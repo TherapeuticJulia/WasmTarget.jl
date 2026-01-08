@@ -13,13 +13,26 @@ include("Compiler/Codegen.jl")
 include("Runtime/Intrinsics.jl")
 
 # Main API
-export compile, WasmModule
+export compile, WasmModule, to_bytes
 
 """
     compile(f, arg_types) -> Vector{UInt8}
 
 Compile a Julia function `f` with the given argument types to WebAssembly bytes.
+Returns a valid WebAssembly binary that can be instantiated and executed.
 """
-function compile end
+function compile(f, arg_types::Tuple)::Vector{UInt8}
+    # Get function name for export
+    func_name = string(nameof(f))
+
+    # Compile to WasmModule
+    mod = compile_function(f, arg_types, func_name)
+
+    # Serialize to bytes
+    return to_bytes(mod)
+end
+
+# Convenience method for single argument type
+compile(f, arg_type::Type) = compile(f, (arg_type,))
 
 end # module

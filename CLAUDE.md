@@ -98,6 +98,7 @@ Per-function compilation state:
 | Tuple{...} | WasmGC struct | Immutable |
 | Vector{T} | WasmGC array | Mutable |
 | JSValue | externref | For JS object references |
+| WasmGlobal{T, IDX} | global (phantom param) | Compiles to global.get/set |
 
 ## Development History
 
@@ -123,6 +124,44 @@ Per-function compilation state:
 18. **Linear Memory**: Memory sections with load/store operations
 19. **Data Segments**: Initialize memory with constant data (strings, bytes)
 20. **Result Type Patterns**: Error handling with custom result structs and control flow
+21. **WasmGlobal{T, IDX}**: Type-safe global variable handles with compile-time indices
+
+### WasmGlobal - Direct Julia Compilation with Wasm Globals
+
+The `WasmGlobal{T, IDX}` type enables directly compiling Julia functions that use Wasm global variables:
+
+```julia
+using WasmTarget
+
+# Define global types with compile-time indices
+const Counter = WasmGlobal{Int32, 0}   # Global index 0
+const Flag = WasmGlobal{Int32, 1}      # Global index 1
+
+# Write pure Julia functions - no Wasm knowledge required
+function increment(g::Counter)::Int32
+    g[] = g[] + Int32(1)
+    return g[]
+end
+
+function toggle(f::Flag)::Int32
+    f[] = f[] == Int32(0) ? Int32(1) : Int32(0)
+    return f[]
+end
+
+# Compile to Wasm - globals auto-created, phantom params removed
+bytes = compile_multi([
+    (increment, (Counter,)),
+    (toggle, (Flag,)),
+])
+```
+
+Key features:
+- **Type-level index**: `IDX` is a type parameter, known at compile time
+- **Phantom parameter**: WasmGlobal args don't become Wasm function parameters
+- **Auto-created globals**: Compiler automatically adds globals to the module
+- **Julia semantics**: `g[]` and `g[] = x` work in Julia for testing
+- **Multiple globals**: Use different type aliases for different indices
+- **Multi-function sharing**: Functions in same `compile_multi` share globals
 
 ### Therapy.jl Pattern Demo
 

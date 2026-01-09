@@ -1,7 +1,7 @@
 # Wasm Types - Value types, Reference types, and composite types
 # Reference: https://webassembly.github.io/spec/core/binary/types.html
 
-export ValType, NumType, RefType, ConcreteRef, FuncType, StructType, ArrayType, FieldType, CompositeType, WasmValType, JSValue
+export ValType, NumType, RefType, ConcreteRef, FuncType, StructType, ArrayType, FieldType, CompositeType, WasmValType, JSValue, WasmGlobal
 
 # ============================================================================
 # Value Types (Section 5.3.1)
@@ -188,6 +188,80 @@ This is a primitive type to prevent Julia from optimizing it away.
 primitive type JSValue 64 end
 
 # ============================================================================
+# WasmGlobal - Handle for Wasm Global Variables
+# ============================================================================
+
+"""
+    WasmGlobal{T, IDX}
+
+A handle to a WebAssembly global variable at index `IDX`. When compiled to Wasm:
+- `global[]` (getindex) → `global.get IDX`
+- `global[] = x` (setindex!) → `global.set IDX, x`
+
+The index is a type parameter so it's known at compile time, which is required
+because Wasm's `global.get` and `global.set` instructions take immediate indices.
+
+This is a general-purpose abstraction for any Julia code that needs to
+interact with Wasm global variables. Use cases include:
+- Stateful applications
+- Game engines
+- Reactive frameworks
+- Any code needing mutable Wasm state
+
+# Type Parameters
+- `T`: The type of value stored in the global (Int32, Float64, etc.)
+- `IDX`: The Wasm global index (0-based), must be an Int literal
+
+# Example
+```julia
+# Define types for specific globals (index is compile-time constant)
+const Counter = WasmGlobal{Int32, 0}   # Global index 0
+const Flag = WasmGlobal{Int32, 1}      # Global index 1
+
+# Functions that use globals - index is known from the type
+function increment(g::Counter)::Int32
+    g[] = g[] + Int32(1)
+    return g[]
+end
+
+function toggle(g::Flag)::Int32
+    g[] = g[] == Int32(0) ? Int32(1) : Int32(0)
+    return g[]
+end
+
+# Create instances (value is for Julia-side testing)
+counter = Counter(0)
+flag = Flag(1)
+
+# Compile to Wasm - global index extracted from type
+wasm_bytes = compile(increment, (Counter,))
+```
+"""
+mutable struct WasmGlobal{T, IDX}
+    value::T
+end
+
+# Constructor with zero initial value
+WasmGlobal{T, IDX}() where {T, IDX} = WasmGlobal{T, IDX}(zero(T))
+
+# Get the global index from the type
+global_index(::Type{WasmGlobal{T, IDX}}) where {T, IDX} = IDX
+global_index(g::WasmGlobal{T, IDX}) where {T, IDX} = IDX
+
+# Get the element type
+global_eltype(::Type{WasmGlobal{T, IDX}}) where {T, IDX} = T
+
+# Accessor methods - work in Julia (for testing) and compile to Wasm global ops
+function Base.getindex(g::WasmGlobal{T, IDX})::T where {T, IDX}
+    return g.value
+end
+
+function Base.setindex!(g::WasmGlobal{T, IDX}, v::T)::T where {T, IDX}
+    g.value = v
+    return v
+end
+
+# ============================================================================
 # Helper functions
 # ============================================================================
 
@@ -221,10 +295,20 @@ function julia_to_wasm_type(::Type{T})::WasmValType where T
     elseif T <: AbstractArray
         # Arrays map to WasmGC arrays
         return ArrayRef
+    elseif T <: WasmGlobal
+        # WasmGlobal is passed as a WasmGC struct (holds just value since idx is in type)
+        return StructRef
     elseif isconcretetype(T) && isstructtype(T)
         # User-defined structs map to WasmGC structs
         return StructRef
     else
         error("Unsupported Julia type for Wasm: $T")
     end
+end
+
+"""
+Get the element type from a WasmGlobal type.
+"""
+function wasm_global_element_type(::Type{WasmGlobal{T, IDX}}) where {T, IDX}
+    return T
 end

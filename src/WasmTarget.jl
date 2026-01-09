@@ -14,6 +14,7 @@ include("Runtime/Intrinsics.jl")
 
 # Main API
 export compile, compile_multi, WasmModule, to_bytes
+export WasmGlobal, global_index, global_eltype
 
 """
     compile(f, arg_types) -> Vector{UInt8}

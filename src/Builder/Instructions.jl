@@ -279,11 +279,11 @@ struct WasmImport
 end
 
 """
-    WasmGlobal
+    WasmGlobalDef
 
-A WebAssembly global variable.
+Internal representation of a WebAssembly global variable definition.
 """
-struct WasmGlobal
+struct WasmGlobalDef
     valtype::WasmValType     # Type of the global
     mutable_::Bool           # Whether the global is mutable
     init::Vector{UInt8}      # Initialization expression (bytecode)
@@ -343,13 +343,13 @@ mutable struct WasmModule
     functions::Vector{WasmFunction}
     tables::Vector{WasmTable}     # Tables for funcref/externref
     memories::Vector{WasmMemory}  # Linear memories
-    globals::Vector{WasmGlobal}   # Global variables
+    globals::Vector{WasmGlobalDef}   # Global variables
     exports::Vector{WasmExport}
     elem_segments::Vector{WasmElemSegment}  # Element segments for table init
     data_segments::Vector{WasmDataSegment}  # Data segments for memory init
 end
 
-WasmModule() = WasmModule(CompositeType[], WasmImport[], WasmFunction[], WasmTable[], WasmMemory[], WasmGlobal[], WasmExport[], WasmElemSegment[], WasmDataSegment[])
+WasmModule() = WasmModule(CompositeType[], WasmImport[], WasmFunction[], WasmTable[], WasmMemory[], WasmGlobalDef[], WasmExport[], WasmElemSegment[], WasmDataSegment[])
 
 # ============================================================================
 # Module Building API
@@ -509,7 +509,7 @@ function add_global!(mod::WasmModule, valtype::WasmValType, mutable_::Bool, init
     end
     push!(init, Opcode.END)
 
-    push!(mod.globals, WasmGlobal(valtype, mutable_, init))
+    push!(mod.globals, WasmGlobalDef(valtype, mutable_, init))
     return UInt32(length(mod.globals) - 1)
 end
 

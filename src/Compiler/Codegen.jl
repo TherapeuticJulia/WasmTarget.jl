@@ -1,7 +1,7 @@
 # Code Generation - Julia IR to Wasm instructions
 # Maps Julia SSA statements to WebAssembly bytecode
 
-export compile_function, compile_module, FunctionRegistry
+export compile_function, compile_module, compile_handler, FunctionRegistry
 
 # ============================================================================
 # Struct Type Registry
@@ -201,8 +201,27 @@ function compile_function(f, arg_types::Tuple, func_name::String)::WasmModule
     # Create type registry for struct mappings
     type_registry = TypeRegistry()
 
-    # Register any struct/array/string types used in parameters
-    for T in arg_types
+    # Detect WasmGlobal arguments (phantom params that map to Wasm globals)
+    global_args = Set{Int}()
+    for (i, T) in enumerate(arg_types)
+        if T <: WasmGlobal
+            push!(global_args, i)
+            # Add the global to the module at the specified index
+            elem_type = global_eltype(T)
+            wasm_type = julia_to_wasm_type(elem_type)
+            global_idx = global_index(T)
+            # Ensure we have enough globals (fill with defaults if needed)
+            while length(mod.globals) <= global_idx
+                add_global!(mod, wasm_type, true, zero(elem_type))
+            end
+        end
+    end
+
+    # Register any struct/array/string types used in parameters (skip WasmGlobal)
+    for (i, T) in enumerate(arg_types)
+        if i in global_args
+            continue  # Skip WasmGlobal
+        end
         if is_struct_type(T)
             register_struct_type!(mod, type_registry, T)
         elseif T <: AbstractVector
@@ -225,8 +244,13 @@ function compile_function(f, arg_types::Tuple, func_name::String)::WasmModule
         get_string_array_type!(mod, type_registry)
     end
 
-    # Determine Wasm types for parameters and return (using concrete types for GC refs)
-    param_types = WasmValType[get_concrete_wasm_type(T, mod, type_registry) for T in arg_types]
+    # Determine Wasm types for parameters and return (skip WasmGlobal args)
+    param_types = WasmValType[]
+    for (i, T) in enumerate(arg_types)
+        if !(i in global_args)
+            push!(param_types, get_concrete_wasm_type(T, mod, type_registry))
+        end
+    end
     result_types = return_type === Nothing ? WasmValType[] : WasmValType[get_concrete_wasm_type(return_type, mod, type_registry)]
 
     # For single-function modules, the function index is 0
@@ -235,7 +259,7 @@ function compile_function(f, arg_types::Tuple, func_name::String)::WasmModule
 
     # Generate function body with the function reference for self-call detection
     ctx = CompilationContext(code_info, arg_types, return_type, mod, type_registry;
-                            func_idx=expected_func_idx, func_ref=f)
+                            func_idx=expected_func_idx, func_ref=f, global_args=global_args)
     body = generate_body(ctx)
 
     # Add function to module
@@ -284,16 +308,34 @@ function compile_module(functions::Vector)::WasmModule
         end
     end
 
-    # First pass: register types and reserve function slots
+    # Track all required globals across all functions
+    required_globals = Dict{Int, Tuple{WasmValType, Type}}()  # global_idx -> (wasm_type, julia_elem_type)
+
+    # First pass: register types, detect WasmGlobals, and reserve function slots
     # We need to know all function indices before compiling bodies
-    function_data = []  # Store (f, arg_types, name, code_info, return_type) for each function
+    function_data = []  # Store (f, arg_types, name, code_info, return_type, global_args) for each function
 
     for (f, arg_types, name) in normalized
         # Get typed IR
         code_info, return_type = get_typed_ir(f, arg_types)
 
-        # Register types used in parameters
-        for T in arg_types
+        # Detect WasmGlobal arguments
+        global_args = Set{Int}()
+        for (i, T) in enumerate(arg_types)
+            if T <: WasmGlobal
+                push!(global_args, i)
+                elem_type = global_eltype(T)
+                wasm_type = julia_to_wasm_type(elem_type)
+                global_idx = global_index(T)
+                required_globals[global_idx] = (wasm_type, elem_type)
+            end
+        end
+
+        # Register types used in parameters (skip WasmGlobal)
+        for (i, T) in enumerate(arg_types)
+            if i in global_args
+                continue
+            end
             if is_struct_type(T)
                 register_struct_type!(mod, type_registry, T)
             elseif T <: AbstractVector
@@ -314,28 +356,42 @@ function compile_module(functions::Vector)::WasmModule
             get_string_array_type!(mod, type_registry)
         end
 
-        push!(function_data, (f, arg_types, name, code_info, return_type))
+        push!(function_data, (f, arg_types, name, code_info, return_type, global_args))
+    end
+
+    # Add all required globals to the module
+    for global_idx in sort(collect(keys(required_globals)))
+        wasm_type, elem_type = required_globals[global_idx]
+        while length(mod.globals) <= global_idx
+            add_global!(mod, wasm_type, true, zero(elem_type))
+        end
     end
 
     # Calculate function indices (accounting for imports)
     # Functions are added in order, so index = n_imports + position - 1
     n_imports = length(mod.imports)
-    for (i, (f, arg_types, name, _, _)) in enumerate(function_data)
+    for (i, (f, arg_types, name, _, _, _)) in enumerate(function_data)
         func_idx = UInt32(n_imports + i - 1)
         register_function!(func_registry, name, f, arg_types, func_idx)
     end
 
     # Second pass: compile function bodies
-    for (i, (f, arg_types, name, code_info, return_type)) in enumerate(function_data)
+    for (i, (f, arg_types, name, code_info, return_type, global_args)) in enumerate(function_data)
         func_idx = UInt32(n_imports + i - 1)
 
         # Generate function body
         ctx = CompilationContext(code_info, arg_types, return_type, mod, type_registry;
-                                func_registry=func_registry, func_idx=func_idx, func_ref=f)
+                                func_registry=func_registry, func_idx=func_idx, func_ref=f,
+                                global_args=global_args)
         body = generate_body(ctx)
 
-        # Get param/result types
-        param_types = WasmValType[get_concrete_wasm_type(T, mod, type_registry) for T in arg_types]
+        # Get param/result types (skip WasmGlobal args)
+        param_types = WasmValType[]
+        for (j, T) in enumerate(arg_types)
+            if !(j in global_args)
+                push!(param_types, get_concrete_wasm_type(T, mod, type_registry))
+            end
+        end
         result_types = return_type === Nothing ? WasmValType[] : WasmValType[get_concrete_wasm_type(return_type, mod, type_registry)]
 
         # Add function to module
@@ -344,6 +400,118 @@ function compile_module(functions::Vector)::WasmModule
         # Export the function
         add_export!(mod, name, 0, actual_idx)
     end
+
+    return mod
+end
+
+"""
+    compile_handler(closure, signal_fields, export_name; globals, imports) -> WasmModule
+
+Compile a Therapy.jl event handler closure to WebAssembly with signal substitution.
+
+The `signal_fields` dict maps captured closure field names to their signal info:
+- Key: field name (Symbol), e.g., :count, :set_count
+- Value: tuple (is_getter::Bool, global_idx::UInt32, value_type::Type)
+
+The handler closure should take no arguments. Signal getters/setters are captured
+in the closure and compiled to Wasm global.get/global.set operations.
+
+# Example
+```julia
+count, set_count = create_signal(0)
+handler = () -> set_count(count() + 1)
+
+signal_fields = Dict(
+    :count => (true, UInt32(0), Int64),      # getter for global 0
+    :set_count => (false, UInt32(0), Int64)  # setter for global 0
+)
+
+mod = compile_handler(handler, signal_fields, "onclick")
+```
+"""
+function compile_handler(
+    closure::Function,
+    signal_fields::Dict{Symbol, Tuple{Bool, UInt32, Type}},
+    export_name::String;
+    globals::Vector{Tuple{Type, Any}} = Tuple{Type, Any}[],  # (type, initial_value) pairs
+    imports::Vector = []  # Import specs (to be defined)
+)::WasmModule
+    # Get typed IR for the closure (no arguments since it's a thunk)
+    typed_results = Base.code_typed(closure, ())
+    if isempty(typed_results)
+        error("Could not get typed IR for handler closure")
+    end
+    code_info, return_type = typed_results[1]
+
+    # Create module
+    mod = WasmModule()
+    type_registry = TypeRegistry()
+
+    # Add imports first (they affect function indices)
+    # TODO: Phase 4 will add import registration
+
+    # Create globals from signal fields
+    # Collect unique global indices and their types
+    required_globals = Dict{UInt32, Type}()
+    for (_, (_, global_idx, value_type)) in signal_fields
+        if !haskey(required_globals, global_idx)
+            required_globals[global_idx] = value_type
+        end
+    end
+
+    # Add explicit globals passed in
+    for (i, (gtype, gval)) in enumerate(globals)
+        global_idx = UInt32(i - 1)
+        if !haskey(required_globals, global_idx)
+            required_globals[global_idx] = gtype
+        end
+    end
+
+    # Add all required globals to the module and export them
+    for global_idx in sort(collect(keys(required_globals)))
+        value_type = required_globals[global_idx]
+        wasm_type = julia_to_wasm_type(value_type)
+        # Find initial value from explicit globals if available
+        initial_value = zero(value_type)
+        if Int(global_idx) + 1 <= length(globals)
+            _, initial_value = globals[Int(global_idx) + 1]
+        end
+        while length(mod.globals) <= Int(global_idx)
+            actual_idx = add_global!(mod, wasm_type, true, initial_value)
+            # Export the global for JS access
+            add_global_export!(mod, "signal_$(actual_idx)", actual_idx)
+        end
+    end
+
+    # Build captured_signal_fields for CompilationContext
+    # Maps field_name -> (is_getter, global_idx) without the type
+    captured_signal_fields = Dict{Symbol, Tuple{Bool, UInt32}}()
+    for (field_name, (is_getter, global_idx, _)) in signal_fields
+        captured_signal_fields[field_name] = (is_getter, global_idx)
+    end
+
+    # Compile the closure body
+    # Closures have one implicit argument (_1 = self)
+    ctx = CompilationContext(
+        code_info,
+        (),  # No explicit arguments
+        return_type,
+        mod,
+        type_registry;
+        captured_signal_fields = captured_signal_fields
+    )
+    body = generate_body(ctx)
+
+    # Handler functions take no params and return nothing (void)
+    # The return value (if any) is typically dropped in event handlers
+    param_types = WasmValType[]
+    result_types = WasmValType[]  # Event handlers return void
+
+    # Add function to module
+    func_idx = add_function!(mod, param_types, result_types, ctx.locals, body)
+
+    # Export the function
+    add_export!(mod, export_name, 0, func_idx)
 
     return mod
 end
@@ -451,16 +619,25 @@ mutable struct CompilationContext
     func_registry::Union{FunctionRegistry, Nothing}  # Function mappings for cross-calls
     func_idx::UInt32             # Index of the function being compiled (for recursion)
     func_ref::Any                # Reference to original function (for self-call detection)
+    global_args::Set{Int}        # Argument indices (1-based) that are WasmGlobal (phantom params)
+    # Signal substitution for Therapy.jl closures
+    signal_ssa_getters::Dict{Int, UInt32}   # SSA id (from getfield) -> Wasm global index
+    signal_ssa_setters::Dict{Int, UInt32}   # SSA id (from getfield) -> Wasm global index
+    captured_signal_fields::Dict{Symbol, Tuple{Bool, UInt32}}  # field_name -> (is_getter, global_idx)
 end
 
 function CompilationContext(code_info, arg_types::Tuple, return_type, mod::WasmModule, type_registry::TypeRegistry;
                            func_registry::Union{FunctionRegistry, Nothing}=nothing,
-                           func_idx::UInt32=UInt32(0), func_ref=nothing)
+                           func_idx::UInt32=UInt32(0), func_ref=nothing,
+                           global_args::Set{Int}=Set{Int}(),
+                           captured_signal_fields::Dict{Symbol, Tuple{Bool, UInt32}}=Dict{Symbol, Tuple{Bool, UInt32}}())
+    # Calculate n_params excluding WasmGlobal arguments (they're phantom)
+    n_real_params = count(i -> !(i in global_args), 1:length(arg_types))
     ctx = CompilationContext(
         code_info,
         arg_types,
         return_type,
-        length(arg_types),
+        n_real_params,
         WasmValType[],
         Dict{Int, Type}(),
         Dict{Int, Int}(),
@@ -470,14 +647,131 @@ function CompilationContext(code_info, arg_types::Tuple, return_type, mod::WasmM
         type_registry,
         func_registry,
         func_idx,
-        func_ref
+        func_ref,
+        global_args,
+        Dict{Int, UInt32}(),    # signal_ssa_getters
+        Dict{Int, UInt32}(),    # signal_ssa_setters
+        captured_signal_fields  # captured signal field mappings
     )
     # Analyze SSA types and allocate locals for multi-use SSAs
     analyze_ssa_types!(ctx)
     analyze_control_flow!(ctx)  # Find loops and phi nodes
+    analyze_signal_captures!(ctx)  # Identify SSAs that are signal getters/setters
     allocate_ssa_locals!(ctx)
     allocate_scratch_locals!(ctx)  # Extra locals for complex operations
     return ctx
+end
+
+"""
+Analyze getfield expressions on the closure (arg 1) to identify signal captures.
+Maps SSA values from getfield to their signal global indices.
+
+For CompilableSignal/CompilableSetter pattern:
+- getfield(_1, :count) -> CompilableSignal SSA
+- getfield(CompilableSignal, :signal) -> Signal SSA
+- getfield(Signal, :value) -> actual value read (substitutes to global.get)
+- setfield!(Signal, :value, x) -> value write (substitutes to global.set)
+"""
+function analyze_signal_captures!(ctx::CompilationContext)
+    isempty(ctx.captured_signal_fields) && return
+
+    code = ctx.code_info.code
+
+    # Track CompilableSignal/CompilableSetter SSAs
+    compilable_ssas = Dict{Int, Tuple{Bool, UInt32}}()  # ssa -> (is_getter, global_idx)
+
+    # Track Signal SSAs (from getfield(CompilableSignal/Setter, :signal))
+    signal_ssas = Dict{Int, UInt32}()  # ssa -> global_idx
+
+    # First pass: find closure field accesses and CompilableSignal/Setter
+    for (i, stmt) in enumerate(code)
+        if stmt isa Expr && stmt.head === :call
+            func = stmt.args[1]
+            if func isa GlobalRef && func.mod === Core && func.name === :getfield
+                target = stmt.args[2]
+                field_ref = stmt.args[3]
+                field_name = field_ref isa QuoteNode ? field_ref.value : field_ref
+
+                # Check if this is getfield(_1, :fieldname) - getting captured closure field
+                # Target can be Core.SlotNumber(1) or Core.Argument(1)
+                is_closure_self = (target isa Core.SlotNumber && target.id == 1) ||
+                                  (target isa Core.Argument && target.n == 1)
+                if is_closure_self
+                    if field_name isa Symbol && haskey(ctx.captured_signal_fields, field_name)
+                        is_getter, global_idx = ctx.captured_signal_fields[field_name]
+                        compilable_ssas[i] = (is_getter, global_idx)
+                    end
+                end
+            end
+        end
+    end
+
+    # Second pass: find getfield(CompilableSignal/Setter, :signal) -> Signal
+    for (i, stmt) in enumerate(code)
+        if stmt isa Expr && stmt.head === :call
+            func = stmt.args[1]
+            # Handle both Core.getfield and Base.getfield
+            is_getfield = (func isa GlobalRef &&
+                          ((func.mod === Core && func.name === :getfield) ||
+                           (func.mod === Base && func.name === :getfield)))
+            if is_getfield && length(stmt.args) >= 3
+                target = stmt.args[2]
+                field_ref = stmt.args[3]
+                field_name = field_ref isa QuoteNode ? field_ref.value : field_ref
+
+                # Check if target is a CompilableSignal/Setter and field is :signal
+                if target isa Core.SSAValue && field_name === :signal
+                    if haskey(compilable_ssas, target.id)
+                        _, global_idx = compilable_ssas[target.id]
+                        signal_ssas[i] = global_idx
+                    end
+                end
+            end
+        end
+    end
+
+    # Third pass: mark getfield(Signal, :value) as signal reads
+    # and setfield!(Signal, :value, x) as signal writes
+    for (i, stmt) in enumerate(code)
+        if stmt isa Expr && stmt.head === :call
+            func = stmt.args[1]
+
+            # Handle getfield(Signal, :value) -> signal read
+            is_getfield = (func isa GlobalRef &&
+                          ((func.mod === Core && func.name === :getfield) ||
+                           (func.mod === Base && func.name === :getfield)))
+            if is_getfield && length(stmt.args) >= 3
+                target = stmt.args[2]
+                field_ref = stmt.args[3]
+                field_name = field_ref isa QuoteNode ? field_ref.value : field_ref
+
+                if target isa Core.SSAValue && field_name === :value
+                    if haskey(signal_ssas, target.id)
+                        global_idx = signal_ssas[target.id]
+                        ctx.signal_ssa_getters[i] = global_idx
+                    end
+                end
+            end
+
+            # Handle setfield!(Signal, :value, x) -> signal write
+            is_setfield = (func isa GlobalRef &&
+                          ((func.mod === Core && func.name === :setfield!) ||
+                           (func.mod === Base && func.name === :setfield!)))
+            if is_setfield && length(stmt.args) >= 4
+                target = stmt.args[2]
+                field_ref = stmt.args[3]
+                new_value = stmt.args[4]
+                field_name = field_ref isa QuoteNode ? field_ref.value : field_ref
+
+                if target isa Core.SSAValue && field_name === :value
+                    if haskey(signal_ssas, target.id)
+                        global_idx = signal_ssas[target.id]
+                        ctx.signal_ssa_setters[i] = global_idx
+                    end
+                end
+            end
+        end
+    end
 end
 
 """
@@ -878,8 +1172,23 @@ function infer_value_type(val, ctx::CompilationContext)
         return Float32
     elseif val isa Bool
         return Bool
+    elseif val isa WasmGlobal
+        return typeof(val)
     end
     return Int64
+end
+
+"""
+Extract the global index from a WasmGlobal type.
+The index is stored as a type parameter, so we extract it from the type.
+"""
+function get_wasm_global_idx(val, ctx::CompilationContext)::Union{Int, Nothing}
+    val_type = infer_value_type(val, ctx)
+    if val_type <: WasmGlobal
+        # Extract IDX from WasmGlobal{T, IDX}
+        return global_index(val_type)
+    end
+    return nothing
 end
 
 # ============================================================================
@@ -1312,25 +1621,30 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
         end
 
     elseif stmt isa Expr
+        stmt_bytes = UInt8[]
         if stmt.head === :call
-            append!(bytes, compile_call(stmt, idx, ctx))
+            stmt_bytes = compile_call(stmt, idx, ctx)
         elseif stmt.head === :invoke
-            append!(bytes, compile_invoke(stmt, idx, ctx))
+            stmt_bytes = compile_invoke(stmt, idx, ctx)
         elseif stmt.head === :new
             # Struct construction: %new(Type, args...)
-            append!(bytes, compile_new(stmt, idx, ctx))
+            stmt_bytes = compile_new(stmt, idx, ctx)
         elseif stmt.head === :boundscheck
             # Bounds check - we can skip this as Wasm has its own bounds checking
             # This is a no-op that produces a Bool (we push false since we're not doing checks)
-            push!(bytes, Opcode.I32_CONST)
-            push!(bytes, 0x00)  # false = no bounds checking
+            push!(stmt_bytes, Opcode.I32_CONST)
+            push!(stmt_bytes, 0x00)  # false = no bounds checking
         end
+
+        append!(bytes, stmt_bytes)
 
         # If this SSA value needs a local, store it (and remove from stack)
         # We use LOCAL_SET (not LOCAL_TEE) to avoid leaving extra values on stack
         # that would interfere with later operations. Values will be retrieved
         # via local.get when needed.
-        if haskey(ctx.ssa_locals, idx)
+        # IMPORTANT: Only do this if the statement actually produced bytecode
+        # (skipped signal statements return empty bytes)
+        if haskey(ctx.ssa_locals, idx) && !isempty(stmt_bytes)
             local_idx = ctx.ssa_locals[idx]
             push!(bytes, Opcode.LOCAL_SET)
             append!(bytes, encode_leb128_unsigned(local_idx))
@@ -1400,8 +1714,17 @@ function compile_value(val, ctx::CompilationContext)::Vector{UInt8}
         # Otherwise, assume it's on the stack (for single-use SSAs in sequence)
 
     elseif val isa Core.Argument
-        local_idx = val.n - 2  # Argument(2) -> local 0
-        if local_idx >= 0
+        # Argument(2) is arg_types[1], Argument(3) is arg_types[2], etc.
+        arg_idx = val.n - 1  # Convert to 1-based arg_types index
+
+        # WasmGlobal arguments don't have locals - they're accessed via global.get/set
+        # in the getfield/setfield handlers, so we skip emitting anything here
+        if arg_idx in ctx.global_args
+            # WasmGlobal arg - no local.get needed (handled by getfield/setfield)
+            # Return empty bytes
+        elseif arg_idx >= 1
+            # Calculate local index: count non-WasmGlobal args before this one
+            local_idx = count(i -> !(i in ctx.global_args), 1:arg_idx-1)
             push!(bytes, Opcode.LOCAL_GET)
             append!(bytes, encode_leb128_unsigned(local_idx))
         end
@@ -1466,6 +1789,65 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
     func = expr.args[1]
     args = expr.args[2:end]
 
+    # Special case for signal read: getfield(Signal, :value) -> global.get
+    # This is detected by analyze_signal_captures! and stored in signal_ssa_getters
+    if haskey(ctx.signal_ssa_getters, idx)
+        global_idx = ctx.signal_ssa_getters[idx]
+        push!(bytes, Opcode.GLOBAL_GET)
+        append!(bytes, encode_leb128_unsigned(global_idx))
+        return bytes
+    end
+
+    # Special case for signal write: setfield!(Signal, :value, x) -> global.set
+    # This is detected by analyze_signal_captures! and stored in signal_ssa_setters
+    if haskey(ctx.signal_ssa_setters, idx)
+        # The value to write is the 4th argument (setfield!(target, field, value))
+        global_idx = ctx.signal_ssa_setters[idx]
+        value_arg = args[3]  # args = [target, field, value]
+        append!(bytes, compile_value(value_arg, ctx))
+        push!(bytes, Opcode.GLOBAL_SET)
+        append!(bytes, encode_leb128_unsigned(global_idx))
+        # setfield! returns the value written, so re-read it
+        push!(bytes, Opcode.GLOBAL_GET)
+        append!(bytes, encode_leb128_unsigned(global_idx))
+        return bytes
+    end
+
+    # Special case for Core.getfield on closure (_1) accessing captured signal fields
+    # These produce intermediate SSA values (CompilableSignal/Setter structs)
+    # Skip them - the actual read/write happens on the inner Signal object
+    if func isa GlobalRef && func.mod === Core && func.name === :getfield
+        if length(args) >= 2
+            target = args[1]
+            field_ref = args[2]
+            # Target can be Core.SlotNumber(1) or Core.Argument(1)
+            is_closure_self = (target isa Core.SlotNumber && target.id == 1) ||
+                              (target isa Core.Argument && target.n == 1)
+            if is_closure_self
+                # This is accessing a field of the closure
+                field_name = field_ref isa QuoteNode ? field_ref.value : field_ref
+                if field_name isa Symbol && haskey(ctx.captured_signal_fields, field_name)
+                    # Skip - this produces a CompilableSignal/Setter reference
+                    return bytes
+                end
+            end
+        end
+    end
+
+    # Skip getfield(CompilableSignal/Setter, :signal) - intermediate step
+    # We track this in analyze_signal_captures! but don't need to emit anything
+    is_getfield = (func isa GlobalRef &&
+                  ((func.mod === Core && func.name === :getfield) ||
+                   (func.mod === Base && func.name === :getfield)))
+    if is_getfield && length(args) >= 2
+        field_ref = args[2]
+        field_name = field_ref isa QuoteNode ? field_ref.value : field_ref
+        if field_name === :signal
+            # Skip - this is getting Signal from CompilableSignal/Setter
+            return bytes
+        end
+    end
+
     # Special case for ifelse - needs different argument order
     if is_func(func, :ifelse) && length(args) == 3
         # Wasm select expects: [val_if_true, val_if_false, cond] (cond on top)
@@ -1518,6 +1900,20 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         obj_arg = args[1]
         field_ref = args[2]
         obj_type = infer_value_type(obj_arg, ctx)
+
+        # Handle WasmGlobal field access (:value -> global.get)
+        if obj_type <: WasmGlobal
+            field_sym = field_ref isa QuoteNode ? field_ref.value : field_ref
+            if field_sym === :value
+                # Extract global index from type parameter
+                global_idx = get_wasm_global_idx(obj_arg, ctx)
+                if global_idx !== nothing
+                    push!(bytes, Opcode.GLOBAL_GET)
+                    append!(bytes, encode_leb128_unsigned(global_idx))
+                    return bytes
+                end
+            end
+        end
 
         # Handle Vector field access (:ref and :size)
         if obj_type <: AbstractVector
@@ -1696,6 +2092,35 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
 
             return bytes
         end
+    end
+
+    # Special case for setfield! - mutable struct field assignment
+    # Also handles WasmGlobal (:value -> global.set)
+    if is_func(func, :setfield!) && length(args) >= 3
+        obj_arg = args[1]
+        field_ref = args[2]
+        value_arg = args[3]
+        obj_type = infer_value_type(obj_arg, ctx)
+
+        # Handle WasmGlobal field assignment (:value -> global.set)
+        if obj_type <: WasmGlobal
+            field_sym = field_ref isa QuoteNode ? field_ref.value : field_ref
+            if field_sym === :value
+                # Extract global index from type parameter
+                global_idx = get_wasm_global_idx(obj_arg, ctx)
+                if global_idx !== nothing
+                    # Push the value to set
+                    append!(bytes, compile_value(value_arg, ctx))
+                    # Emit global.set
+                    push!(bytes, Opcode.GLOBAL_SET)
+                    append!(bytes, encode_leb128_unsigned(global_idx))
+                    # setfield! returns the value, so push it again
+                    append!(bytes, compile_value(value_arg, ctx))
+                    return bytes
+                end
+            end
+        end
+        # Fall through for other struct types - will hit error
     end
 
     # Special case for compilerbarrier - just pass through the value
@@ -2036,7 +2461,34 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
     bytes = UInt8[]
     args = expr.args[3:end]
 
-    # Push arguments
+    # Check for signal substitution (Therapy.jl closures)
+    # When calling through a captured signal getter/setter, emit global.get/set directly
+    func_ref = expr.args[2]
+    if func_ref isa Core.SSAValue
+        ssa_id = func_ref.id
+        # Signal getter: no args, returns the signal value
+        if haskey(ctx.signal_ssa_getters, ssa_id) && isempty(args)
+            global_idx = ctx.signal_ssa_getters[ssa_id]
+            push!(bytes, Opcode.GLOBAL_GET)
+            append!(bytes, encode_leb128_unsigned(global_idx))
+            return bytes
+        end
+        # Signal setter: one arg, sets the signal value
+        if haskey(ctx.signal_ssa_setters, ssa_id) && length(args) == 1
+            global_idx = ctx.signal_ssa_setters[ssa_id]
+            # Compile the argument (the new value)
+            append!(bytes, compile_value(args[1], ctx))
+            # Store to global
+            push!(bytes, Opcode.GLOBAL_SET)
+            append!(bytes, encode_leb128_unsigned(global_idx))
+            # Setter returns the value in Therapy.jl, so re-read it
+            push!(bytes, Opcode.GLOBAL_GET)
+            append!(bytes, encode_leb128_unsigned(global_idx))
+            return bytes
+        end
+    end
+
+    # Push arguments (for non-signal calls)
     for arg in args
         append!(bytes, compile_value(arg, ctx))
     end

@@ -110,7 +110,7 @@ Per-function compilation state:
 5. **Structs**: WasmGC struct creation, field access
 6. **Tuples**: As immutable WasmGC structs
 7. **Arrays**: WasmGC arrays with get/set/length
-8. **Strings**: As i32 arrays, sizeof/length support
+8. **Strings**: As i32 arrays, sizeof/length, concatenation, equality
 9. **Recursion**: Self-recursive functions
 10. **Multi-Function Modules**: compile_multi() API
 11. **Cross-Function Calls**: Functions calling other functions in same module
@@ -122,6 +122,7 @@ Per-function compilation state:
 17. **Indirect Calls**: call_indirect for dynamic dispatch
 18. **Linear Memory**: Memory sections with load/store operations
 19. **Data Segments**: Initialize memory with constant data (strings, bytes)
+20. **Result Type Patterns**: Error handling with custom result structs and control flow
 
 ### Therapy.jl Pattern Demo
 
@@ -146,7 +147,7 @@ This pattern enables Therapy.jl to:
 
 ### Test Coverage
 
-~199 tests organized in phases:
+~205 tests organized in phases:
 - Phase 1-3: Infrastructure, builder, compiler basics
 - Phase 4-6: Control flow, integers, type conversions
 - Phase 7-9: Structs, tuples, arrays

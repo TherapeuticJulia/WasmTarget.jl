@@ -14,6 +14,8 @@ A Julia-to-WebAssembly compiler targeting the WasmGC (Garbage Collection) propos
 - **Tables**: Function reference tables for indirect calls and dynamic dispatch
 - **Linear Memory**: Memory sections with load/store operations and data initialization
 - **Globals**: Mutable and immutable global variables, exportable to JS
+- **String Operations**: String concatenation (`*`) and equality comparison (`==`)
+- **Result Type Patterns**: Error handling via custom result structs with control flow
 
 ## Requirements
 
@@ -180,10 +182,11 @@ src/
 ## Limitations
 
 - No closures (use macros for compile-time code generation instead)
-- No exceptions (use Result-type patterns)
+- No exceptions (use Result-type patterns - now supported!)
 - No async/await (use callbacks)
 - Limited Base Julia coverage (focused on core primitives)
 - String indexing not supported (Julia's UTF-8 IR is too complex)
+- Array resize operations (`push!`, `pop!`) not supported (WasmGC arrays are fixed-size)
 
 ## Examples
 

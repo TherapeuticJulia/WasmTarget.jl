@@ -1578,6 +1578,74 @@ end
             @test run_wasm(bytes, "dispatch", Int32(5), Int32(1)) == 15
         end
 
+        @testset "Linear memory" begin
+            mod = WasmTarget.WasmModule()
+
+            # Add memory with 1 page (64KB)
+            mem_idx = WasmTarget.add_memory!(mod, 1)
+            @test mem_idx == 0
+
+            # Export the memory
+            WasmTarget.add_memory_export!(mod, "memory", mem_idx)
+
+            # Add a function that uses memory operations
+            func_idx = WasmTarget.add_function!(
+                mod,
+                [WasmTarget.I32, WasmTarget.I32],  # address, value
+                WasmTarget.WasmValType[],
+                WasmTarget.WasmValType[],
+                UInt8[
+                    WasmTarget.Opcode.LOCAL_GET, 0x00,  # address
+                    WasmTarget.Opcode.LOCAL_GET, 0x01,  # value
+                    WasmTarget.Opcode.I32_STORE, 0x02, 0x00,  # store (align=4, offset=0)
+                    WasmTarget.Opcode.END
+                ]
+            )
+            WasmTarget.add_export!(mod, "store", 0, func_idx)
+
+            # Add a load function
+            load_idx = WasmTarget.add_function!(
+                mod,
+                [WasmTarget.I32],      # address
+                [WasmTarget.I32],      # result
+                WasmTarget.WasmValType[],
+                UInt8[
+                    WasmTarget.Opcode.LOCAL_GET, 0x00,  # address
+                    WasmTarget.Opcode.I32_LOAD, 0x02, 0x00,  # load (align=4, offset=0)
+                    WasmTarget.Opcode.END
+                ]
+            )
+            WasmTarget.add_export!(mod, "load", 0, load_idx)
+
+            bytes = WasmTarget.to_bytes(mod)
+            @test length(bytes) > 0
+            @test validate_wasm(bytes)
+
+            # Test memory operations via Node.js
+            js_code = """
+            const bytes = Buffer.from([$(join(bytes, ","))]);
+            WebAssembly.instantiate(bytes).then(result => {
+                const { store, load, memory } = result.instance.exports;
+                store(0, 42);
+                console.log(load(0));
+            });
+            """
+            result = read(`node -e $js_code`, String)
+            @test strip(result) == "42"
+        end
+
+        @testset "Memory with max limit" begin
+            mod = WasmTarget.WasmModule()
+
+            # Add memory with min 1 page, max 10 pages
+            mem_idx = WasmTarget.add_memory!(mod, 1, 10)
+            @test mem_idx == 0
+
+            bytes = WasmTarget.to_bytes(mod)
+            @test length(bytes) > 0
+            @test validate_wasm(bytes)
+        end
+
     end
 
 end

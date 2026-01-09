@@ -1,7 +1,7 @@
 # WebAssembly Instructions and Opcodes
 # Reference: https://webassembly.github.io/spec/core/binary/instructions.html
 
-export Opcode, WasmModule, WasmImport, WasmTable, add_function!, add_import!, add_export!, add_struct_type!, add_array_type!, add_table!, add_table_export!, add_elem_segment!, to_bytes
+export Opcode, WasmModule, WasmImport, WasmTable, WasmMemory, add_function!, add_import!, add_export!, add_struct_type!, add_array_type!, add_table!, add_table_export!, add_elem_segment!, add_memory!, add_memory_export!, to_bytes
 
 # ============================================================================
 # Opcodes (Section 5.4)
@@ -312,6 +312,16 @@ struct WasmElemSegment
 end
 
 """
+    WasmMemory
+
+A WebAssembly linear memory (in pages of 64KB).
+"""
+struct WasmMemory
+    min::UInt32              # Minimum size in pages
+    max::Union{UInt32, Nothing}  # Maximum size in pages (nothing = no max)
+end
+
+"""
     WasmModule
 
 A WebAssembly module builder. Use this to construct modules programmatically.
@@ -321,12 +331,13 @@ mutable struct WasmModule
     imports::Vector{WasmImport}   # Imported functions/tables/etc
     functions::Vector{WasmFunction}
     tables::Vector{WasmTable}     # Tables for funcref/externref
+    memories::Vector{WasmMemory}  # Linear memories
     globals::Vector{WasmGlobal}   # Global variables
     exports::Vector{WasmExport}
     elem_segments::Vector{WasmElemSegment}  # Element segments for table init
 end
 
-WasmModule() = WasmModule(CompositeType[], WasmImport[], WasmFunction[], WasmTable[], WasmGlobal[], WasmExport[], WasmElemSegment[])
+WasmModule() = WasmModule(CompositeType[], WasmImport[], WasmFunction[], WasmTable[], WasmMemory[], WasmGlobal[], WasmExport[], WasmElemSegment[])
 
 # ============================================================================
 # Module Building API
@@ -529,6 +540,26 @@ function add_elem_segment!(mod::WasmModule, table_idx::Integer, offset::Integer,
     return mod
 end
 
+"""
+    add_memory!(mod, min, max=nothing) -> memory_idx
+
+Add a linear memory to the module. Size is in pages (64KB each).
+"""
+function add_memory!(mod::WasmModule, min::Integer, max::Union{Integer, Nothing}=nothing)::UInt32
+    max_val = max === nothing ? nothing : UInt32(max)
+    push!(mod.memories, WasmMemory(UInt32(min), max_val))
+    return UInt32(length(mod.memories) - 1)
+end
+
+"""
+    add_memory_export!(mod, name, memory_idx)
+
+Export a memory.
+"""
+function add_memory_export!(mod::WasmModule, name::String, memory_idx::Integer)
+    add_export!(mod, name, 2, memory_idx)  # kind 2 = memory
+end
+
 # ============================================================================
 # Binary Serialization
 # ============================================================================
@@ -541,6 +572,7 @@ const SECTION_TYPE = 0x01
 const SECTION_IMPORT = 0x02
 const SECTION_FUNCTION = 0x03
 const SECTION_TABLE = 0x04
+const SECTION_MEMORY = 0x05
 const SECTION_GLOBAL = 0x06
 const SECTION_EXPORT = 0x07
 const SECTION_ELEMENT = 0x09
@@ -605,6 +637,24 @@ function to_bytes(mod::WasmModule)::Vector{UInt8}
                     write_byte!(section, 0x01)
                     write_u32!(section, table.min)
                     write_u32!(section, table.max)
+                end
+            end
+        end
+    end
+
+    # Memory section
+    if !isempty(mod.memories)
+        write_section!(w, SECTION_MEMORY) do section
+            write_u32!(section, length(mod.memories))
+            for mem in mod.memories
+                # Limits: 0x00 = min only, 0x01 = min and max
+                if mem.max === nothing
+                    write_byte!(section, 0x00)
+                    write_u32!(section, mem.min)
+                else
+                    write_byte!(section, 0x01)
+                    write_u32!(section, mem.min)
+                    write_u32!(section, mem.max)
                 end
             end
         end

@@ -279,6 +279,17 @@ struct WasmImport
 end
 
 """
+    WasmGlobal
+
+A WebAssembly global variable.
+"""
+struct WasmGlobal
+    valtype::WasmValType     # Type of the global
+    mutable_::Bool           # Whether the global is mutable
+    init::Vector{UInt8}      # Initialization expression (bytecode)
+end
+
+"""
     WasmModule
 
 A WebAssembly module builder. Use this to construct modules programmatically.
@@ -287,10 +298,11 @@ mutable struct WasmModule
     types::Vector{CompositeType}  # Can contain FuncType, StructType, ArrayType
     imports::Vector{WasmImport}   # Imported functions/tables/etc
     functions::Vector{WasmFunction}
+    globals::Vector{WasmGlobal}   # Global variables
     exports::Vector{WasmExport}
 end
 
-WasmModule() = WasmModule(CompositeType[], WasmImport[], WasmFunction[], WasmExport[])
+WasmModule() = WasmModule(CompositeType[], WasmImport[], WasmFunction[], WasmGlobal[], WasmExport[])
 
 # ============================================================================
 # Module Building API
@@ -420,6 +432,49 @@ function add_export!(mod::WasmModule, name::String, kind::Integer, idx::Integer)
     return mod
 end
 
+"""
+    add_global!(mod, valtype, mutable, init_value) -> global_idx
+
+Add a global variable to the module and return its index.
+The init_value should be a constant of the appropriate type.
+"""
+function add_global!(mod::WasmModule, valtype::WasmValType, mutable_::Bool, init_value)::UInt32
+    # Generate initialization expression
+    init = UInt8[]
+    if valtype == I32
+        push!(init, Opcode.I32_CONST)
+        append!(init, encode_leb128_signed(Int32(init_value)))
+    elseif valtype == I64
+        push!(init, Opcode.I64_CONST)
+        append!(init, encode_leb128_signed(Int64(init_value)))
+    elseif valtype == F32
+        push!(init, Opcode.F32_CONST)
+        append!(init, reinterpret(UInt8, [Float32(init_value)]))
+    elseif valtype == F64
+        push!(init, Opcode.F64_CONST)
+        append!(init, reinterpret(UInt8, [Float64(init_value)]))
+    elseif valtype == ExternRef
+        # externref initialized to null
+        push!(init, Opcode.REF_NULL)
+        push!(init, 0x6F)  # externref heap type
+    else
+        error("Unsupported global type: $valtype")
+    end
+    push!(init, Opcode.END)
+
+    push!(mod.globals, WasmGlobal(valtype, mutable_, init))
+    return UInt32(length(mod.globals) - 1)
+end
+
+"""
+    add_global_export!(mod, name, global_idx)
+
+Export a global variable.
+"""
+function add_global_export!(mod::WasmModule, name::String, global_idx::Integer)
+    add_export!(mod, name, 3, global_idx)  # kind 3 = global
+end
+
 # ============================================================================
 # Binary Serialization
 # ============================================================================
@@ -431,6 +486,7 @@ const WASM_VERSION = UInt8[0x01, 0x00, 0x00, 0x00]  # version 1
 const SECTION_TYPE = 0x01
 const SECTION_IMPORT = 0x02
 const SECTION_FUNCTION = 0x03
+const SECTION_GLOBAL = 0x06
 const SECTION_EXPORT = 0x07
 const SECTION_CODE = 0x0A
 
@@ -475,6 +531,20 @@ function to_bytes(mod::WasmModule)::Vector{UInt8}
             write_u32!(section, length(mod.functions))
             for func in mod.functions
                 write_u32!(section, func.type_idx)
+            end
+        end
+    end
+
+    # Global section
+    if !isempty(mod.globals)
+        write_section!(w, SECTION_GLOBAL) do section
+            write_u32!(section, length(mod.globals))
+            for g in mod.globals
+                # Global type: valtype + mutability
+                write_valtype!(section, g.valtype)
+                write_byte!(section, g.mutable_ ? 0x01 : 0x00)
+                # Init expression (already includes END byte)
+                append!(section.buffer, g.init)
             end
         end
     end

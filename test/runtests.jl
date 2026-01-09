@@ -1368,6 +1368,23 @@ end
             @test validate_wasm(wasm_bytes)
         end
 
+        @testset "Wasm globals" begin
+            # Test global variable creation and export
+            mod = WasmTarget.WasmModule()
+
+            # Add mutable i32 global
+            global_idx = WasmTarget.add_global!(mod, WasmTarget.I32, true, 0)
+            @test global_idx == 0
+
+            # Export it
+            WasmTarget.add_global_export!(mod, "counter", global_idx)
+
+            # Serialize and validate
+            bytes = WasmTarget.to_bytes(mod)
+            @test length(bytes) > 0
+            @test validate_wasm(bytes)
+        end
+
     end
 
 end

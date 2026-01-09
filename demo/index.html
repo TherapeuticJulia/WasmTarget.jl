@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Julia REPL - WasmTarget.jl</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+            font-size: 14px;
+            line-height: 1.5;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            background: #2d2d2d;
+            padding: 8px 15px;
+            border-bottom: 1px solid #404040;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .header-title { color: #9cdcfe; font-weight: 600; }
+        .header-status {
+            font-size: 12px;
+            padding: 3px 10px;
+            border-radius: 3px;
+        }
+        .status-online { background: #2ea043; color: white; }
+        .status-offline { background: #6e7681; color: white; }
+        .terminal {
+            flex: 1;
+            overflow-y: auto;
+            padding: 15px;
+            background: #1e1e1e;
+        }
+        .line { white-space: pre-wrap; word-wrap: break-word; }
+        .prompt { color: #4ec9b0; }
+        .input-text { color: #d4d4d4; }
+        .result { color: #b5cea8; }
+        .wasm-result { color: #4ec9b0; }
+        .error { color: #f14c4c; }
+        .info { color: #6a9955; }
+        .wasm-tag {
+            color: #1e1e1e;
+            background: #4ec9b0;
+            padding: 1px 5px;
+            border-radius: 3px;
+            font-size: 11px;
+            margin-left: 8px;
+        }
+        .input-line { display: flex; align-items: flex-start; }
+        .input-line .prompt { flex-shrink: 0; }
+        #input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: #d4d4d4;
+            font-family: inherit;
+            font-size: inherit;
+            outline: none;
+            resize: none;
+            overflow: hidden;
+        }
+        .banner { color: #569cd6; margin-bottom: 10px; }
+        .note { color: #808080; font-size: 12px; margin-bottom: 15px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <span class="header-title">Julia REPL (WasmTarget.jl)</span>
+        <span class="header-status status-offline" id="status">Connecting...</span>
+    </div>
+    <div class="terminal" id="terminal">
+        <pre class="banner">               _
+   _       _ _(_)_     |  WasmTarget.jl REPL
+  (_)     | (_) (_)    |  Pure Julia to WebAssembly
+   _ _   _| |_  __ _   |
+  | | | | | | |/ _` |  |  Functions compile to Wasm bytecode
+  | | |_| | | | (_| |  |  and execute in your browser
+ _/ |\__'_|_|_|\__'_|  |
+|__/                   |</pre>
+        <div class="note">Currently requires type annotations: add(a::Int32, b::Int32) = a + b
+Type inference coming in future versions.</div>
+        <div id="output"></div>
+        <div class="input-line">
+            <span class="prompt">julia&gt; </span>
+            <textarea id="input" rows="1" autofocus spellcheck="false"></textarea>
+        </div>
+    </div>
+
+    <script>
+        const SERVER = 'http://localhost:8081';
+        const terminal = document.getElementById('terminal');
+        const output = document.getElementById('output');
+        const input = document.getElementById('input');
+        const statusEl = document.getElementById('status');
+        let history = [];
+        let historyIndex = -1;
+
+        function autoResize() {
+            input.style.height = 'auto';
+            input.style.height = input.scrollHeight + 'px';
+        }
+        input.addEventListener('input', autoResize);
+
+        function print(text, className = '', suffix = '') {
+            const line = document.createElement('div');
+            line.className = 'line ' + className;
+            line.innerHTML = escapeHtml(text) + suffix;
+            output.appendChild(line);
+            terminal.scrollTop = terminal.scrollHeight;
+        }
+
+        function printInput(text) {
+            const lines = text.split('\n');
+            lines.forEach((line, i) => {
+                const div = document.createElement('div');
+                div.className = 'line';
+                const prefix = i === 0 ? 'julia&gt; ' : '       ';
+                div.innerHTML = '<span class="prompt">' + prefix + '</span><span class="input-text">' + escapeHtml(line) + '</span>';
+                output.appendChild(div);
+            });
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        async function checkServer() {
+            try {
+                const response = await fetch(`${SERVER}/health`);
+                if (response.ok) {
+                    const data = await response.json();
+                    statusEl.textContent = 'Connected (Wasm-only)';
+                    statusEl.className = 'header-status status-online';
+                    return true;
+                }
+            } catch (e) {}
+            statusEl.textContent = 'Offline';
+            statusEl.className = 'header-status status-offline';
+            return false;
+        }
+
+        async function evaluate(code) {
+            if (!await checkServer()) {
+                print('Server not running. Start with:', 'error');
+                print('  julia --project=. demo/repl_server.jl', 'info');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${SERVER}/eval`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code })
+                });
+                const data = await response.json();
+
+                if (data.type === 'error') {
+                    print(data.message, 'error');
+                } else if (data.type === 'result') {
+                    if (data.value) print(data.value, 'result');
+                } else if (data.type === 'wasm') {
+                    // Execute Wasm in browser - this is the real deal!
+                    await executeWasm(data.wasm, data.args, data.func_name, data.size);
+                }
+            } catch (e) {
+                print('Error: ' + e.message, 'error');
+            }
+        }
+
+        async function executeWasm(wasmBytes, args, funcName, size) {
+            try {
+                const bytes = new Uint8Array(wasmBytes);
+                const { instance } = await WebAssembly.instantiate(bytes);
+                const func = instance.exports[funcName];
+
+                if (!func) {
+                    print('Wasm module missing export: ' + funcName, 'error');
+                    return;
+                }
+
+                const result = func(...args);
+                const displayResult = typeof result === 'bigint' ? result.toString() : String(result);
+
+                // Show result with Wasm indicator
+                print(displayResult, 'wasm-result', '<span class="wasm-tag">WASM ' + size + 'B</span>');
+            } catch (e) {
+                print('Wasm execution error: ' + e.message, 'error');
+            }
+        }
+
+        input.addEventListener('keydown', async (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                const code = input.value.trim();
+                if (code) {
+                    history.push(code);
+                    historyIndex = history.length;
+                    printInput(code);
+                    input.value = '';
+                    autoResize();
+                    await evaluate(code);
+                }
+                terminal.scrollTop = terminal.scrollHeight;
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                if (historyIndex > 0) {
+                    historyIndex--;
+                    input.value = history[historyIndex];
+                    autoResize();
+                }
+            } else if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                if (historyIndex < history.length - 1) {
+                    historyIndex++;
+                    input.value = history[historyIndex];
+                } else {
+                    historyIndex = history.length;
+                    input.value = '';
+                }
+                autoResize();
+            }
+        });
+
+        terminal.addEventListener('click', () => input.focus());
+
+        async function init() {
+            const online = await checkServer();
+            if (!online) {
+                print('Start the compilation server:', 'info');
+                print('  julia --project=. demo/repl_server.jl', 'info');
+            } else {
+                print('Ready. Try: add(a::Int32, b::Int32) = a + b', 'info');
+            }
+            print('', '');
+            input.focus();
+        }
+
+        setInterval(checkServer, 3000);
+        init();
+    </script>
+</body>
+</html>

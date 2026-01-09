@@ -174,6 +174,126 @@ function unmarshal_result(result)
 end
 
 # ============================================================================
+# Wasm Execution with Imports
+# ============================================================================
+
+"""
+    run_wasm_with_imports(wasm_bytes, func_name, imports, args...) -> Any
+
+Execute a WebAssembly function with JavaScript imports.
+
+# Arguments
+- `wasm_bytes`: The compiled WebAssembly binary
+- `func_name`: Name of the exported function to call
+- `imports`: Dict of module_name => Dict of field_name => JS function code
+- `args...`: Arguments to pass to the function
+
+# Example
+```julia
+imports = Dict("env" => Dict("log" => "(x) => console.log(x)"))
+run_wasm_with_imports(bytes, "main", imports, Int32(42))
+```
+"""
+function run_wasm_with_imports(wasm_bytes::Vector{UInt8}, func_name::String,
+                               imports::Dict, args...)
+    if NODE_CMD === nothing
+        @warn "Node.js not available. Skipping Wasm execution."
+        return nothing
+    end
+
+    dir = mktempdir()
+    wasm_path = joinpath(dir, "module.wasm")
+    js_path = joinpath(dir, "loader.mjs")
+
+    # Write the Wasm binary
+    write(wasm_path, wasm_bytes)
+
+    # Convert Julia args to JS args
+    js_args = join(map(arg -> format_js_arg(arg), args), ", ")
+
+    # Build imports object
+    imports_js = build_imports_js(imports)
+
+    # Generate the loader script
+    loader_script = """
+import fs from 'fs';
+
+const bytes = fs.readFileSync('$(escape_string(wasm_path))');
+
+$imports_js
+
+async function run() {
+    try {
+        const wasmModule = await WebAssembly.instantiate(bytes, importObject);
+        const func = wasmModule.instance.exports['$func_name'];
+
+        if (typeof func !== 'function') {
+            console.error('Export "$func_name" is not a function');
+            process.exit(1);
+        }
+
+        const result = func($js_args);
+
+        // Handle BigInt serialization for JSON
+        const serialized = JSON.stringify(result, (key, value) => {
+            if (typeof value === 'bigint') {
+                return { __bigint__: value.toString() };
+            }
+            return value;
+        });
+
+        console.log(serialized);
+    } catch (e) {
+        console.error('Wasm execution error:', e.message);
+        process.exit(1);
+    }
+}
+
+run();
+"""
+
+    open(js_path, "w") do io
+        print(io, loader_script)
+    end
+
+    # Run Node.js
+    try
+        node_cmd = NEEDS_EXPERIMENTAL_FLAG ? `$NODE_CMD --experimental-wasm-gc $js_path` : `$NODE_CMD $js_path`
+        output = read(pipeline(node_cmd; stderr=stderr), String)
+        output = strip(output)
+
+        if isempty(output)
+            return nothing
+        end
+
+        result = JSON.parse(output)
+        return unmarshal_result(result)
+    catch e
+        if e isa ProcessFailedException
+            error("Wasm execution failed. Check stderr for details.")
+        end
+        rethrow()
+    end
+end
+
+"""
+Build JavaScript code for import object.
+"""
+function build_imports_js(imports::Dict)
+    parts = String[]
+    push!(parts, "const importObject = {")
+    for (mod_name, fields) in imports
+        push!(parts, "  \"$mod_name\": {")
+        for (field_name, func_code) in fields
+            push!(parts, "    \"$field_name\": $func_code,")
+        end
+        push!(parts, "  },")
+    end
+    push!(parts, "};")
+    return join(parts, "\n")
+end
+
+# ============================================================================
 # TDD Test Macros
 # ============================================================================
 

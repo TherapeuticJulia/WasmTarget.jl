@@ -1,7 +1,7 @@
 # Wasm Types - Value types, Reference types, and composite types
 # Reference: https://webassembly.github.io/spec/core/binary/types.html
 
-export ValType, NumType, RefType, FuncType
+export ValType, NumType, RefType, ConcreteRef, FuncType, StructType, ArrayType, FieldType, CompositeType, WasmValType
 
 # ============================================================================
 # Value Types (Section 5.3.1)
@@ -41,6 +41,26 @@ Reference types in WebAssembly (including WasmGC extensions).
     ArrayRef = 0x6A   # arrayref (WasmGC)
 end
 
+"""
+    ConcreteRef
+
+A concrete reference type with a type index, e.g., `(ref null \$typeidx)`.
+Used for locals and parameters that hold instances of specific struct/array types.
+"""
+struct ConcreteRef
+    type_idx::UInt32
+    nullable::Bool
+end
+
+ConcreteRef(type_idx::UInt32) = ConcreteRef(type_idx, true)  # Default nullable
+
+"""
+    WasmValType
+
+Union type for all Wasm value types (numeric, reference, packed, concrete refs).
+"""
+const WasmValType = Union{NumType, RefType, ConcreteRef, UInt8}
+
 # ============================================================================
 # Function Types (Section 5.3.6)
 # ============================================================================
@@ -49,11 +69,97 @@ end
     FuncType
 
 A function type describing the signature of a WebAssembly function.
+Supports both numeric types and reference types (for WasmGC).
 """
 struct FuncType
-    params::Vector{NumType}
-    results::Vector{NumType}
+    params::Vector{WasmValType}
+    results::Vector{WasmValType}
 end
+
+# Convenience constructor for NumType-only signatures
+FuncType(params::Vector{NumType}, results::Vector{NumType}) =
+    FuncType(WasmValType[p for p in params], WasmValType[r for r in results])
+
+# ============================================================================
+# WasmGC Types
+# Reference: https://github.com/WebAssembly/gc/blob/main/proposals/gc/Overview.md
+# ============================================================================
+
+"""
+    FieldType
+
+A field in a WasmGC struct type.
+"""
+struct FieldType
+    valtype::WasmValType  # The type of the field
+    mutable_::Bool        # Whether the field is mutable
+end
+
+FieldType(valtype::WasmValType) = FieldType(valtype, true)  # Default to mutable
+
+"""
+    StructType
+
+A WasmGC struct type with named fields.
+"""
+struct StructType
+    fields::Vector{FieldType}
+end
+
+"""
+    ArrayType
+
+A WasmGC array type with element type.
+"""
+struct ArrayType
+    elem::FieldType  # Element type with mutability
+end
+
+ArrayType(valtype::WasmValType) = ArrayType(FieldType(valtype, true))
+
+"""
+    CompositeType
+
+Union of all composite types in WasmGC.
+"""
+const CompositeType = Union{FuncType, StructType, ArrayType}
+
+"""
+    HeapType
+
+Represents a heap type - either an abstract type or a concrete type index.
+"""
+struct HeapType
+    # If index >= 0, it's a concrete type index
+    # If index < 0, it's an abstract type encoded as negative
+    index::Int32
+end
+
+# Abstract heap types (encoded as negative values internally)
+const HEAP_FUNC = HeapType(-1)      # func
+const HEAP_EXTERN = HeapType(-2)    # extern
+const HEAP_ANY = HeapType(-3)       # any
+const HEAP_EQ = HeapType(-4)        # eq
+const HEAP_I31 = HeapType(-5)       # i31
+const HEAP_STRUCT = HeapType(-6)    # struct
+const HEAP_ARRAY = HeapType(-7)     # array
+const HEAP_NONE = HeapType(-8)      # none
+const HEAP_NOEXTERN = HeapType(-9)  # noextern
+const HEAP_NOFUNC = HeapType(-10)   # nofunc
+
+HeapType(idx::Integer) = HeapType(Int32(idx))
+
+"""
+    RefTypeGC
+
+A reference type in WasmGC with nullability.
+"""
+struct RefTypeGC
+    nullable::Bool
+    heaptype::HeapType
+end
+
+RefTypeGC(ht::HeapType) = RefTypeGC(true, ht)  # Default to nullable
 
 # ============================================================================
 # Limits (for memories and tables)
@@ -72,9 +178,9 @@ Limits(min::Integer, max::Integer) = Limits(UInt32(min), UInt32(max))
 # ============================================================================
 
 """
-Convert a Julia type to a Wasm NumType.
+Convert a Julia type to a Wasm value type (NumType or RefType).
 """
-function julia_to_wasm_type(::Type{T}) where T
+function julia_to_wasm_type(::Type{T})::WasmValType where T
     if T === Int32 || T === UInt32
         return I32
     elseif T === Int64 || T === UInt64 || T === Int
@@ -83,6 +189,24 @@ function julia_to_wasm_type(::Type{T}) where T
         return F32
     elseif T === Float64
         return F64
+    elseif T === Bool
+        # Bool is represented as i32 (0 or 1)
+        return I32
+    elseif T === UInt8 || T === Int8 || T === UInt16 || T === Int16
+        # Smaller integers also use i32
+        return I32
+    elseif T === String
+        # Strings are represented as WasmGC arrays
+        return ArrayRef
+    elseif T <: Tuple
+        # Tuples map to WasmGC structs
+        return StructRef
+    elseif T <: AbstractArray
+        # Arrays map to WasmGC arrays
+        return ArrayRef
+    elseif isconcretetype(T) && isstructtype(T)
+        # User-defined structs map to WasmGC structs
+        return StructRef
     else
         error("Unsupported Julia type for Wasm: $T")
     end

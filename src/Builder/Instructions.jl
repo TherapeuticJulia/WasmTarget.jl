@@ -1,7 +1,7 @@
 # WebAssembly Instructions and Opcodes
 # Reference: https://webassembly.github.io/spec/core/binary/instructions.html
 
-export Opcode, WasmModule, add_function!, add_export!, to_bytes
+export Opcode, WasmModule, WasmImport, add_function!, add_import!, add_export!, add_struct_type!, add_array_type!, to_bytes
 
 # ============================================================================
 # Opcodes (Section 5.4)
@@ -77,6 +77,22 @@ module Opcode
     const I64_LE_U = 0x58
     const I64_GE_S = 0x59
     const I64_GE_U = 0x5A
+
+    # Numeric instructions - f32 comparisons
+    const F32_EQ = 0x5B
+    const F32_NE = 0x5C
+    const F32_LT = 0x5D
+    const F32_GT = 0x5E
+    const F32_LE = 0x5F
+    const F32_GE = 0x60
+
+    # Numeric instructions - f64 comparisons
+    const F64_EQ = 0x61
+    const F64_NE = 0x62
+    const F64_LT = 0x63
+    const F64_GT = 0x64
+    const F64_LE = 0x65
+    const F64_GE = 0x66
 
     # Numeric instructions - i32 arithmetic
     const I32_CLZ = 0x67
@@ -156,10 +172,78 @@ module Opcode
     const I64_EXTEND_I32_U = 0xAD
     const F32_CONVERT_I32_S = 0xB2
     const F32_CONVERT_I32_U = 0xB3
+    const F32_CONVERT_I64_S = 0xB4
+    const F32_CONVERT_I64_U = 0xB5
     const F64_CONVERT_I32_S = 0xB7
     const F64_CONVERT_I32_U = 0xB8
     const F64_CONVERT_I64_S = 0xB9
     const F64_CONVERT_I64_U = 0xBA
+
+    # Float to int conversions
+    const I32_TRUNC_F32_S = 0xA8
+    const I32_TRUNC_F32_U = 0xA9
+    const I32_TRUNC_F64_S = 0xAA
+    const I32_TRUNC_F64_U = 0xAB
+    const I64_TRUNC_F32_S = 0xAE
+    const I64_TRUNC_F32_U = 0xAF
+    const I64_TRUNC_F64_S = 0xB0
+    const I64_TRUNC_F64_U = 0xB1
+
+    # Reinterpret operations
+    const I32_REINTERPRET_F32 = 0xBC
+    const I64_REINTERPRET_F64 = 0xBD
+    const F32_REINTERPRET_I32 = 0xBE
+    const F64_REINTERPRET_I64 = 0xBF
+
+    # ========================================================================
+    # WasmGC Instructions (0xFB prefix)
+    # Reference: https://github.com/WebAssembly/gc/blob/main/proposals/gc/Overview.md
+    # ========================================================================
+    const GC_PREFIX = 0xFB
+
+    # Struct operations
+    const STRUCT_NEW = 0x00       # struct.new $t : [field types] -> [(ref $t)]
+    const STRUCT_NEW_DEFAULT = 0x01  # struct.new_default $t : [] -> [(ref $t)]
+    const STRUCT_GET = 0x02       # struct.get $t $i : [(ref null $t)] -> [field type]
+    const STRUCT_GET_S = 0x03     # struct.get_s $t $i (packed signed)
+    const STRUCT_GET_U = 0x04     # struct.get_u $t $i (packed unsigned)
+    const STRUCT_SET = 0x05       # struct.set $t $i : [(ref null $t) value] -> []
+
+    # Array operations
+    const ARRAY_NEW = 0x06        # array.new $t : [elem init, len] -> [(ref $t)]
+    const ARRAY_NEW_DEFAULT = 0x07  # array.new_default $t : [len] -> [(ref $t)]
+    const ARRAY_NEW_FIXED = 0x08  # array.new_fixed $t $n : [elem...] -> [(ref $t)]
+    const ARRAY_NEW_DATA = 0x09   # array.new_data $t $d : [offset, len] -> [(ref $t)]
+    const ARRAY_NEW_ELEM = 0x0A   # array.new_elem $t $e
+    const ARRAY_GET = 0x0B        # array.get $t : [(ref null $t) i32] -> [elem type]
+    const ARRAY_GET_S = 0x0C      # array.get_s (packed signed)
+    const ARRAY_GET_U = 0x0D      # array.get_u (packed unsigned)
+    const ARRAY_SET = 0x0E        # array.set $t : [(ref null $t) i32 value] -> []
+    const ARRAY_LEN = 0x0F        # array.len : [(ref null array)] -> [i32]
+    const ARRAY_FILL = 0x10       # array.fill $t : [(ref null $t) i32 value i32] -> []
+    const ARRAY_COPY = 0x11       # array.copy $t1 $t2
+
+    # Reference type operations
+    const REF_NULL = 0xD0         # ref.null $t : [] -> [(ref null $t)]
+    const REF_IS_NULL = 0xD1      # ref.is_null : [(ref null $t)] -> [i32]
+    const REF_FUNC = 0xD2         # ref.func $f : [] -> [(ref $f)]
+    const REF_EQ = 0xD3           # ref.eq : [(eqref) (eqref)] -> [i32]
+    const REF_AS_NON_NULL = 0xD4  # ref.as_non_null : [(ref null $t)] -> [(ref $t)]
+
+    # GC casting operations (0xFB prefix)
+    const REF_CAST = 0x17         # ref.cast (ref null? $t) : [(ref null? $ht)] -> [(ref null? $t)]
+    const REF_TEST = 0x14         # ref.test (ref null? $t) : [(ref null? $ht)] -> [i32]
+    const BR_ON_CAST = 0x18       # br_on_cast
+    const BR_ON_CAST_FAIL = 0x19  # br_on_cast_fail
+
+    # i31 operations (0xFB prefix)
+    const REF_I31 = 0x1C          # ref.i31 : [i32] -> [(ref i31)]
+    const I31_GET_S = 0x1D        # i31.get_s : [(ref null i31)] -> [i32]
+    const I31_GET_U = 0x1E        # i31.get_u : [(ref null i31)] -> [i32]
+
+    # any/extern conversions (0xFB prefix)
+    const ANY_CONVERT_EXTERN = 0x1A  # any.convert_extern
+    const EXTERN_CONVERT_ANY = 0x1B  # extern.convert_any
 end
 
 # ============================================================================
@@ -171,7 +255,7 @@ Represents a WebAssembly function definition.
 """
 struct WasmFunction
     type_idx::UInt32
-    locals::Vector{NumType}
+    locals::Vector{WasmValType}
     body::Vector{UInt8}
 end
 
@@ -185,52 +269,129 @@ struct WasmExport
 end
 
 """
+Represents an import entry.
+"""
+struct WasmImport
+    module_name::String
+    field_name::String
+    kind::UInt8  # 0=func, 1=table, 2=memory, 3=global
+    type_idx::UInt32  # For functions, the type index
+end
+
+"""
     WasmModule
 
 A WebAssembly module builder. Use this to construct modules programmatically.
 """
 mutable struct WasmModule
-    types::Vector{FuncType}
+    types::Vector{CompositeType}  # Can contain FuncType, StructType, ArrayType
+    imports::Vector{WasmImport}   # Imported functions/tables/etc
     functions::Vector{WasmFunction}
     exports::Vector{WasmExport}
 end
 
-WasmModule() = WasmModule(FuncType[], WasmFunction[], WasmExport[])
+WasmModule() = WasmModule(CompositeType[], WasmImport[], WasmFunction[], WasmExport[])
 
 # ============================================================================
 # Module Building API
 # ============================================================================
 
 """
-    add_type!(mod, func_type) -> type_idx
+    add_type!(mod, composite_type) -> type_idx
 
-Add a function type to the module and return its index.
+Add a composite type (FuncType, StructType, or ArrayType) to the module and return its index.
 """
-function add_type!(mod::WasmModule, ft::FuncType)::UInt32
+function add_type!(mod::WasmModule, ct::CompositeType)::UInt32
     # Check if type already exists
     for (i, existing) in enumerate(mod.types)
-        if existing.params == ft.params && existing.results == ft.results
+        if types_equal(existing, ct)
             return UInt32(i - 1)
         end
     end
-    push!(mod.types, ft)
+    push!(mod.types, ct)
     return UInt32(length(mod.types) - 1)
+end
+
+function types_equal(a::FuncType, b::FuncType)
+    a.params == b.params && a.results == b.results
+end
+
+function types_equal(a::StructType, b::StructType)
+    length(a.fields) == length(b.fields) &&
+    all(fields_equal(af, bf) for (af, bf) in zip(a.fields, b.fields))
+end
+
+function types_equal(a::ArrayType, b::ArrayType)
+    fields_equal(a.elem, b.elem)
+end
+
+types_equal(a::CompositeType, b::CompositeType) = false  # Different types
+
+function fields_equal(a::FieldType, b::FieldType)
+    a.valtype == b.valtype && a.mutable_ == b.mutable_
+end
+
+"""
+    add_struct_type!(mod, fields) -> type_idx
+
+Add a struct type to the module and return its index.
+"""
+function add_struct_type!(mod::WasmModule, fields::Vector{FieldType})::UInt32
+    add_type!(mod, StructType(fields))
+end
+
+"""
+    add_array_type!(mod, elem_type, mutable_=true) -> type_idx
+
+Add an array type to the module and return its index.
+"""
+function add_array_type!(mod::WasmModule, elem_type::WasmValType, mutable_::Bool=true)::UInt32
+    add_type!(mod, ArrayType(FieldType(elem_type, mutable_)))
+end
+
+"""
+    add_import!(mod, module_name, field_name, params, results) -> func_idx
+
+Add an imported function to the module and return its function index.
+Imported functions come before local functions in the function index space.
+"""
+function add_import!(mod::WasmModule,
+                     module_name::String,
+                     field_name::String,
+                     params::Vector{NumType},
+                     results::Vector{NumType})::UInt32
+    ft = FuncType(params, results)
+    type_idx = add_type!(mod, ft)
+    push!(mod.imports, WasmImport(module_name, field_name, 0x00, type_idx))
+    return UInt32(length(mod.imports) - 1)  # Import function indices
+end
+
+"""
+    num_imported_funcs(mod) -> Int
+
+Return the number of imported functions (affects function index space).
+"""
+function num_imported_funcs(mod::WasmModule)::Int
+    count(imp -> imp.kind == 0x00, mod.imports)
 end
 
 """
     add_function!(mod, params, results, locals, body) -> func_idx
 
 Add a function to the module and return its index.
+Note: Local function indices start after imported functions.
+Params and results can be NumType or WasmValType vectors.
 """
 function add_function!(mod::WasmModule,
-                       params::Vector{NumType},
-                       results::Vector{NumType},
-                       locals::Vector{NumType},
+                       params::Vector{<:WasmValType},
+                       results::Vector{<:WasmValType},
+                       locals::Vector{<:WasmValType},
                        body::Vector{UInt8})::UInt32
-    ft = FuncType(params, results)
+    ft = FuncType(WasmValType[p for p in params], WasmValType[r for r in results])
     type_idx = add_type!(mod, ft)
-    push!(mod.functions, WasmFunction(type_idx, locals, body))
-    return UInt32(length(mod.functions) - 1)
+    push!(mod.functions, WasmFunction(type_idx, WasmValType[l for l in locals], body))
+    # Function index = number of imported functions + local function index
+    return UInt32(num_imported_funcs(mod) + length(mod.functions) - 1)
 end
 
 """
@@ -253,6 +414,7 @@ const WASM_VERSION = UInt8[0x01, 0x00, 0x00, 0x00]  # version 1
 
 # Section IDs
 const SECTION_TYPE = 0x01
+const SECTION_IMPORT = 0x02
 const SECTION_FUNCTION = 0x03
 const SECTION_EXPORT = 0x07
 const SECTION_CODE = 0x0A
@@ -273,10 +435,21 @@ function to_bytes(mod::WasmModule)::Vector{UInt8}
     if !isempty(mod.types)
         write_section!(w, SECTION_TYPE) do section
             write_u32!(section, length(mod.types))
-            for ft in mod.types
-                write_byte!(section, 0x60)  # functype
-                write_vec!(section, [UInt8(p) for p in ft.params])
-                write_vec!(section, [UInt8(r) for r in ft.results])
+            for ct in mod.types
+                write_composite_type!(section, ct)
+            end
+        end
+    end
+
+    # Import section
+    if !isempty(mod.imports)
+        write_section!(w, SECTION_IMPORT) do section
+            write_u32!(section, length(mod.imports))
+            for imp in mod.imports
+                write_name!(section, imp.module_name)
+                write_name!(section, imp.field_name)
+                write_byte!(section, imp.kind)
+                write_u32!(section, imp.type_idx)
             end
         end
     end
@@ -318,9 +491,9 @@ function to_bytes(mod::WasmModule)::Vector{UInt8}
                     # Group consecutive locals of same type
                     local_groups = group_locals(func.locals)
                     write_u32!(body_writer, length(local_groups))
-                    for (count, type) in local_groups
+                    for (count, valtype) in local_groups
                         write_u32!(body_writer, count)
-                        write_byte!(body_writer, UInt8(type))
+                        write_valtype!(body_writer, valtype)
                     end
                 end
 
@@ -352,10 +525,10 @@ end
 """
 Group consecutive locals of the same type.
 """
-function group_locals(locals::Vector{NumType})
-    isempty(locals) && return Tuple{Int, NumType}[]
+function group_locals(locals::Vector{<:WasmValType})
+    isempty(locals) && return Tuple{Int, WasmValType}[]
 
-    groups = Tuple{Int, NumType}[]
+    groups = Tuple{Int, WasmValType}[]
     current_type = locals[1]
     count = 1
 
@@ -371,4 +544,78 @@ function group_locals(locals::Vector{NumType})
     push!(groups, (count, current_type))
 
     return groups
+end
+
+# ============================================================================
+# Composite Type Serialization (WasmGC)
+# ============================================================================
+
+# Type constructors for binary encoding
+const FUNCTYPE_BYTE = 0x60
+const STRUCTTYPE_BYTE = 0x5F
+const ARRAYTYPE_BYTE = 0x5E
+
+"""
+Write a composite type to the type section.
+"""
+function write_composite_type!(w::WasmWriter, ft::FuncType)
+    write_byte!(w, FUNCTYPE_BYTE)
+    # Write params as a vector of valtypes
+    write_u32!(w, length(ft.params))
+    for p in ft.params
+        write_valtype!(w, p)
+    end
+    # Write results as a vector of valtypes
+    write_u32!(w, length(ft.results))
+    for r in ft.results
+        write_valtype!(w, r)
+    end
+end
+
+function write_composite_type!(w::WasmWriter, st::StructType)
+    write_byte!(w, STRUCTTYPE_BYTE)
+    write_u32!(w, length(st.fields))
+    for field in st.fields
+        write_field_type!(w, field)
+    end
+end
+
+function write_composite_type!(w::WasmWriter, at::ArrayType)
+    write_byte!(w, ARRAYTYPE_BYTE)
+    write_field_type!(w, at.elem)
+end
+
+"""
+Write a field type (valtype + mutability).
+"""
+function write_field_type!(w::WasmWriter, ft::FieldType)
+    write_valtype!(w, ft.valtype)
+    write_byte!(w, ft.mutable_ ? 0x01 : 0x00)
+end
+
+"""
+Write a value type (NumType, RefType, or packed type).
+"""
+function write_valtype!(w::WasmWriter, vt::NumType)
+    write_byte!(w, UInt8(vt))
+end
+
+function write_valtype!(w::WasmWriter, vt::RefType)
+    write_byte!(w, UInt8(vt))
+end
+
+function write_valtype!(w::WasmWriter, vt::UInt8)
+    write_byte!(w, vt)
+end
+
+function write_valtype!(w::WasmWriter, vt::ConcreteRef)
+    # Concrete reference type: (ref null $typeidx) or (ref $typeidx)
+    # Binary format: 0x63 (nullable) or 0x64 (non-nullable) followed by heap type index
+    if vt.nullable
+        write_byte!(w, 0x63)  # ref null
+    else
+        write_byte!(w, 0x64)  # ref
+    end
+    # Heap type index is a signed LEB128 (s33)
+    write_i32!(w, Int32(vt.type_idx))
 end

@@ -997,6 +997,25 @@ function julia_to_wasm_type_concrete(T, ctx::CompilationContext)::WasmValType
 end
 
 """
+Emit bytecode to convert a value on the stack to f64.
+Used for DOM bindings where all numeric values are passed as f64 for JS compatibility.
+"""
+function emit_convert_to_f64(valtype::WasmValType)::Vector{UInt8}
+    if valtype == I32
+        return UInt8[0xB7]  # f64.convert_i32_s
+    elseif valtype == I64
+        return UInt8[0xB9]  # f64.convert_i64_s
+    elseif valtype == F32
+        return UInt8[0xBB]  # f64.promote_f32
+    elseif valtype == F64
+        return UInt8[]      # Already f64, no conversion needed
+    else
+        # For other types (refs, etc.), no conversion - will cause type error
+        return UInt8[]
+    end
+end
+
+"""
 Encode a block result type (for if/block/loop).
 Handles both simple types (i32/i64/f32/f64) and concrete reference types.
 Returns a vector of bytes to append to the instruction stream.
@@ -2008,6 +2027,9 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
 
         # Inject DOM update calls for this signal (Therapy.jl reactive updates)
         if haskey(ctx.dom_bindings, global_idx)
+            # Get global's type for conversion
+            global_type = ctx.mod.globals[global_idx + 1].valtype
+
             for (import_idx, const_args) in ctx.dom_bindings[global_idx]
                 # Push constant arguments (e.g., hydration key)
                 for arg in const_args
@@ -2017,6 +2039,8 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
                 # Push the signal value (re-read from global)
                 push!(bytes, Opcode.GLOBAL_GET)
                 append!(bytes, encode_leb128_unsigned(global_idx))
+                # Convert to f64 for DOM imports (all DOM imports expect f64)
+                append!(bytes, emit_convert_to_f64(global_type))
                 # Call the DOM import function
                 push!(bytes, Opcode.CALL)
                 append!(bytes, encode_leb128_unsigned(import_idx))
@@ -2701,6 +2725,9 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
 
             # Inject DOM update calls for this signal (Therapy.jl reactive updates)
             if haskey(ctx.dom_bindings, global_idx)
+                # Get global's type for conversion
+                global_type = ctx.mod.globals[global_idx + 1].valtype
+
                 for (import_idx, const_args) in ctx.dom_bindings[global_idx]
                     # Push constant arguments (e.g., hydration key)
                     for arg in const_args
@@ -2710,6 +2737,8 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
                     # Push the signal value (re-read from global)
                     push!(bytes, Opcode.GLOBAL_GET)
                     append!(bytes, encode_leb128_unsigned(global_idx))
+                    # Convert to f64 for DOM imports (all DOM imports expect f64)
+                    append!(bytes, emit_convert_to_f64(global_type))
                     # Call the DOM import function
                     push!(bytes, Opcode.CALL)
                     append!(bytes, encode_leb128_unsigned(import_idx))

@@ -116,10 +116,33 @@ Per-function compilation state:
 11. **Cross-Function Calls**: Functions calling other functions in same module
 12. **Multiple Dispatch**: Same function name, different type signatures
 13. **JS Interop**: externref (JSValue type), imports with RefTypes
+14. **Wasm Globals**: Mutable/immutable globals, exported to JS
+15. **Callbacks**: Exported functions work as JS event handlers
+
+### Therapy.jl Pattern Demo
+
+The counter example in `/tmp/counter.wasm` demonstrates the core pattern:
+
+```julia
+# Globals serve as reactive state (like Signals)
+global_count = add_global!(mod, I32, true, 0)
+
+# Exported functions serve as event handlers
+# increment() modifies global, JS calls it on click
+add_export!(mod, "increment", 0, func_idx)
+
+# JS imports for DOM manipulation
+add_import!(mod, "dom", "set_text_content", [ExternRef, I32], [])
+```
+
+This pattern enables Therapy.jl to:
+- Store reactive state in Wasm globals
+- Generate event handlers as exported functions (via macros)
+- Call DOM APIs through imports
 
 ### Test Coverage
 
-~170 tests organized in phases:
+~173 tests organized in phases:
 - Phase 1-3: Infrastructure, builder, compiler basics
 - Phase 4-6: Control flow, integers, type conversions
 - Phase 7-9: Structs, tuples, arrays

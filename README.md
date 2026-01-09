@@ -185,6 +185,22 @@ src/
 - Limited Base Julia coverage (focused on core primitives)
 - String indexing not supported (Julia's UTF-8 IR is too complex)
 
+## Examples
+
+See the `examples/` directory for practical demos:
+
+- **counter_demo.jl**: Interactive counter showing the Therapy.jl reactive pattern
+  - Wasm globals for state management
+  - Exported functions as event handlers
+  - JS imports for DOM manipulation
+
+Run the counter demo:
+```bash
+julia --project=. examples/counter_demo.jl
+cd examples && python3 -m http.server 8080
+# Open http://localhost:8080/counter.html
+```
+
 ## Testing
 
 ```bash

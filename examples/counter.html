@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WasmTarget.jl Counter Demo</title>
+    <style>
+        body { font-family: system-ui; max-width: 600px; margin: 50px auto; text-align: center; }
+        .count { font-size: 4em; margin: 20px; }
+        button { font-size: 1.5em; padding: 10px 30px; margin: 5px; cursor: pointer; }
+        .info { color: #666; margin-top: 30px; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <h1>Counter Demo</h1>
+    <p>Built with WasmTarget.jl - Julia to WebAssembly</p>
+
+    <div class="count" id="display">0</div>
+
+    <div>
+        <button id="decrement">-</button>
+        <button id="increment">+</button>
+        <button id="reset">Reset</button>
+    </div>
+
+    <div class="info">
+        <p>This counter is powered by WebAssembly compiled from Julia.</p>
+        <p>State is stored in a Wasm global variable.</p>
+    </div>
+
+    <script>
+    async function init() {
+        // DOM API imports for the Wasm module
+        const imports = {
+            dom: {
+                get_element_by_id: (id) => document.getElementById(id),
+                set_text_content: (el, value) => { if (el) el.textContent = value; },
+                add_click_handler: (el, handlerIdx) => {
+                    // In a real implementation, this would map to function table
+                    console.log("Handler registered:", handlerIdx);
+                }
+            }
+        };
+
+        const response = await fetch('counter.wasm');
+        const bytes = await response.arrayBuffer();
+        const result = await WebAssembly.instantiate(bytes, imports);
+        const { increment, decrement, get_count, reset } = result.instance.exports;
+
+        const display = document.getElementById('display');
+
+        function updateDisplay() {
+            display.textContent = get_count();
+        }
+
+        document.getElementById('increment').onclick = () => {
+            increment();
+            updateDisplay();
+        };
+
+        document.getElementById('decrement').onclick = () => {
+            decrement();
+            updateDisplay();
+        };
+
+        document.getElementById('reset').onclick = () => {
+            reset();
+            updateDisplay();
+        };
+
+        console.log('Counter demo loaded!');
+    }
+
+    init().catch(console.error);
+    </script>
+</body>
+</html>

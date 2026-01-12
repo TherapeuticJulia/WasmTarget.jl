@@ -9,7 +9,10 @@
 # - Provides read, position, eof operations
 # - All operations are WASM-compilable
 
-export ByteBuffer, bb_new, bb_read, bb_peek, bb_position, bb_eof, bb_seek
+export ByteBuffer, bb_new, bb_read, bb_peek, bb_position, bb_eof, bb_seek, bb_remaining
+export is_ascii_digit, is_ascii_alpha, is_ascii_alphanum, is_ascii_space
+export is_ascii_newline, is_ascii_hex, is_identifier_start, is_identifier_char, is_operator_char
+export EOF_CHAR
 
 """
 ByteBuffer - A simple in-memory byte buffer for reading characters.

@@ -280,6 +280,9 @@ function julia_to_wasm_type(::Type{T})::WasmValType where T
     elseif T === Bool
         # Bool is represented as i32 (0 or 1)
         return I32
+    elseif T === Char
+        # Char is represented as i32 (Unicode codepoint)
+        return I32
     elseif T === UInt8 || T === Int8 || T === UInt16 || T === Int16
         # Smaller integers also use i32
         return I32

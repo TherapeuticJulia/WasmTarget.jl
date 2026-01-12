@@ -2555,6 +2555,11 @@ function compile_value(val, ctx::CompilationContext)::Vector{UInt8}
         push!(bytes, Opcode.I32_CONST)
         push!(bytes, val ? 0x01 : 0x00)
 
+    elseif val isa Char
+        # Char is represented as i32 (Unicode codepoint)
+        push!(bytes, Opcode.I32_CONST)
+        append!(bytes, encode_leb128_signed(Int32(val)))
+
     elseif val isa Int32
         push!(bytes, Opcode.I32_CONST)
         append!(bytes, encode_leb128_signed(val))
@@ -3053,7 +3058,7 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
 
     # Determine argument type for opcode selection
     arg_type = length(args) > 0 ? infer_value_type(args[1], ctx) : Int64
-    is_32bit = arg_type === Int32 || arg_type === UInt32 || arg_type === Bool
+    is_32bit = arg_type === Int32 || arg_type === UInt32 || arg_type === Bool || arg_type === Char
 
     # Match intrinsics by name
     if is_func(func, :add_int)
@@ -3217,6 +3222,13 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         end
         push!(bytes, is_32bit ? Opcode.I32_SHR_U : Opcode.I64_SHR_U)
 
+    # Count leading/trailing zeros (used in Char conversion)
+    elseif is_func(func, :ctlz_int)
+        push!(bytes, is_32bit ? Opcode.I32_CLZ : Opcode.I64_CLZ)
+
+    elseif is_func(func, :cttz_int)
+        push!(bytes, is_32bit ? Opcode.I32_CTZ : Opcode.I64_CTZ)
+
     # Float operations
     elseif is_func(func, :add_float)
         push!(bytes, arg_type === Float32 ? Opcode.F32_ADD : Opcode.F64_ADD)
@@ -3248,7 +3260,7 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         # Need to check: target float type (first arg) and source int type (second arg)
         target_type = args[1]  # Float32 or Float64
         source_type = length(args) >= 2 ? infer_value_type(args[2], ctx) : Int64
-        source_is_32bit = source_type === Int32 || source_type === UInt32
+        source_is_32bit = source_type === Int32 || source_type === UInt32 || source_type === Char
 
         if target_type === Float32
             push!(bytes, source_is_32bit ? Opcode.F32_CONVERT_I32_S : Opcode.F32_CONVERT_I64_S)
@@ -3259,7 +3271,7 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
     elseif is_func(func, :uitofp)  # Unsigned int to float
         target_type = args[1]
         source_type = length(args) >= 2 ? infer_value_type(args[2], ctx) : Int64
-        source_is_32bit = source_type === Int32 || source_type === UInt32
+        source_is_32bit = source_type === Int32 || source_type === UInt32 || source_type === Char
 
         if target_type === Float32
             push!(bytes, source_is_32bit ? Opcode.F32_CONVERT_I32_U : Opcode.F32_CONVERT_I64_U)
@@ -3428,7 +3440,7 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
     end
 
     arg_type = length(args) > 0 ? infer_value_type(args[1], ctx) : Int64
-    is_32bit = arg_type === Int32 || arg_type === UInt32
+    is_32bit = arg_type === Int32 || arg_type === UInt32 || arg_type === Bool || arg_type === Char
 
     mi = expr.args[1]
     if mi isa Core.MethodInstance

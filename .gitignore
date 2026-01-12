@@ -1,0 +1,9 @@
+# Build outputs
+docs/dist/
+
+# Julia artifacts
+*.jl.cov
+*.jl.mem
+
+# OS files
+.DS_Store

@@ -364,23 +364,26 @@ WasmTarget.jl/
 - Char type support (map to i32, comparisons work)
 - Count leading/trailing zeros intrinsics (ctlz_int, cttz_int)
 - JuliaSyntax.jl tokenizer analysis (HIGHLY FEASIBLE)
+- ByteBuffer I/O abstraction layer (bb_read, bb_peek, bb_position, bb_eof, etc.)
+- Character classification functions (is_ascii_digit, is_ascii_alpha, is_ascii_space, etc.)
+- Tokenizer-style patterns successfully compile (skip_whitespace, read_integer, skip_identifier)
 
 **Next Steps:**
-1. Create I/O abstraction layer (ByteBuffer type)
-2. Add character classification functions (isdigit, isalpha, isspace)
-3. Implement iterator protocol for strings
-4. Create minimal tokenizer compilation test
-5. Compile ASCII-only tokenizer subset
+1. Implement iterator protocol for strings
+2. Create RawToken struct for tokenizer output
+3. Compile more complex tokenizer functions (lex_number, lex_identifier, lex_string)
+4. Build ASCII-only tokenizer subset
+5. Add Unicode category tables
 
 **Key Findings from JuliaSyntax.jl Analysis:**
 - Tokenizer uses simple if/else dispatch on characters
 - ~1300 lines, ~35 lexing functions
 - No closures, no recursion (except tail calls)
-- Main blockers: I/O abstraction, Unicode tables
+- I/O abstraction: IMPLEMENTED (ByteBuffer)
+- Character classification: IMPLEMENTED
 - Strategy: Start with ASCII-only subset
 
 **Blockers:**
-- Need I/O abstraction layer (read, position, eof)
 - Unicode category_code requires lookup tables (defer to Phase 3.1c)
 
 ---

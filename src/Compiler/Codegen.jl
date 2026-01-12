@@ -603,6 +603,12 @@ function is_struct_type(T::Type)::Bool
     T <: AbstractArray && return false
     T === String && return false
 
+    # Internal Julia types that have pointer fields - not user structs
+    # MemoryRef and GenericMemoryRef are used for array element access
+    if T isa DataType && T.name.name in (:MemoryRef, :GenericMemoryRef, :Memory, :GenericMemory)
+        return false
+    end
+
     # Check if it's a concrete struct type
     return isconcretetype(T) && isstructtype(T) && !(T <: Tuple)
 end
@@ -623,7 +629,17 @@ function register_struct_type!(mod::WasmModule, registry::TypeRegistry, T::DataT
     # Create WasmGC field types
     wasm_fields = FieldType[]
     for ft in field_types
-        wasm_vt = julia_to_wasm_type(ft)
+        # For array fields, use concrete reference to registered array type
+        if ft <: AbstractVector
+            elem_type = eltype(ft)
+            array_type_idx = get_array_type!(mod, registry, elem_type)
+            wasm_vt = ConcreteRef(array_type_idx, true)  # nullable reference
+        elseif ft === String
+            str_type_idx = get_string_array_type!(mod, registry)
+            wasm_vt = ConcreteRef(str_type_idx, true)
+        else
+            wasm_vt = julia_to_wasm_type(ft)
+        end
         push!(wasm_fields, FieldType(wasm_vt, true))  # mutable by default
     end
 
@@ -922,7 +938,8 @@ function allocate_scratch_locals!(ctx::CompilationContext)
         # - 1 ref for result array
         # - 2 refs for source strings
         # - 2 i32s for lengths/indices
-        str_type_idx = ctx.type_registry.string_array_idx
+        # Use get_string_array_type! to ensure type is registered
+        str_type_idx = get_string_array_type!(ctx.mod, ctx.type_registry)
         str_ref_type = ConcreteRef(str_type_idx, true)
 
         push!(ctx.locals, str_ref_type)  # result/scratch ref 1
@@ -1140,6 +1157,24 @@ function allocate_ssa_locals!(ctx::CompilationContext)
             end
         end
 
+        # Also handle :invoke expressions (method calls)
+        # args[1] is MethodInstance, args[2] is function ref, args[3:end] are actual arguments
+        if stmt isa Expr && stmt.head === :invoke
+            args = stmt.args[3:end]
+            ssa_args = [arg.id for arg in args if arg isa Core.SSAValue]
+
+            # If there are any SSA args and there are other args before them, need locals
+            # to ensure correct stack ordering (SSA values on stack would be in wrong position)
+            has_non_ssa_args = any(!(arg isa Core.SSAValue) for arg in args)
+
+            if !isempty(ssa_args) && (has_non_ssa_args || length(ssa_args) > 1)
+                # All SSA args need locals to ensure correct stack ordering
+                for id in ssa_args
+                    push!(needs_local_set, id)
+                end
+            end
+        end
+
         # Also handle :new expressions - struct fields need correct ordering
         if stmt isa Expr && stmt.head === :new
             # args[1] is the type, args[2:end] are field values
@@ -1154,6 +1189,45 @@ function allocate_ssa_locals!(ctx::CompilationContext)
                 end
             end
         end
+
+        # Handle setfield! - the value arg needs a local if it's an SSA
+        # because struct.set expects [ref, value] order, but if value is a single-use
+        # SSA from a previous statement, it's already on the stack before we push ref
+        if stmt isa Expr && stmt.head === :call
+            func = stmt.args[1]
+            is_setfield = (func isa GlobalRef &&
+                          ((func.mod === Core && func.name === :setfield!) ||
+                           (func.mod === Base && func.name === :setfield!)))
+            if is_setfield && length(stmt.args) >= 4
+                value_arg = stmt.args[4]  # args = [func, obj, field, value]
+                if value_arg isa Core.SSAValue
+                    push!(needs_local_set, value_arg.id)
+                end
+            end
+        end
+
+        # Handle :call expressions where a non-SSA arg appears BEFORE an SSA arg
+        # This causes stack ordering issues: the SSA from the previous statement
+        # is already on the stack, but we need to push the non-SSA first.
+        # Example: slt_int(0, %1) - need to push 0, then %1, but %1 is already on stack
+        # ONLY applies to numeric SSA values (struct refs have different handling)
+        if stmt isa Expr && stmt.head === :call
+            args = stmt.args[2:end]  # Skip function ref
+            seen_non_ssa = false
+            for arg in args
+                if !(arg isa Core.SSAValue)
+                    seen_non_ssa = true
+                elseif seen_non_ssa
+                    # This SSA comes after a non-SSA arg - needs a local
+                    ssa_type = get(ctx.ssa_types, arg.id, Any)
+                    is_numeric = ssa_type in (Int32, UInt32, Int64, UInt64, Int, Float32, Float64, Bool)
+                    if is_numeric
+                        push!(needs_local_set, arg.id)
+                    end
+                end
+            end
+        end
+
     end
 
     # Actually allocate the locals
@@ -1932,6 +2006,22 @@ function generate_void_flow(ctx::CompilationContext, blocks::Vector{BasicBlock},
                 else
                     append!(bytes, compile_statement(inner, j, ctx))
                     push!(compiled, j)
+
+                    # Drop unused values in void context (else branch)
+                    if inner isa Expr && (inner.head === :call || inner.head === :invoke)
+                        stmt_type = get(ctx.ssa_types, j, Nothing)
+                        if stmt_type !== Nothing && stmt_type !== Any
+                            is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                            if !is_nothing_union
+                                if !haskey(ctx.ssa_locals, j) && !haskey(ctx.phi_locals, j)
+                                    use_count = get(ssa_use_count, j, 0)
+                                    if use_count == 0
+                                        push!(bytes, Opcode.DROP)
+                                    end
+                                end
+                            end
+                        end
+                    end
                 end
             end
 
@@ -1949,6 +2039,34 @@ function generate_void_flow(ctx::CompilationContext, blocks::Vector{BasicBlock},
         # Regular statement
         append!(bytes, compile_statement(stmt, i, ctx))
         push!(compiled, i)
+
+        # Drop unused values from statements that produce values
+        if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+            stmt_type = get(ctx.ssa_types, i, Nothing)
+            if stmt_type !== Nothing && stmt_type !== Any
+                is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                if !is_nothing_union
+                    if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                        use_count = get(ssa_use_count, i, 0)
+                        if use_count == 0
+                            push!(bytes, Opcode.DROP)
+                        end
+                    end
+                end
+            end
+        elseif stmt isa GlobalRef
+            # GlobalRef statements (constants) may leave values on stack
+            stmt_type = get(ctx.ssa_types, i, Nothing)
+            if stmt_type !== Nothing && stmt_type !== Any
+                if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                    use_count = get(ssa_use_count, i, 0)
+                    if use_count == 0
+                        push!(bytes, Opcode.DROP)
+                    end
+                end
+            end
+        end
+
         i += 1
     end
 
@@ -2300,6 +2418,23 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
             append!(bytes, encode_leb128_unsigned(local_idx))
         end
 
+    elseif stmt isa GlobalRef
+        # GlobalRef statement - evaluate the constant and push it
+        # This handles things like Main.SLOT_EMPTY that are module-level constants
+        try
+            val = getfield(stmt.mod, stmt.name)
+            append!(bytes, compile_value(val, ctx))
+
+            # If this SSA value needs a local, store it
+            if haskey(ctx.ssa_locals, idx)
+                local_idx = ctx.ssa_locals[idx]
+                push!(bytes, Opcode.LOCAL_SET)
+                append!(bytes, encode_leb128_unsigned(local_idx))
+            end
+        catch
+            # If we can't evaluate, it might be a type reference which has no runtime value
+        end
+
     elseif stmt isa Expr
         stmt_bytes = UInt8[]
         if stmt.head === :call
@@ -2452,6 +2587,15 @@ function compile_value(val, ctx::CompilationContext)::Vector{UInt8}
         push!(bytes, Opcode.ARRAY_NEW_FIXED)
         append!(bytes, encode_leb128_unsigned(type_idx))
         append!(bytes, encode_leb128_unsigned(length(val)))
+
+    elseif val isa GlobalRef
+        # GlobalRef to a constant - evaluate and compile the value
+        try
+            actual_val = getfield(val.mod, val.name)
+            append!(bytes, compile_value(actual_val, ctx))
+        catch
+            # If we can't evaluate, might be a type reference (no runtime value)
+        end
     end
 
     return bytes
@@ -2834,6 +2978,36 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
                 end
             end
         end
+
+        # Handle mutable struct field assignment
+        if is_struct_type(obj_type) && ismutabletype(obj_type)
+            if haskey(ctx.type_registry.structs, obj_type)
+                info = ctx.type_registry.structs[obj_type]
+                field_sym = field_ref isa QuoteNode ? field_ref.value : field_ref
+
+                field_idx = findfirst(==(field_sym), info.field_names)
+                if field_idx !== nothing
+                    # struct.set expects: [ref, value]
+                    append!(bytes, compile_value(obj_arg, ctx))
+                    append!(bytes, compile_value(value_arg, ctx))
+                    push!(bytes, Opcode.GC_PREFIX)
+                    push!(bytes, Opcode.STRUCT_SET)
+                    append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
+                    append!(bytes, encode_leb128_unsigned(field_idx - 1))  # 0-indexed
+                    # setfield! returns the value, so push it again
+                    append!(bytes, compile_value(value_arg, ctx))
+                    return bytes
+                end
+            end
+        end
+
+        # Handle setfield! on Base.RefValue (used for optimization sinks)
+        # These are no-ops in Wasm since we don't need the sink pattern
+        if obj_type <: Base.RefValue
+            # Just push the value (setfield! returns the value)
+            append!(bytes, compile_value(value_arg, ctx))
+            return bytes
+        end
         # Fall through for other struct types - will hit error
     end
 
@@ -3011,13 +3185,36 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         end
 
     # Shift operations
+    # Note: Wasm requires shift amount to have same type as value being shifted
+    # Julia often uses Int64/UInt64 shift amounts even for Int32 values
     elseif is_func(func, :shl_int)
+        if is_32bit && length(args) >= 2
+            shift_type = infer_value_type(args[2], ctx)
+            if shift_type === Int64 || shift_type === UInt64
+                # Truncate i64 shift amount to i32
+                push!(bytes, Opcode.I32_WRAP_I64)
+            end
+        end
         push!(bytes, is_32bit ? Opcode.I32_SHL : Opcode.I64_SHL)
 
     elseif is_func(func, :ashr_int)  # arithmetic shift right
+        if is_32bit && length(args) >= 2
+            shift_type = infer_value_type(args[2], ctx)
+            if shift_type === Int64 || shift_type === UInt64
+                # Truncate i64 shift amount to i32
+                push!(bytes, Opcode.I32_WRAP_I64)
+            end
+        end
         push!(bytes, is_32bit ? Opcode.I32_SHR_S : Opcode.I64_SHR_S)
 
     elseif is_func(func, :lshr_int)  # logical shift right
+        if is_32bit && length(args) >= 2
+            shift_type = infer_value_type(args[2], ctx)
+            if shift_type === Int64 || shift_type === UInt64
+                # Truncate i64 shift amount to i32
+                push!(bytes, Opcode.I32_WRAP_I64)
+            end
+        end
         push!(bytes, is_32bit ? Opcode.I32_SHR_U : Opcode.I64_SHR_U)
 
     # Float operations
@@ -3325,6 +3522,298 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
                    infer_value_type(args[1], ctx) === String &&
                    infer_value_type(args[2], ctx) === String
                 bytes = compile_string_equal(args[1], args[2], ctx)
+
+            # WasmTarget string operations - str_char(s, i) -> Int32
+            elseif name === :str_char && length(args) == 2
+                # Get character at index: array.get on string array
+                # Args: string, index (1-based)
+                str_type_idx = get_string_array_type!(ctx.mod, ctx.type_registry)
+
+                # Compile string arg (already pushed by args loop)
+                # Compile index arg and convert to 0-based
+                idx_type = infer_value_type(args[2], ctx)
+                if idx_type === Int64 || idx_type === Int
+                    # Convert Int64 to Int32 and subtract 1
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)  # 1
+                push!(bytes, Opcode.I32_SUB)  # index - 1 for 0-based
+
+                # array.get
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.ARRAY_GET)
+                append!(bytes, encode_leb128_unsigned(str_type_idx))
+
+            # WasmTarget string operations - str_setchar!(s, i, c) -> Nothing
+            elseif name === :str_setchar! && length(args) == 3
+                # Set character at index: array.set on string array
+                # Args: string, index (1-based), char (Int32)
+                str_type_idx = get_string_array_type!(ctx.mod, ctx.type_registry)
+
+                # Stack has: string, index, char
+                # Need to reorder to: string, index-1, char for array.set
+                # Actually array.set expects: array, index, value
+                # So we need: compile string, compile index-1, compile char
+
+                # Clear the bytes from the args loop - we'll recompile in correct order
+                bytes = UInt8[]
+
+                # Compile string
+                append!(bytes, compile_value(args[1], ctx))
+
+                # Compile index and convert to 0-based
+                append!(bytes, compile_value(args[2], ctx))
+                idx_type = infer_value_type(args[2], ctx)
+                if idx_type === Int64 || idx_type === Int
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)
+                push!(bytes, Opcode.I32_SUB)
+
+                # Compile char value
+                append!(bytes, compile_value(args[3], ctx))
+                char_type = infer_value_type(args[3], ctx)
+                if char_type === Int64 || char_type === Int
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+
+                # array.set
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.ARRAY_SET)
+                append!(bytes, encode_leb128_unsigned(str_type_idx))
+
+            # WasmTarget string operations - str_len(s) -> Int32
+            elseif name === :str_len && length(args) == 1
+                # Get string length as Int32
+                # Arg already compiled, just emit array.len
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.ARRAY_LEN)
+
+            # WasmTarget string operations - str_new(len) -> String
+            elseif name === :str_new && length(args) == 1
+                # Create new string of given length, filled with zeros
+                str_type_idx = get_string_array_type!(ctx.mod, ctx.type_registry)
+
+                # Length arg already compiled
+                len_type = infer_value_type(args[1], ctx)
+                if len_type === Int64 || len_type === Int
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+
+                # array.new_default creates array filled with default value (0 for i32)
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.ARRAY_NEW_DEFAULT)
+                append!(bytes, encode_leb128_unsigned(str_type_idx))
+
+            # WasmTarget string operations - str_copy(src, src_pos, dst, dst_pos, len) -> Nothing
+            elseif name === :str_copy && length(args) == 5
+                # Copy characters from src to dst using array.copy
+                str_type_idx = get_string_array_type!(ctx.mod, ctx.type_registry)
+
+                # Clear bytes - recompile in correct order for array.copy
+                # array.copy expects: dst, dst_offset, src, src_offset, len
+                bytes = UInt8[]
+
+                # dst array
+                append!(bytes, compile_value(args[3], ctx))
+                # dst offset (0-based)
+                append!(bytes, compile_value(args[4], ctx))
+                dst_idx_type = infer_value_type(args[4], ctx)
+                if dst_idx_type === Int64 || dst_idx_type === Int
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)
+                push!(bytes, Opcode.I32_SUB)
+
+                # src array
+                append!(bytes, compile_value(args[1], ctx))
+                # src offset (0-based)
+                append!(bytes, compile_value(args[2], ctx))
+                src_idx_type = infer_value_type(args[2], ctx)
+                if src_idx_type === Int64 || src_idx_type === Int
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)
+                push!(bytes, Opcode.I32_SUB)
+
+                # length
+                append!(bytes, compile_value(args[5], ctx))
+                len_type = infer_value_type(args[5], ctx)
+                if len_type === Int64 || len_type === Int
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+
+                # array.copy
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.ARRAY_COPY)
+                append!(bytes, encode_leb128_unsigned(str_type_idx))
+                append!(bytes, encode_leb128_unsigned(str_type_idx))
+
+            # WasmTarget string operations - str_substr(s, start, len) -> String
+            elseif name === :str_substr && length(args) == 3
+                # Extract substring: create new string and copy characters
+                str_type_idx = get_string_array_type!(ctx.mod, ctx.type_registry)
+
+                # Use scratch locals
+                n_locals_before_scratch = length(ctx.locals) - 5
+                scratch_base = ctx.n_params + n_locals_before_scratch
+                result_local = scratch_base      # ref for result
+                src_local = scratch_base + 1     # ref for source string
+
+                # Clear bytes - recompile in correct order
+                bytes = UInt8[]
+
+                # Store source string
+                append!(bytes, compile_value(args[1], ctx))
+                push!(bytes, Opcode.LOCAL_SET)
+                append!(bytes, encode_leb128_unsigned(src_local))
+
+                # Create new string of specified length
+                append!(bytes, compile_value(args[3], ctx))  # len
+                len_type = infer_value_type(args[3], ctx)
+                if len_type === Int64 || len_type === Int
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.ARRAY_NEW_DEFAULT)
+                append!(bytes, encode_leb128_unsigned(str_type_idx))
+                push!(bytes, Opcode.LOCAL_SET)
+                append!(bytes, encode_leb128_unsigned(result_local))
+
+                # Copy characters: array.copy [dst, dst_off, src, src_off, len]
+                # dst = result, dst_off = 0, src = source, src_off = start-1, len = len
+                push!(bytes, Opcode.LOCAL_GET)
+                append!(bytes, encode_leb128_unsigned(result_local))
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x00)  # dst_off = 0
+
+                push!(bytes, Opcode.LOCAL_GET)
+                append!(bytes, encode_leb128_unsigned(src_local))
+
+                # src_off = start - 1 (convert to 0-based)
+                append!(bytes, compile_value(args[2], ctx))
+                start_type = infer_value_type(args[2], ctx)
+                if start_type === Int64 || start_type === Int
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)
+                push!(bytes, Opcode.I32_SUB)
+
+                # len
+                append!(bytes, compile_value(args[3], ctx))
+                len_type2 = infer_value_type(args[3], ctx)
+                if len_type2 === Int64 || len_type2 === Int
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.ARRAY_COPY)
+                append!(bytes, encode_leb128_unsigned(str_type_idx))
+                append!(bytes, encode_leb128_unsigned(str_type_idx))
+
+                # Return result
+                push!(bytes, Opcode.LOCAL_GET)
+                append!(bytes, encode_leb128_unsigned(result_local))
+
+            # ================================================================
+            # WasmTarget array operations - arr_new, arr_get, arr_set!, arr_len
+            # ================================================================
+
+            # arr_new(Type, len) -> Vector{Type}
+            elseif name === :arr_new && length(args) == 2
+                # First arg is the type (compile-time constant)
+                # Second arg is the length
+                type_arg = args[1]
+                elem_type = if type_arg isa Core.SSAValue
+                    ctx.ssa_types[type_arg.id]
+                elseif type_arg isa GlobalRef
+                    getfield(type_arg.mod, type_arg.name)
+                elseif type_arg isa Type
+                    type_arg
+                else
+                    Int32  # Default
+                end
+
+                # Get or create array type
+                arr_type_idx = get_array_type!(ctx.mod, ctx.type_registry, elem_type)
+
+                # Clear previous arg compilation - we only need length
+                bytes = UInt8[]
+
+                # Compile length arg
+                append!(bytes, compile_value(args[2], ctx))
+                len_type = infer_value_type(args[2], ctx)
+                if len_type === Int64 || len_type === Int
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+
+                # array.new_default creates array filled with default value (0)
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.ARRAY_NEW_DEFAULT)
+                append!(bytes, encode_leb128_unsigned(arr_type_idx))
+
+            # arr_get(arr, i) -> T
+            elseif name === :arr_get && length(args) == 2
+                # Args already compiled: arr, index
+                # Need to adjust index to 0-based and emit array.get
+                arr_type = infer_value_type(args[1], ctx)
+                elem_type = eltype(arr_type)
+                arr_type_idx = get_array_type!(ctx.mod, ctx.type_registry, elem_type)
+
+                # Convert index to 0-based
+                idx_type = infer_value_type(args[2], ctx)
+                if idx_type === Int64 || idx_type === Int
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)
+                push!(bytes, Opcode.I32_SUB)  # index - 1
+
+                # array.get
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.ARRAY_GET)
+                append!(bytes, encode_leb128_unsigned(arr_type_idx))
+
+            # arr_set!(arr, i, val) -> Nothing
+            elseif name === :arr_set! && length(args) == 3
+                arr_type = infer_value_type(args[1], ctx)
+                elem_type = eltype(arr_type)
+                arr_type_idx = get_array_type!(ctx.mod, ctx.type_registry, elem_type)
+
+                # Recompile in correct order for array.set: arr, index-1, val
+                bytes = UInt8[]
+
+                # Array ref
+                append!(bytes, compile_value(args[1], ctx))
+
+                # Index (convert to 0-based)
+                append!(bytes, compile_value(args[2], ctx))
+                idx_type = infer_value_type(args[2], ctx)
+                if idx_type === Int64 || idx_type === Int
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)
+                push!(bytes, Opcode.I32_SUB)
+
+                # Value
+                append!(bytes, compile_value(args[3], ctx))
+
+                # array.set
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.ARRAY_SET)
+                append!(bytes, encode_leb128_unsigned(arr_type_idx))
+
+            # arr_len(arr) -> Int32
+            elseif name === :arr_len && length(args) == 1
+                # Arg already compiled, just emit array.len
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.ARRAY_LEN)
 
             else
                 error("Unsupported method: $name")

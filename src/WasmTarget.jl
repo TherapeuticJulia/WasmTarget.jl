@@ -11,6 +11,9 @@ include("Compiler/Codegen.jl")
 
 # Runtime - Intrinsics and stdlib mapping
 include("Runtime/Intrinsics.jl")
+include("Runtime/StringOps.jl")
+include("Runtime/ArrayOps.jl")
+include("Runtime/SimpleDict.jl")
 
 # Main API
 export compile, compile_multi, WasmModule, to_bytes

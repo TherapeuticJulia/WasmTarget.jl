@@ -1533,6 +1533,54 @@ function has_loop(ctx::CompilationContext)
 end
 
 """
+Find merge points - targets of multiple forward jumps.
+These are blocks that need WASM block/br structure for proper control flow.
+Returns a Dict mapping target index to list of source indices.
+"""
+function find_merge_points(code)
+    # Track all forward jump targets
+    forward_targets = Dict{Int, Vector{Int}}()
+
+    for (i, stmt) in enumerate(code)
+        if stmt isa Core.GotoNode
+            target = stmt.label
+            if target > i  # Forward jump
+                if !haskey(forward_targets, target)
+                    forward_targets[target] = Int[]
+                end
+                push!(forward_targets[target], i)
+            end
+        elseif stmt isa Core.GotoIfNot
+            target = stmt.dest
+            if target > i  # Forward jump (the false branch)
+                if !haskey(forward_targets, target)
+                    forward_targets[target] = Int[]
+                end
+                push!(forward_targets[target], i)
+            end
+        end
+    end
+
+    # Merge points are targets with multiple sources
+    merge_points = Dict{Int, Vector{Int}}()
+    for (target, sources) in forward_targets
+        if length(sources) >= 2
+            merge_points[target] = sources
+        end
+    end
+
+    return merge_points
+end
+
+"""
+Check if the control flow has || or && patterns (merge points from short-circuit evaluation).
+"""
+function has_short_circuit_patterns(code)
+    merge_points = find_merge_points(code)
+    return !isempty(merge_points)
+end
+
+"""
 Generate code using Wasm's structured control flow.
 For simple if-then-else patterns, we use the `if` instruction.
 """
@@ -1842,9 +1890,11 @@ function generate_if_then_else(ctx::CompilationContext, blocks::Vector{BasicBloc
                 append!(bytes, compile_statement(stmt, i, ctx))
 
                 # Drop unused values from calls (like setfield! which returns a value)
+                # Also drop Any-typed values (like bb_read) when unused
                 if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
-                    stmt_type = get(ctx.ssa_types, i, Nothing)
-                    if stmt_type !== Nothing && stmt_type !== Any
+                    # Default to Any (not Nothing) so unknown types get drop check
+                    stmt_type = get(ctx.ssa_types, i, Any)
+                    if stmt_type !== Nothing  # Only skip if type is definitely Nothing
                         is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
                         if !is_nothing_union
                             if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
@@ -1863,7 +1913,12 @@ function generate_if_then_else(ctx::CompilationContext, blocks::Vector{BasicBloc
         push!(bytes, Opcode.ELSE)
 
         # Generate else-branch
+        # Track compiled statements to handle nested conditionals properly
+        compiled_in_else = Set{Int}()
         for i in else_start:length(code)
+            if i in compiled_in_else
+                continue
+            end
             stmt = code[i]
             if stmt isa Core.ReturnNode
                 if isdefined(stmt, :val)
@@ -1871,13 +1926,22 @@ function generate_if_then_else(ctx::CompilationContext, blocks::Vector{BasicBloc
                 end
             elseif stmt === nothing
                 # Skip nothing statements
+            elseif stmt isa Core.GotoIfNot
+                # Nested conditional in else branch - generate nested if/else
+                nested_result = compile_nested_if_else(ctx, code, i, compiled_in_else, ssa_use_count)
+                append!(bytes, nested_result)
+            elseif stmt isa Core.GotoNode
+                # Skip goto statements (they're control flow markers)
+                push!(compiled_in_else, i)
             else
                 append!(bytes, compile_statement(stmt, i, ctx))
 
                 # Drop unused values from calls (like setfield! which returns a value)
+                # Also drop Any-typed values (like bb_read) when unused
                 if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
-                    stmt_type = get(ctx.ssa_types, i, Nothing)
-                    if stmt_type !== Nothing && stmt_type !== Any
+                    # Default to Any (not Nothing) so unknown types get drop check
+                    stmt_type = get(ctx.ssa_types, i, Any)
+                    if stmt_type !== Nothing  # Only skip if type is definitely Nothing
                         is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
                         if !is_nothing_union
                             if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
@@ -1898,6 +1962,121 @@ function generate_if_then_else(ctx::CompilationContext, blocks::Vector{BasicBloc
         # The result of if...else...end is on the stack, return it
         push!(bytes, Opcode.RETURN)
     end
+
+    return bytes
+end
+
+"""
+Compile a nested if/else inside a return-based pattern.
+This handles the case where there's a GotoIfNot inside an else branch
+that creates a nested conditional, each branch ending with a return.
+"""
+function compile_nested_if_else(ctx::CompilationContext, code, goto_idx::Int, compiled::Set{Int}, ssa_use_count::Dict{Int,Int})::Vector{UInt8}
+    bytes = UInt8[]
+
+    goto_if_not = code[goto_idx]::Core.GotoIfNot
+    else_target = goto_if_not.dest  # Where to jump if condition is FALSE
+    then_start = goto_idx + 1
+
+    # The condition is already computed (it's an SSA reference)
+    # Push it
+    append!(bytes, compile_value(goto_if_not.cond, ctx))
+    push!(compiled, goto_idx)
+
+    # Determine result type - should match the enclosing function's return type
+    result_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
+
+    # Start if block
+    push!(bytes, Opcode.IF)
+    append!(bytes, encode_block_type(result_type))
+
+    # Then branch: from then_start to else_target-1
+    for i in then_start:else_target-1
+        if i in compiled
+            continue
+        end
+        stmt = code[i]
+        push!(compiled, i)
+
+        if stmt isa Core.ReturnNode
+            if isdefined(stmt, :val)
+                append!(bytes, compile_value(stmt.val, ctx))
+            end
+            # Value stays on stack for the if result
+        elseif stmt === nothing
+            # Skip
+        elseif stmt isa Core.GotoNode
+            # Skip forward gotos
+        else
+            append!(bytes, compile_statement(stmt, i, ctx))
+
+            # Drop unused values
+            if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                # Default to Any (not Nothing) so unknown types get drop check
+                stmt_type = get(ctx.ssa_types, i, Any)
+                use_count = get(ssa_use_count, i, 0)
+                if stmt_type !== Nothing
+                    is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                    if !is_nothing_union
+                        if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                            if use_count == 0
+                                push!(bytes, Opcode.DROP)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    # Else branch
+    push!(bytes, Opcode.ELSE)
+
+    # Else branch: from else_target to end
+    for i in else_target:length(code)
+        if i in compiled
+            continue
+        end
+        stmt = code[i]
+        push!(compiled, i)
+
+        if stmt isa Core.ReturnNode
+            if isdefined(stmt, :val)
+                append!(bytes, compile_value(stmt.val, ctx))
+            end
+            # Value stays on stack for the if result
+        elseif stmt === nothing
+            # Skip
+        elseif stmt isa Core.GotoNode
+            # Skip forward gotos
+        elseif stmt isa Core.GotoIfNot
+            # Another nested conditional - recurse
+            nested = compile_nested_if_else(ctx, code, i, compiled, ssa_use_count)
+            append!(bytes, nested)
+        else
+            append!(bytes, compile_statement(stmt, i, ctx))
+
+            # Drop unused values
+            if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                # Default to Any (not Nothing) so unknown types get drop check
+                stmt_type = get(ctx.ssa_types, i, Any)
+                if stmt_type !== Nothing
+                    is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                    if !is_nothing_union
+                        if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                            use_count = get(ssa_use_count, i, 0)
+                            if use_count == 0
+                                push!(bytes, Opcode.DROP)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    # End nested if
+    push!(bytes, Opcode.END)
 
     return bytes
 end
@@ -2061,7 +2240,7 @@ function generate_void_flow(ctx::CompilationContext, blocks::Vector{BasicBlock},
                         else
                             # For other calls, check type and use count
                             stmt_type = get(ctx.ssa_types, j, Nothing)
-                            if stmt_type !== Nothing && stmt_type !== Any
+                            if stmt_type !== Nothing  # Only skip if type is definitely Nothing
                                 is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
                                 if !is_nothing_union
                                     # This call produces a value
@@ -2125,7 +2304,7 @@ function generate_void_flow(ctx::CompilationContext, blocks::Vector{BasicBlock},
                     # Drop unused values in void context (else branch)
                     if inner isa Expr && (inner.head === :call || inner.head === :invoke)
                         stmt_type = get(ctx.ssa_types, j, Nothing)
-                        if stmt_type !== Nothing && stmt_type !== Any
+                        if stmt_type !== Nothing  # Only skip if type is definitely Nothing
                             is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
                             if !is_nothing_union
                                 if !haskey(ctx.ssa_locals, j) && !haskey(ctx.phi_locals, j)
@@ -2158,7 +2337,7 @@ function generate_void_flow(ctx::CompilationContext, blocks::Vector{BasicBlock},
         # Drop unused values from statements that produce values
         if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
             stmt_type = get(ctx.ssa_types, i, Nothing)
-            if stmt_type !== Nothing && stmt_type !== Any
+            if stmt_type !== Nothing  # Only skip if type is definitely Nothing
                 is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
                 if !is_nothing_union
                     if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
@@ -2172,7 +2351,7 @@ function generate_void_flow(ctx::CompilationContext, blocks::Vector{BasicBlock},
         elseif stmt isa GlobalRef
             # GlobalRef statements (constants) may leave values on stack
             stmt_type = get(ctx.ssa_types, i, Nothing)
-            if stmt_type !== Nothing && stmt_type !== Any
+            if stmt_type !== Nothing  # Only skip if type is definitely Nothing
                 if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
                     use_count = get(ssa_use_count, i, 0)
                     if use_count == 0
@@ -2291,7 +2470,7 @@ function compile_void_nested_conditional(ctx::CompilationContext, code, start_id
                     push!(bytes, Opcode.DROP)
                 else
                     stmt_type = get(ctx.ssa_types, j, Nothing)
-                    if stmt_type !== Nothing && stmt_type !== Any
+                    if stmt_type !== Nothing  # Only skip if type is definitely Nothing
                         is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
                         if !is_nothing_union
                             if !haskey(ctx.ssa_locals, j) && !haskey(ctx.phi_locals, j)
@@ -2408,21 +2587,231 @@ function compile_ternary_for_phi(ctx::CompilationContext, code, cond_idx::Int, c
 end
 
 """
+Generate code for && pattern: multiple conditionals all jumping to the same else target.
+Uses block/br_if structure:
+  block \$outer [result_type]
+    block \$else_target []
+      cond1; i32.eqz; br_if 0   ;; if false, jump to else
+      cond2; i32.eqz; br_if 0   ;; if false, jump to else
+      <then_code>; br 1         ;; jump past else
+    end
+    <else_code>
+  end
+"""
+function generate_and_pattern(ctx::CompilationContext, blocks, code, conditionals, result_type, else_target, ssa_use_count)::Vector{UInt8}
+    bytes = UInt8[]
+
+    # Outer block for result
+    push!(bytes, Opcode.BLOCK)
+    append!(bytes, encode_block_type(result_type))
+
+    # Inner block for else jump target (void result)
+    push!(bytes, Opcode.BLOCK)
+    push!(bytes, 0x40)  # void result type
+
+    # Generate each condition with br_if to else
+    for (i, (block_idx, block)) in enumerate(conditionals)
+        goto_if_not = block.terminator::Core.GotoIfNot
+
+        # Generate statements before condition
+        for j in block.start_idx:block.end_idx-1
+            append!(bytes, compile_statement(code[j], j, ctx))
+
+            # Drop unused values
+            stmt = code[j]
+            if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                stmt_type = get(ctx.ssa_types, j, Any)
+                if stmt_type !== Nothing
+                    is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                    if !is_nothing_union
+                        if !haskey(ctx.ssa_locals, j) && !haskey(ctx.phi_locals, j)
+                            use_count = get(ssa_use_count, j, 0)
+                            if use_count == 0
+                                push!(bytes, Opcode.DROP)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        # Push condition and test for false (invert condition)
+        append!(bytes, compile_value(goto_if_not.cond, ctx))
+        push!(bytes, Opcode.I32_EQZ)  # invert: GotoIfNot jumps when false, so we br when !cond
+        push!(bytes, Opcode.BR_IF)
+        append!(bytes, encode_leb128_unsigned(0))  # br to inner block (else)
+    end
+
+    # All conditions passed - generate then code
+    last_cond = conditionals[end]
+    then_start = last_cond[2].end_idx + 1
+    for i in then_start:else_target-1
+        stmt = code[i]
+        if stmt isa Core.ReturnNode
+            if isdefined(stmt, :val)
+                append!(bytes, compile_value(stmt.val, ctx))
+            end
+            break
+        elseif stmt !== nothing && !(stmt isa Core.GotoIfNot) && !(stmt isa Core.GotoNode)
+            append!(bytes, compile_statement(stmt, i, ctx))
+
+            # Drop unused values
+            if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                stmt_type = get(ctx.ssa_types, i, Any)
+                if stmt_type !== Nothing
+                    is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                    if !is_nothing_union
+                        if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                            use_count = get(ssa_use_count, i, 0)
+                            if use_count == 0
+                                push!(bytes, Opcode.DROP)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    # br past else to outer block end
+    push!(bytes, Opcode.BR)
+    append!(bytes, encode_leb128_unsigned(1))  # br to outer block (depth 1)
+
+    # End inner block (else target)
+    push!(bytes, Opcode.END)
+
+    # Generate else code
+    for i in else_target:length(code)
+        stmt = code[i]
+        if stmt isa Core.ReturnNode
+            if isdefined(stmt, :val)
+                append!(bytes, compile_value(stmt.val, ctx))
+            end
+            break
+        elseif stmt !== nothing && !(stmt isa Core.GotoIfNot) && !(stmt isa Core.GotoNode)
+            append!(bytes, compile_statement(stmt, i, ctx))
+
+            # Drop unused values
+            if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                stmt_type = get(ctx.ssa_types, i, Any)
+                if stmt_type !== Nothing
+                    is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                    if !is_nothing_union
+                        if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                            use_count = get(ssa_use_count, i, 0)
+                            if use_count == 0
+                                push!(bytes, Opcode.DROP)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    # End outer block
+    push!(bytes, Opcode.END)
+
+    # Add RETURN after the block
+    push!(bytes, Opcode.RETURN)
+
+    return bytes
+end
+
+"""
 Generate nested if-else for multiple conditionals.
 """
 function generate_nested_conditionals(ctx::CompilationContext, blocks, code, conditionals)::Vector{UInt8}
     bytes = UInt8[]
     result_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
 
+    # Count SSA uses for drop logic
+    ssa_use_count = Dict{Int, Int}()
+    for stmt in code
+        count_ssa_uses!(stmt, ssa_use_count)
+    end
+
+    # Check for && pattern: all conditionals jump to the same destination
+    # This pattern needs special handling with block/br_if instead of nested if/else
+    if length(conditionals) >= 2
+        first_dest = conditionals[1][2].terminator.dest
+        all_same_dest = all(c -> c[2].terminator.dest == first_dest, conditionals)
+
+        if all_same_dest
+            # && pattern: use block/br_if approach
+            return generate_and_pattern(ctx, blocks, code, conditionals, result_type, first_dest, ssa_use_count)
+        end
+    end
+
     # Build a recursive if-else structure
-    function gen_conditional(cond_idx::Int)::Vector{UInt8}
+    # target_idx tracks where to generate code when no more conditionals
+    function gen_conditional(cond_idx::Int; target_idx::Int=0)::Vector{UInt8}
         inner_bytes = UInt8[]
 
         if cond_idx > length(conditionals)
-            # No more conditionals - generate remaining code
-            # Find the last block and generate it
+            # No more conditionals - generate code starting from target_idx
+            # This should generate the "else" path for the control flow
             for block in blocks
-                if block.terminator isa Core.ReturnNode && !(block.terminator isa Core.GotoIfNot)
+                # Find the block that contains or starts at target_idx
+                if target_idx > 0 && block.start_idx <= target_idx && target_idx <= block.end_idx && block.terminator isa Core.ReturnNode
+                    # target_idx is inside this block - generate from target_idx to end
+                    for i in target_idx:block.end_idx
+                        stmt = code[i]
+                        if stmt isa Core.ReturnNode
+                            if isdefined(stmt, :val)
+                                append!(inner_bytes, compile_value(stmt.val, ctx))
+                            end
+                        elseif !(stmt isa Core.GotoIfNot)
+                            append!(inner_bytes, compile_statement(stmt, i, ctx))
+
+                            # Drop unused values
+                            if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                                stmt_type = get(ctx.ssa_types, i, Any)
+                                if stmt_type !== Nothing
+                                    is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                                    if !is_nothing_union
+                                        if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                                            use_count = get(ssa_use_count, i, 0)
+                                            if use_count == 0
+                                                push!(inner_bytes, Opcode.DROP)
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    break
+                elseif target_idx > 0 && block.start_idx >= target_idx && block.terminator isa Core.ReturnNode
+                    for i in block.start_idx:block.end_idx
+                        stmt = code[i]
+                        if stmt isa Core.ReturnNode
+                            if isdefined(stmt, :val)
+                                append!(inner_bytes, compile_value(stmt.val, ctx))
+                            end
+                        elseif !(stmt isa Core.GotoIfNot)
+                            append!(inner_bytes, compile_statement(stmt, i, ctx))
+
+                            # Drop unused values
+                            if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                                stmt_type = get(ctx.ssa_types, i, Any)
+                                if stmt_type !== Nothing
+                                    is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                                    if !is_nothing_union
+                                        if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                                            use_count = get(ssa_use_count, i, 0)
+                                            if use_count == 0
+                                                push!(inner_bytes, Opcode.DROP)
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    break
+                elseif target_idx == 0 && block.terminator isa Core.ReturnNode
+                    # Fallback: find first return block
                     for i in block.start_idx:block.end_idx
                         stmt = code[i]
                         if stmt isa Core.ReturnNode
@@ -2445,35 +2834,237 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
         # Generate statements before condition
         for i in block.start_idx:block.end_idx-1
             append!(inner_bytes, compile_statement(code[i], i, ctx))
+
+            # Drop unused values
+            stmt = code[i]
+            if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                stmt_type = get(ctx.ssa_types, i, Any)
+                if stmt_type !== Nothing
+                    is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                    if !is_nothing_union
+                        if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                            use_count = get(ssa_use_count, i, 0)
+                            if use_count == 0
+                                push!(inner_bytes, Opcode.DROP)
+                            end
+                        end
+                    end
+                end
+            end
         end
 
-        # Push condition
+        # Then branch - analyze what's in the then range BEFORE generating IF
+        then_start = block.end_idx + 1
+        then_end = goto_if_not.dest - 1
+        found_return = false
+        found_nested_cond = false
+        found_forward_goto = nothing  # Target of unconditional forward GotoNode
+        found_phi_pattern = nothing  # For && producing boolean to phi
+
+        # First, analyze what's in the then range
+        for i in then_start:min(then_end, length(code))
+            stmt = code[i]
+            if stmt isa Core.GotoIfNot
+                found_nested_cond = true
+                break
+            elseif stmt isa Core.GotoNode && stmt.label > i
+                # Unconditional forward jump - check if it's an || merge pattern
+                # Only treat as || if target is NOT a PhiNode (phi indicates && boolean result)
+                target_idx = stmt.label
+                if target_idx <= length(code) && code[target_idx] isa Core.PhiNode
+                    # Forward goto to phi - this is && producing a boolean value
+                    # Need to generate ternary: if cond1 then cond2 else false
+                    found_phi_pattern = (target_idx, i)  # (phi_idx, goto_idx)
+                elseif target_idx <= length(code)
+                    found_forward_goto = target_idx
+                end
+                break
+            end
+        end
+
+        # Handle phi pattern specially - generates boolean IF and continues
+        if found_phi_pattern !== nothing
+            phi_idx, goto_idx = found_phi_pattern
+
+            # Push condition
+            append!(inner_bytes, compile_value(goto_if_not.cond, ctx))
+
+            # IF block with i32 (boolean) result type
+            push!(inner_bytes, Opcode.IF)
+            push!(inner_bytes, 0x7f)  # i32 result type
+
+            # Then-branch: compute cond2 (the expression before the goto)
+            for i in then_start:goto_idx-1
+                stmt = code[i]
+                if stmt !== nothing && !(stmt isa Core.GotoIfNot) && !(stmt isa Core.GotoNode)
+                    append!(inner_bytes, compile_statement(stmt, i, ctx))
+                end
+            end
+
+            # Else-branch: push false (0)
+            push!(inner_bytes, Opcode.ELSE)
+            push!(inner_bytes, Opcode.I32_CONST)
+            append!(inner_bytes, encode_leb128_signed(0))
+
+            # End IF - boolean result on stack
+            push!(inner_bytes, Opcode.END)
+
+            # Store to phi local if we have one
+            if haskey(ctx.phi_locals, phi_idx)
+                local_idx = ctx.phi_locals[phi_idx]
+                push!(inner_bytes, Opcode.LOCAL_SET)
+                append!(inner_bytes, encode_leb128_unsigned(local_idx))
+            end
+
+            # Continue with conditionals after the phi
+            # Find the conditional that USES the phi as its condition
+            for (j, (_, b)) in enumerate(conditionals)
+                goto_if_not = b.terminator::Core.GotoIfNot
+                # Check if this conditional tests the phi
+                if goto_if_not.cond isa Core.SSAValue && goto_if_not.cond.id == phi_idx
+                    append!(inner_bytes, gen_conditional(j; target_idx=0))
+                    break
+                end
+            end
+
+            return inner_bytes  # Done with this conditional
+        end
+
+        # Push condition for normal pattern
         append!(inner_bytes, compile_value(goto_if_not.cond, ctx))
 
         # if block
         push!(inner_bytes, Opcode.IF)
         append!(inner_bytes, encode_block_type(result_type))
 
-        # Then branch - find the return after this block
-        then_start = block.end_idx + 1
-        then_end = goto_if_not.dest - 1
-        for i in then_start:min(then_end, length(code))
-            stmt = code[i]
-            if stmt isa Core.ReturnNode
-                if isdefined(stmt, :val)
-                    append!(inner_bytes, compile_value(stmt.val, ctx))
+        if found_forward_goto !== nothing
+            # The then-branch is a forward goto to a merge point (|| pattern)
+            # Generate the code at the merge point target
+            for i in found_forward_goto:length(code)
+                stmt = code[i]
+                if stmt isa Core.ReturnNode
+                    if isdefined(stmt, :val)
+                        append!(inner_bytes, compile_value(stmt.val, ctx))
+                    end
+                    break
+                elseif stmt === nothing
+                    # Skip nothing statements
+                elseif !(stmt isa Core.GotoIfNot) && !(stmt isa Core.GotoNode)
+                    append!(inner_bytes, compile_statement(stmt, i, ctx))
+
+                    # Drop unused values
+                    if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                        stmt_type = get(ctx.ssa_types, i, Any)
+                        if stmt_type !== Nothing
+                            is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                            if !is_nothing_union
+                                if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                                    use_count = get(ssa_use_count, i, 0)
+                                    if use_count == 0
+                                        push!(inner_bytes, Opcode.DROP)
+                                    end
+                                end
+                            end
+                        end
+                    end
                 end
-                break
-            else
-                append!(inner_bytes, compile_statement(stmt, i, ctx))
+            end
+        elseif !found_nested_cond
+            # No nested conditional and no forward goto - compile statements normally
+            for i in then_start:min(then_end, length(code))
+                stmt = code[i]
+                if stmt isa Core.ReturnNode
+                    if isdefined(stmt, :val)
+                        append!(inner_bytes, compile_value(stmt.val, ctx))
+                    end
+                    found_return = true
+                    break
+                elseif stmt === nothing
+                    # Skip nothing statements
+                else
+                    append!(inner_bytes, compile_statement(stmt, i, ctx))
+
+                    # Drop unused values
+                    if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                        stmt_type = get(ctx.ssa_types, i, Any)
+                        if stmt_type !== Nothing
+                            is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                            if !is_nothing_union
+                                if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                                    use_count = get(ssa_use_count, i, 0)
+                                    if use_count == 0
+                                        push!(inner_bytes, Opcode.DROP)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        # Handle based on what we found in the then branch
+        # NOTE: found_phi_pattern is handled earlier and returns, so won't reach here
+        if found_forward_goto !== nothing
+            # Already generated merge point code above - nothing more to do for then branch
+        elseif found_nested_cond
+            # Then branch has a nested conditional - recurse to handle it
+            # This handles short-circuit && patterns
+            append!(inner_bytes, gen_conditional(cond_idx + 1))
+        elseif !found_return
+            # Then branch doesn't return and has no nested conditionals
+            # Generate code from goto dest to return
+            for i in goto_if_not.dest:length(code)
+                stmt = code[i]
+                if stmt isa Core.ReturnNode
+                    if isdefined(stmt, :val)
+                        append!(inner_bytes, compile_value(stmt.val, ctx))
+                    end
+                    break
+                elseif stmt === nothing
+                    # Skip nothing statements
+                elseif !(stmt isa Core.GotoIfNot) && !(stmt isa Core.GotoNode)
+                    append!(inner_bytes, compile_statement(stmt, i, ctx))
+
+                    # Drop unused values
+                    if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                        stmt_type = get(ctx.ssa_types, i, Any)
+                        if stmt_type !== Nothing
+                            is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                            if !is_nothing_union
+                                if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                                    use_count = get(ssa_use_count, i, 0)
+                                    if use_count == 0
+                                        push!(inner_bytes, Opcode.DROP)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
             end
         end
 
         # Else branch
         push!(inner_bytes, Opcode.ELSE)
 
-        # Recurse for next conditional or generate final else
-        append!(inner_bytes, gen_conditional(cond_idx + 1))
+        # Find the conditional at dest (if any)
+        # This handles the case where multiple conditionals jump to the same target
+        dest_cond_idx = nothing
+        for (j, (_, b)) in enumerate(conditionals)
+            if b.start_idx >= goto_if_not.dest
+                dest_cond_idx = j
+                break
+            end
+        end
+
+        # Recurse to the conditional at dest, or generate final block
+        if dest_cond_idx !== nothing
+            append!(inner_bytes, gen_conditional(dest_cond_idx; target_idx=goto_if_not.dest))
+        else
+            # No conditional at dest - generate the code at dest directly
+            append!(inner_bytes, gen_conditional(length(conditionals) + 1; target_idx=goto_if_not.dest))
+        end
 
         push!(inner_bytes, Opcode.END)
 
@@ -2635,9 +3226,14 @@ function compile_value(val, ctx::CompilationContext)::Vector{UInt8}
     bytes = UInt8[]
 
     if val isa Core.SSAValue
-        # Check if this SSA has a local allocated
+        # Check if this SSA has a local allocated (either regular or phi)
         if haskey(ctx.ssa_locals, val.id)
             local_idx = ctx.ssa_locals[val.id]
+            push!(bytes, Opcode.LOCAL_GET)
+            append!(bytes, encode_leb128_unsigned(local_idx))
+        elseif haskey(ctx.phi_locals, val.id)
+            # Phi node - load from phi local
+            local_idx = ctx.phi_locals[val.id]
             push!(bytes, Opcode.LOCAL_GET)
             append!(bytes, encode_leb128_unsigned(local_idx))
         end
@@ -2716,6 +3312,29 @@ function compile_value(val, ctx::CompilationContext)::Vector{UInt8}
         catch
             # If we can't evaluate, might be a type reference (no runtime value)
         end
+
+    elseif val isa QuoteNode
+        # QuoteNode wraps a constant value - unwrap and compile
+        append!(bytes, compile_value(val.value, ctx))
+
+    elseif isstructtype(typeof(val)) && !isa(val, Type) && !isa(val, Function) && !isa(val, Module)
+        # Struct constant - create it with struct.new
+        T = typeof(val)
+
+        # Ensure struct type is registered and get its type index
+        info = register_struct_type!(ctx.mod, ctx.type_registry, T)
+        type_idx = info.wasm_type_idx
+
+        # Push field values
+        for field_name in fieldnames(T)
+            field_val = getfield(val, field_name)
+            append!(bytes, compile_value(field_val, ctx))
+        end
+
+        # Create the struct
+        push!(bytes, Opcode.GC_PREFIX)
+        push!(bytes, Opcode.STRUCT_NEW)
+        append!(bytes, encode_leb128_unsigned(type_idx))
     end
 
     return bytes

@@ -195,28 +195,158 @@ This pattern enables Therapy.jl to:
 - Phase 16-17: Multi-function modules, JS interop
 - Phase 18: Tables, memory, and data segments
 
-## Future Work (Roadmap for Therapy.jl)
+## dart2wasm Parallel Architecture
 
-### Near-Term (WasmTarget.jl)
+WasmTarget.jl follows the same architecture as dart2wasm:
 
-1. **More String Operations**: Concatenation, comparison
-2. **Better Error Messages**: Source location tracking
-3. **funcref Support**: ref.func and function reference passing
+**dart2wasm pipeline:**
+```
+Dart source → CFE (parser) → Kernel IR → dart2wasm → WASM + .mjs runtime
+```
 
-### Medium-Term (Therapy.jl Foundation)
+**WasmTarget.jl pipeline:**
+```
+Julia source → Julia compiler → IR (Base.code_typed) → WasmTarget.jl → WASM
+```
 
-1. **DOM Binding Layer**: Typed wrappers for DOM APIs
-2. **Signal Primitives**: Reactive state management
-3. **Component Macros**: @component, @effect, @html
-4. **Event Handling**: onclick, oninput, etc.
+### Key Lessons from dart2wasm
 
-### Long-Term (Full Therapy.jl)
+1. **Use native compiler infrastructure**: dart2wasm reuses Dart's CFE for parsing/analysis. We reuse Julia's compiler via `Base.code_typed()`.
 
-1. **Server Functions**: RPC to Julia backend
-2. **SSR Support**: Server-side rendering
-3. **Hydration**: Client-side takeover of SSR HTML
-4. **Routing**: Client-side navigation
-5. **Reactive Notebooks**: Pluto alternative
+2. **Control flow compilation**: dart2wasm uses block-based control flow with `br_if` for complex patterns. We use nested if/else (simpler but works for most cases).
+   - **Solved**: Julia's `||` and `&&` operators now compile natively. The compiler handles:
+     - Simple `||` patterns (forward GotoNode to merge points)
+     - Simple `&&` patterns (multiple GotoIfNot to same else target)
+     - Combined `&&`/`||` patterns with PhiNode (boolean merge)
+
+3. **WasmGC-first**: Both dart2wasm and WasmTarget.jl target WasmGC for automatic memory management and direct struct/array support.
+
+4. **JS runtime companion**: dart2wasm outputs a `.mjs` file alongside WASM. We'll need similar for DOM bindings.
+
+### Two Compilation Paths
+
+1. **Main path (Therapy.jl)**: Compile user code at build time
+   - Parse/analyze using Julia's compiler
+   - Generate WASM via WasmTarget.jl
+   - Ship to browser
+
+2. **Tooling path (optional)**: Compile Julia tools to WASM
+   - Tokenizer/parser running in browser
+   - Useful for REPL, syntax highlighting, interactive tutorials
+   - JuliaSyntax.jl in WASM would enable browser-based Julia
+
+## Roadmap: Path to dart2wasm Parity
+
+The goal is full dart2wasm parity, which then enables self-hosting (compiling JuliaSyntax.jl to WASM for browser-based REPL).
+
+### Current Status (as of Jan 2026)
+
+| Feature | dart2wasm | WasmTarget.jl |
+|---------|-----------|---------------|
+| Basic types, structs, arrays | ✅ | ✅ |
+| Simple control flow | ✅ | ✅ |
+| Multi-function modules | ✅ | ✅ |
+| JS interop (externref) | ✅ | ✅ |
+| `\|\|`/`&&` operators | ✅ | ✅ |
+| Try/catch exceptions | ✅ | ❌ |
+| Closures | ✅ | ❌ |
+| Full multiple dispatch | ✅ | ⚠️ partial |
+| Standard library | ✅ | ❌ minimal |
+| DOM runtime | ✅ | ❌ |
+
+**Estimated parity: ~30-35%**
+
+### Phase 1: Control Flow Completeness (Current)
+
+Goal: Handle ALL Julia IR control flow patterns natively.
+
+1. **Short-circuit operators** ✅ COMPLETE
+   - `||` operator: Forward GotoNode to merge points
+   - `&&` operator: Multiple GotoIfNot to same else target (block/br_if pattern)
+   - Combined `&&`/`||`: PhiNode boolean merge
+
+2. **Exception handling**: WASM exception handling proposal
+   - `try`/`catch`/`finally` → WASM `try`/`catch`/`throw`
+   - Julia's exception types → WASM tag types
+
+3. **All GotoIfNot patterns**: Ensure every Julia IR pattern compiles correctly
+
+**Success criteria**: Can compile any Julia function without control flow errors.
+
+### Phase 2: Language Feature Completeness
+
+Goal: Support all Julia language features that dart2wasm supports for Dart.
+
+1. **Closures**: Environment capture and closure compilation
+   - Closure struct generation
+   - Captured variable handling
+   - funcref for closure calls
+
+2. **Full multiple dispatch**: Runtime method lookup
+   - Method tables
+   - Dynamic dispatch via call_indirect
+
+3. **Abstract types and unions**: Type hierarchy support
+   - Union type handling
+   - Abstract type dispatch
+
+4. **Generators/iterators**: If needed for standard library
+
+**Success criteria**: Can compile JuliaSyntax.jl's code patterns.
+
+### Phase 3: Standard Library
+
+Goal: Core Julia functionality available in WASM.
+
+1. **String operations**: Full string API
+2. **Collections**: Dict, Set, etc.
+3. **Math functions**: Comprehensive math library
+4. **I/O abstractions**: Print, string formatting
+
+**Success criteria**: Common Julia code "just works".
+
+### Phase 4: Runtime & DOM
+
+Goal: Browser integration matching dart2wasm's Flutter Web capabilities.
+
+1. **DOM binding layer**: Typed wrappers for DOM APIs
+2. **Event handling**: onclick, oninput, etc.
+3. **JS runtime companion**: `.mjs` file like dart2wasm
+4. **Async support**: Promises, event loop integration
+
+**Success criteria**: Can build interactive web apps.
+
+### Phase 5: Self-Hosting (REPL)
+
+Goal: Julia compiler runs in the browser.
+
+1. **Compile JuliaSyntax.jl → WASM**: Parser in browser
+2. **Compile JuliaLowering.jl → WASM**: Lowering in browser
+3. **Compile WasmTarget.jl → WASM**: Codegen in browser
+4. **REPL UI**: Interactive Julia in browser
+
+**Success criteria**: Type Julia code in browser, see results.
+
+### Phase 6: Therapy.jl Framework
+
+Goal: Full reactive web framework.
+
+1. **Signal primitives**: Fine-grained reactivity
+2. **Component macros**: @component, @effect, @html
+3. **Server functions**: RPC to Julia backend
+4. **SSR + Hydration**: Server-side rendering
+5. **Routing**: Client-side navigation
+
+**Success criteria**: Production-ready web framework.
+
+## Future Work (Post-Parity)
+
+Once dart2wasm parity is achieved:
+
+1. **Reactive Notebooks**: Pluto.jl alternative in browser
+2. **Julia Package Ecosystem**: Compile popular packages to WASM
+3. **Performance optimization**: Match dart2wasm's performance
+4. **Developer tooling**: Source maps, debugging, hot reload
 
 ## Key Decisions and Rationale
 

@@ -1503,6 +1503,63 @@ struct BasicBlock
 end
 
 """
+Represents a try/catch region in the IR.
+"""
+struct TryRegion
+    enter_idx::Int      # SSA index of Core.EnterNode
+    catch_dest::Int     # SSA index where catch block starts
+    leave_idx::Int      # SSA index of :leave expression (end of try body)
+end
+
+"""
+Find try/catch regions by scanning for Core.EnterNode statements.
+Returns a list of TryRegion structs.
+"""
+function find_try_regions(code)::Vector{TryRegion}
+    regions = TryRegion[]
+
+    for (i, stmt) in enumerate(code)
+        if stmt isa Core.EnterNode
+            catch_dest = stmt.catch_dest
+            # Find the corresponding :leave that references this EnterNode
+            leave_idx = 0
+            for (j, s) in enumerate(code)
+                if s isa Expr && s.head === :leave
+                    # :leave args contain references to EnterNode SSA values
+                    for arg in s.args
+                        if arg isa Core.SSAValue && arg.id == i
+                            leave_idx = j
+                            break
+                        end
+                    end
+                    if leave_idx > 0
+                        break
+                    end
+                end
+            end
+
+            if leave_idx > 0
+                push!(regions, TryRegion(i, catch_dest, leave_idx))
+            end
+        end
+    end
+
+    return regions
+end
+
+"""
+Check if code contains try/catch regions.
+"""
+function has_try_catch(code)::Bool
+    for stmt in code
+        if stmt isa Core.EnterNode
+            return true
+        end
+    end
+    return false
+end
+
+"""
 Analyze the IR to find basic block boundaries.
 """
 function analyze_blocks(code)
@@ -1581,6 +1638,231 @@ function has_short_circuit_patterns(code)
 end
 
 """
+Generate code for try/catch blocks using WASM exception handling (try_table).
+
+Following dart2wasm's approach:
+- Use a single exception tag for all Julia exceptions
+- try_table with catch_all to handle any exception
+- Catch handler gets exception value (if any)
+
+WASM structure:
+  (block \$after_try          ; exit point for try success
+    (block \$catch_handler    ; catch handler block
+      (try_table (catch_all 0) ; branch to \$catch_handler on exception
+        ;; try body code
+        (br 1)                 ; normal exit (skip catch)
+      )
+    )
+    ;; catch handler code
+  )
+  ;; code after try/catch
+"""
+function generate_try_catch(ctx::CompilationContext, blocks::Vector{BasicBlock}, code)::Vector{UInt8}
+    bytes = UInt8[]
+    regions = find_try_regions(code)
+
+    if isempty(regions)
+        # No try regions, fall back to normal generation
+        return generate_complex_flow(ctx, blocks, code)
+    end
+
+    # Ensure module has an exception tag for Julia exceptions
+    # Tag 0 is a void function type (no parameters, no results) for simple exceptions
+    if isempty(ctx.mod.tags)
+        # Add a void function type for the exception tag using add_type!
+        void_ft = FuncType(WasmValType[], WasmValType[])
+        void_type_idx = add_type!(ctx.mod, void_ft)
+        add_tag!(ctx.mod, void_type_idx)
+    end
+
+    # For now, handle single try/catch region
+    region = regions[1]
+    enter_idx = region.enter_idx
+    catch_dest = region.catch_dest
+    leave_idx = region.leave_idx
+
+    # Determine result type for the function
+    result_type_byte = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
+
+    # Structure:
+    # (block $after_try [result_type]      ; outer block - exit for both paths
+    #   (block $catch_block                 ; catch jumps here
+    #     (try_table (catch_all 0)          ; try body, catch_all jumps to label 0 ($catch_block)
+    #       ;; code before EnterNode
+    #       ;; try body (enter_idx+1 to leave_idx-1)
+    #       ;; normal path after :leave until catch_dest-1
+    #       (br 1)                          ; skip catch, go to $after_try
+    #     )
+    #   )
+    #   ;; catch handler (catch_dest to end of catch)
+    # )
+
+    # Outer block for the result value
+    push!(bytes, Opcode.BLOCK)
+    append!(bytes, encode_block_type(result_type_byte))
+
+    # Inner void block for catch destination
+    push!(bytes, Opcode.BLOCK)
+    push!(bytes, 0x40)  # void result type
+
+    # try_table with catch_all clause
+    # Format: try_table blocktype vec(catch) end
+    push!(bytes, Opcode.TRY_TABLE)
+    push!(bytes, 0x40)  # void block type (no result from try_table itself)
+
+    # Catch clauses: catch_all 0 (branch to label 0 on any exception)
+    append!(bytes, encode_leb128_unsigned(1))  # 1 catch clause
+    push!(bytes, Opcode.CATCH_ALL)             # catch_all type
+    append!(bytes, encode_leb128_unsigned(0))  # label index 0 (inner block)
+
+    # Generate code BEFORE EnterNode
+    for i in 1:(enter_idx-1)
+        stmt = code[i]
+        if stmt !== nothing && !(stmt isa Core.EnterNode)
+            append!(bytes, compile_statement(stmt, i, ctx))
+        end
+    end
+
+    # Generate try body (from EnterNode+1 to leave_idx-1)
+    # Need to handle control flow (GotoIfNot) properly
+    i = enter_idx + 1
+    while i <= leave_idx - 1
+        stmt = code[i]
+        if stmt === nothing
+            i += 1
+            continue
+        end
+
+        # Handle GotoIfNot (if statement) inside try body
+        if stmt isa Core.GotoIfNot
+            # This is an if statement in the try body
+            # The then-branch is from i+1 to dest-1
+            # The else-branch starts at dest
+            goto_if_not = stmt
+            else_target = goto_if_not.dest
+
+            # Compile the condition value
+            append!(bytes, compile_value(goto_if_not.cond, ctx))
+
+            # Check if then-branch has a return or throw (void if) vs needs else
+            then_start = i + 1
+            then_end = min(else_target - 1, leave_idx - 1)
+            then_has_return = false
+            then_has_throw = false
+
+            for j in then_start:then_end
+                if code[j] isa Core.ReturnNode
+                    then_has_return = true
+                    break
+                elseif code[j] isa Expr && code[j].head === :call
+                    func = code[j].args[1]
+                    if func isa GlobalRef && func.name === :throw
+                        then_has_throw = true
+                        break
+                    end
+                end
+            end
+
+            if then_has_throw || then_has_return
+                # Then branch ends with throw/return, no else branch needed
+                # Use: (if (then ...))
+                push!(bytes, Opcode.IF)
+                push!(bytes, 0x40)  # void result type
+
+                # Generate then branch
+                for j in then_start:then_end
+                    if code[j] !== nothing
+                        append!(bytes, compile_statement(code[j], j, ctx))
+                    end
+                end
+
+                push!(bytes, Opcode.END)
+
+                # Skip to else_target (which becomes the continuation)
+                i = else_target
+            else
+                # Normal if-else pattern (rare in try body, but handle it)
+                push!(bytes, Opcode.IF)
+                push!(bytes, 0x40)  # void result type
+
+                for j in then_start:then_end
+                    if code[j] !== nothing
+                        append!(bytes, compile_statement(code[j], j, ctx))
+                    end
+                end
+
+                push!(bytes, Opcode.ELSE)
+
+                # Else branch from else_target to leave_idx-1
+                for j in else_target:(leave_idx-1)
+                    if code[j] !== nothing
+                        append!(bytes, compile_statement(code[j], j, ctx))
+                    end
+                end
+
+                push!(bytes, Opcode.END)
+
+                # We've processed everything up to leave_idx
+                i = leave_idx
+            end
+        else
+            append!(bytes, compile_statement(stmt, i, ctx))
+            i += 1
+        end
+    end
+
+    # Skip the :leave itself (it's a control flow marker)
+
+    # Generate normal path code after :leave until catch_dest
+    for i in (leave_idx+1):(catch_dest-1)
+        stmt = code[i]
+        if stmt !== nothing
+            # Check if this is a return - if so, we need to handle it specially
+            if stmt isa Core.ReturnNode
+                append!(bytes, compile_statement(stmt, i, ctx))
+                # After return in try, branch out
+                push!(bytes, Opcode.BR)
+                append!(bytes, encode_leb128_unsigned(1))  # branch to outer block
+                break
+            else
+                append!(bytes, compile_statement(stmt, i, ctx))
+            end
+        end
+    end
+
+    # If no return in try body, branch past catch
+    push!(bytes, Opcode.BR)
+    append!(bytes, encode_leb128_unsigned(1))  # branch to outer block (past catch)
+
+    # End try_table
+    push!(bytes, Opcode.END)
+
+    # End inner (catch destination) block
+    push!(bytes, Opcode.END)
+
+    # Catch handler code (from catch_dest to end)
+    for i in catch_dest:length(code)
+        stmt = code[i]
+        if stmt !== nothing
+            # Skip :pop_exception - it's just a marker
+            if stmt isa Expr && stmt.head === :pop_exception
+                continue
+            end
+            append!(bytes, compile_statement(stmt, i, ctx))
+        end
+    end
+
+    # End outer block - don't add END here, generate_structured will add it
+    # Actually wait, we need to end the outer block but the END is added by generate_structured
+    # Let me check... generate_structured adds one END at the end of the function
+
+    # Actually we DO need to end the outer block here
+    push!(bytes, Opcode.END)
+
+    return bytes
+end
+
+"""
 Generate code using Wasm's structured control flow.
 For simple if-then-else patterns, we use the `if` instruction.
 """
@@ -1588,8 +1870,11 @@ function generate_structured(ctx::CompilationContext, blocks::Vector{BasicBlock}
     bytes = UInt8[]
     code = ctx.code_info.code
 
+    # Check for try/catch first
+    if has_try_catch(code)
+        append!(bytes, generate_try_catch(ctx, blocks, code))
     # Check for loops first
-    if has_loop(ctx)
+    elseif has_loop(ctx)
         append!(bytes, generate_loop_code(ctx))
     elseif length(blocks) == 1
         # Single block - just generate statements
@@ -4117,6 +4402,19 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         # The first arg is a symbol (like :type), second is the actual value
         # We only pushed the value (args[2]) since args[1] is a QuoteNode
         # The value is already on stack, nothing more to do
+
+    # throw() - compile to WASM throw instruction
+    elseif func isa GlobalRef && func.name === :throw
+        # Ensure module has an exception tag (tag 0)
+        if isempty(ctx.mod.tags)
+            void_ft = FuncType(WasmValType[], WasmValType[])
+            void_type_idx = add_type!(ctx.mod, void_ft)
+            add_tag!(ctx.mod, void_type_idx)
+        end
+        # Emit throw instruction with tag 0 (our Julia exception tag)
+        # For now, we're not passing the exception value - just throwing
+        push!(bytes, Opcode.THROW)
+        append!(bytes, encode_leb128_unsigned(0))  # tag index 0
 
     else
         error("Unsupported function call: $func (type: $(typeof(func)))")

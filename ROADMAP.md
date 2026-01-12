@@ -100,38 +100,80 @@ Build a complete Julia-to-WebAssembly compiler that can compile JuliaSyntax.jl a
 
 ## Phase 3: JuliaSyntax.jl Compilation
 
-### 3.1 Tokenizer
-Target: `JuliaSyntax.tokenize(source::String)`
+### 3.1 Tokenizer (ANALYZED - HIGHLY FEASIBLE)
 
-**Required features:**
-- String iteration
-- Character classification
-- Token struct creation
-- Vector of tokens output
+**Architecture (from JuliaSyntax.jl analysis):**
+```
+tokenize(input)
+    → Lexer(IOBuffer(input))  # Iterator creation
+    → Base.iterate(lexer)      # Standard iterator protocol
+    → next_token(lexer)        # Main dispatch
+        → _next_token(lexer, char)  # Char-based dispatcher
+            → lex_whitespace/lex_digit/lex_string/etc.
+            → emit(lexer, kind)     # Token emission
+```
 
-**Test strategy:**
-1. Compile tokenizer in isolation
-2. Test with simple inputs: `"1 + 2"`, `"x = 1"`, `"function f() end"`
-3. Compare output with native Julia tokenizer
+**Required Types:**
+- `RawToken` struct (kind::UInt16, startbyte::Int, endbyte::Int, suffix::Bool)
+- `StringState` struct (triplestr, raw, delim, paren_depth)
+- `Lexer` mutable struct with 4-char lookahead buffer
+- `Vector{StringState}` for interpolation state stack
+
+**Required Base Functions:**
+| Function | Status | Notes |
+|----------|--------|-------|
+| read(io, Char) | Need I/O layer | Can use byte buffer abstraction |
+| position(io) | Need I/O layer | Track position locally |
+| eof(io) | Need I/O layer | Check buffer bounds |
+| isvalid(Char) | Need to add | Unicode validation |
+| Unicode.category_code | Need tables | Start with ASCII subset |
+| push!/pop!/last | Supported | For interpolation stack |
+| if/while/for | Supported | Standard control flow |
+
+**Implementation Strategy:**
+1. **Phase 3.1a: ASCII-Only Tokenizer** (2-3 days)
+   - Strip Unicode handling
+   - Use simplified character tests
+   - Basic tokens: keywords, identifiers, operators, literals
+
+2. **Phase 3.1b: I/O Abstraction Layer** (1-2 days)
+   - Create Wasm-compatible byte buffer type
+   - Implement read, position, eof
+   - Refactor Lexer to use abstractions
+
+3. **Phase 3.1c: Full Unicode Support** (3-5 days)
+   - Add Unicode category tables
+   - Support raw strings, interpolations
+
+**Test Strategy:**
+- Simple expressions: `"1 + 2"`, `"x = 1"`
+- Keywords: `"function f() end"`, `"if x else y end"`
+- Strings: `"hello"`, `"""multiline"""`
+- Compare output with native JuliaSyntax tokenizer
 
 ### 3.2 Parser
-Target: `JuliaSyntax.parse(tokens)` or `JuliaSyntax.parseall(source)`
+Target: `JuliaSyntax.parseall(source)`
+
+**Architecture:**
+- Pratt parser for expression precedence
+- Recursive descent for statements
+- Green tree (lossless) construction
 
 **Required features:**
 - Recursive descent parsing
 - AST node creation
-- Error handling (Result types or error codes)
-- Operator precedence
+- Error handling via token emission (no exceptions)
+- Operator precedence tables
 
 **Challenges:**
-- Complex control flow
-- Nested data structures
-- Error recovery
+- Expression precedence handling
+- Nested data structures (AST nodes)
+- Error recovery without exceptions
 
 ### 3.3 AST Representation
 - GreenNode / SyntaxNode compilation
-- Tree traversal
-- Source location tracking
+- Tree traversal (children iteration)
+- Source location tracking (byte spans)
 
 ---
 
@@ -311,23 +353,35 @@ WasmTarget.jl/
 
 ## Current Status
 
-**Date:** 2024-01-12
+**Date:** 2026-01-12
 
 **Completed:**
 - Core compiler infrastructure
-- Basic types and operations
-- Structs, tuples, arrays, strings
-- Multi-function modules
-- SimpleDict implementation
+- Basic types and operations (Int32, Int64, Float32, Float64, Bool)
+- Structs (mutable and immutable), tuples, arrays, strings
+- Multi-function modules with cross-function calls
+- SimpleDict implementation (hash table for Int32 keys/values)
+- Char type support (map to i32, comparisons work)
+- Count leading/trailing zeros intrinsics (ctlz_int, cttz_int)
+- JuliaSyntax.jl tokenizer analysis (HIGHLY FEASIBLE)
 
 **Next Steps:**
-1. Add Char type support
-2. Implement basic iterator protocol
-3. Analyze JuliaSyntax.jl to identify exact requirements
+1. Create I/O abstraction layer (ByteBuffer type)
+2. Add character classification functions (isdigit, isalpha, isspace)
+3. Implement iterator protocol for strings
 4. Create minimal tokenizer compilation test
+5. Compile ASCII-only tokenizer subset
+
+**Key Findings from JuliaSyntax.jl Analysis:**
+- Tokenizer uses simple if/else dispatch on characters
+- ~1300 lines, ~35 lexing functions
+- No closures, no recursion (except tail calls)
+- Main blockers: I/O abstraction, Unicode tables
+- Strategy: Start with ASCII-only subset
 
 **Blockers:**
-- None currently identified
+- Need I/O abstraction layer (read, position, eof)
+- Unicode category_code requires lookup tables (defer to Phase 3.1c)
 
 ---
 

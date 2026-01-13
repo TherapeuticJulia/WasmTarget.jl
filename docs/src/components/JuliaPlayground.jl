@@ -1,13 +1,14 @@
-# JuliaPlayground.jl - Rust Playground-style Julia REPL
+# JuliaPlayground.jl - True REPL experience
 #
-# For now: Shows code examples with Run button (runtime loading)
-# Future: When trimmed Julia runtime is ready, will compile arbitrary code
+# NOT an island - uses client-side JS for textarea handling
+# WASM compilation will be added when trimmed runtime is ready
 #
-# Pattern: Only button on_click handlers (like Therapy.jl InteractiveCounter)
+# This is the correct architecture:
+# - UI interactivity via vanilla JS (textarea, buttons)
+# - WASM for the actual Julia compilation (when runtime ships)
 
-# Example code snippets
-const EXAMPLES = [
-    """function sum_to_n(n::Int32)::Int32
+const DEFAULT_CODE = """# Write any Julia code here!
+function sum_to_n(n::Int32)::Int32
     result = Int32(0)
     i = Int32(1)
     while i <= n
@@ -15,52 +16,29 @@ const EXAMPLES = [
         i = i + Int32(1)
     end
     return result
-end""",
-    """function fibonacci(n::Int32)::Int32
-    if n <= 1
-        return n
-    end
-    return fibonacci(n - Int32(1)) + fibonacci(n - Int32(2))
-end""",
-    """function factorial(n::Int32)::Int32
-    if n <= 1
-        return Int32(1)
-    end
-    return n * factorial(n - Int32(1))
-end"""
-]
+end
 
-const EXAMPLE_NAMES = ["Sum to N", "Fibonacci", "Factorial"]
+# Try: sum_to_n(100)
+"""
 
 """
-Julia Playground - Code viewer with example selector.
-Uses only button handlers (Therapy.jl pattern).
-"""
-JuliaPlayground = island(:JuliaPlayground) do
-    # State: which example is selected (0, 1, 2)
-    selected, set_selected = create_signal(0)
-    output, set_output = create_signal("")
+Julia Playground - Full REPL experience with editable code.
 
+This is a regular component (not an island) because:
+1. Textarea input handling requires JS, not compiled WASM
+2. The WASM part is the Julia compiler itself (coming with trimmed runtime)
+3. UI interactivity and compiler are separate concerns
+"""
+function JuliaPlayground()
     Div(:class => "max-w-6xl mx-auto",
-        # Example selector buttons
+        # Top bar
         Div(:class => "flex items-center justify-between mb-4 flex-wrap gap-2",
-            Div(:class => "flex gap-2",
-                Button(:class => "px-4 py-2 rounded-lg font-medium transition-colors bg-cyan-500 hover:bg-cyan-600 text-white",
-                    :on_click => () -> set_selected(0),
-                    "Sum to N"
-                ),
-                Button(:class => "px-4 py-2 rounded-lg font-medium transition-colors bg-stone-200 dark:bg-stone-700 hover:bg-stone-300 dark:hover:bg-stone-600 text-stone-700 dark:text-stone-200",
-                    :on_click => () -> set_selected(1),
-                    "Fibonacci"
-                ),
-                Button(:class => "px-4 py-2 rounded-lg font-medium transition-colors bg-stone-200 dark:bg-stone-700 hover:bg-stone-300 dark:hover:bg-stone-600 text-stone-700 dark:text-stone-200",
-                    :on_click => () -> set_selected(2),
-                    "Factorial"
-                )
+            Span(:class => "text-stone-600 dark:text-stone-400 text-sm font-medium",
+                "Julia Playground"
             ),
             # Run button
-            Button(:class => "flex items-center gap-2 bg-cyan-500 hover:bg-cyan-600 text-white px-6 py-2 rounded-lg font-semibold transition-colors shadow-lg shadow-cyan-500/20",
-                :on_click => () -> set_output("Compiling... (trimmed runtime loading)"),
+            Button(:id => "run-btn",
+                   :class => "flex items-center gap-2 bg-cyan-500 hover:bg-cyan-600 text-white px-6 py-2 rounded-lg font-semibold transition-colors shadow-lg shadow-cyan-500/20",
                 Svg(:class => "w-4 h-4", :fill => "currentColor", :viewBox => "0 0 24 24",
                     Path(:d => "M8 5v14l11-7z")
                 ),
@@ -68,18 +46,19 @@ JuliaPlayground = island(:JuliaPlayground) do
             )
         ),
 
-        # Main content: Code + Output
+        # Main content: Editor + Output
         Div(:class => "grid lg:grid-cols-2 gap-4",
-            # Code display (read-only)
+            # Code editor
             Div(:class => "flex flex-col",
                 Div(:class => "flex items-center justify-between px-4 py-2 bg-stone-700 dark:bg-stone-800 rounded-t-xl",
                     Span(:class => "text-stone-300 text-sm font-medium", "Julia"),
-                    Span(:class => "text-stone-500 text-xs", "Read-only")
+                    Span(:class => "text-stone-500 text-xs", "Edit your code")
                 ),
-                Pre(:class => "bg-stone-800 dark:bg-stone-900 p-4 rounded-b-xl min-h-[300px] overflow-auto",
-                    Code(:class => "text-sm text-stone-100 font-mono whitespace-pre",
-                        () -> EXAMPLES[selected() + 1]
-                    )
+                Textarea(:id => "code-editor",
+                         :class => "bg-stone-800 dark:bg-stone-900 p-4 rounded-b-xl text-sm text-stone-100 font-mono min-h-[400px] w-full resize-y focus:outline-none focus:ring-2 focus:ring-cyan-500 border-0",
+                         :spellcheck => "false",
+                         :placeholder => "Write Julia code here...",
+                         DEFAULT_CODE
                 )
             ),
 
@@ -87,22 +66,85 @@ JuliaPlayground = island(:JuliaPlayground) do
             Div(:class => "flex flex-col",
                 Div(:class => "flex items-center justify-between px-4 py-2 bg-stone-700 dark:bg-stone-800 rounded-t-xl",
                     Span(:class => "text-stone-300 text-sm font-medium", "Output"),
-                    Span(:class => "text-amber-400 text-xs", "Runtime loading...")
+                    Span(:id => "status-indicator", :class => "text-amber-400 text-xs",
+                        "Ready"
+                    )
                 ),
-                Div(:class => "bg-stone-900 dark:bg-black p-4 rounded-b-xl flex-1 min-h-[300px] font-mono",
-                    Pre(:class => "text-sm text-stone-400 whitespace-pre-wrap", output)
+                Div(:id => "output-panel",
+                    :class => "bg-stone-900 dark:bg-black p-4 rounded-b-xl flex-1 min-h-[400px] font-mono overflow-auto",
+                    Pre(:id => "output-content",
+                        :class => "text-sm text-stone-400 whitespace-pre-wrap",
+                        "Click 'Run' to compile and execute your Julia code.\n\nThe trimmed Julia compiler will run entirely in your browser."
+                    )
                 )
             )
         ),
 
-        # Footer info
+        # Footer
         Div(:class => "mt-6 p-4 bg-stone-100 dark:bg-stone-800 rounded-xl",
-            P(:class => "text-stone-700 dark:text-stone-200 font-medium text-sm",
-                "Coming Soon: Full REPL"
-            ),
-            P(:class => "text-stone-500 dark:text-stone-400 text-xs mt-1",
-                "A trimmed Julia runtime will run in your browser, compiling arbitrary Julia code to WebAssembly client-side."
+            Div(:class => "flex items-start gap-3",
+                Div(:class => "flex-shrink-0 w-8 h-8 bg-cyan-500 rounded-full flex items-center justify-center",
+                    Span(:class => "text-white text-sm font-bold", "?")
+                ),
+                Div(
+                    P(:class => "text-stone-700 dark:text-stone-200 font-medium text-sm",
+                        "How it works"
+                    ),
+                    P(:class => "text-stone-500 dark:text-stone-400 text-xs mt-1",
+                        "When the trimmed Julia runtime loads, your code is parsed by JuliaSyntax, type-inferred, and compiled to WebAssembly by WasmTarget.jl - all client-side. No server required."
+                    )
+                )
             )
-        )
+        ),
+
+        # Client-side JavaScript for interactivity
+        Script("""
+            (function() {
+                const editor = document.getElementById('code-editor');
+                const runBtn = document.getElementById('run-btn');
+                const output = document.getElementById('output-content');
+                const status = document.getElementById('status-indicator');
+
+                // Handle Run button click
+                runBtn.addEventListener('click', function() {
+                    const code = editor.value;
+                    status.textContent = 'Compiling...';
+                    status.className = 'text-cyan-400 text-xs';
+
+                    // Show the code being compiled
+                    output.innerHTML = '<span class="text-cyan-400">Compiling...</span>\\n\\n';
+                    output.innerHTML += '<span class="text-stone-500">// Your code:</span>\\n';
+                    output.innerHTML += '<span class="text-stone-300">' + escapeHtml(code.substring(0, 500)) + '</span>\\n\\n';
+
+                    // Simulate compilation (replace with actual WASM call when runtime ready)
+                    setTimeout(function() {
+                        output.innerHTML += '<span class="text-amber-400">Trimmed Julia runtime loading...</span>\\n';
+                        output.innerHTML += '<span class="text-stone-500">The browser-based compiler requires Julia 1.12 trimming.</span>\\n\\n';
+                        output.innerHTML += '<span class="text-stone-500">Status: In development</span>\\n';
+                        output.innerHTML += '<span class="text-stone-500">See: github.com/GroupTherapyOrg/WasmTarget.jl</span>';
+                        status.textContent = 'Runtime loading...';
+                        status.className = 'text-amber-400 text-xs';
+                    }, 500);
+                });
+
+                // Helper to escape HTML
+                function escapeHtml(text) {
+                    const div = document.createElement('div');
+                    div.textContent = text;
+                    return div.innerHTML;
+                }
+
+                // Tab key inserts spaces in editor
+                editor.addEventListener('keydown', function(e) {
+                    if (e.key === 'Tab') {
+                        e.preventDefault();
+                        const start = this.selectionStart;
+                        const end = this.selectionEnd;
+                        this.value = this.value.substring(0, start) + '    ' + this.value.substring(end);
+                        this.selectionStart = this.selectionEnd = start + 4;
+                    }
+                });
+            })();
+        """)
     )
 end

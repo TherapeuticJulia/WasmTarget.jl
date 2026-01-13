@@ -768,6 +768,9 @@ function _register_struct_type_impl!(mod::WasmModule, registry::TypeRegistry, T:
         elseif ft === String
             str_type_idx = get_string_array_type!(mod, registry)
             wasm_vt = ConcreteRef(str_type_idx, true)
+        elseif ft === Any
+            # Any type - map to externref (Julia 1.12 closures have Any fields)
+            wasm_vt = ExternRef
         elseif isprimitivetype(ft)
             # Custom primitive types (e.g., JuliaSyntax.Kind) - map by size
             sz = sizeof(ft)

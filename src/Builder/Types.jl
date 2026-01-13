@@ -291,6 +291,10 @@ function julia_to_wasm_type(::Type{T})::WasmValType where T
         # Nothing has no Wasm representation - handled specially
         # Return I32 as a placeholder (functions returning Nothing don't actually return)
         return I32
+    elseif T === Any
+        # Any can hold any value - map to externref for JS interop
+        # This handles Julia 1.12 closure types that have Any fields
+        return ExternRef
     elseif T === JSValue
         # JS values are held as externref
         return ExternRef

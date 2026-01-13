@@ -196,7 +196,7 @@ function get_concrete_wasm_type(T::Type, mod::WasmModule, registry::TypeRegistry
             end
         end
         return StructRef
-    elseif T <: AbstractVector
+    elseif T <: AbstractArray  # Handles Vector, Matrix, and higher-dim arrays
         elem_type = eltype(T)
         if haskey(registry.arrays, elem_type)
             type_idx = registry.arrays[elem_type]
@@ -268,8 +268,8 @@ function compile_function(f, arg_types::Tuple, func_name::String)::WasmModule
             register_closure_type!(mod, type_registry, T)
         elseif is_struct_type(T)
             register_struct_type!(mod, type_registry, T)
-        elseif T <: AbstractVector
-            # Register array type for Vector parameters
+        elseif T <: AbstractArray
+            # Register array type for Vector/Matrix parameters
             elem_type = eltype(T)
             get_array_type!(mod, type_registry, elem_type)
         elseif T === String
@@ -281,7 +281,7 @@ function compile_function(f, arg_types::Tuple, func_name::String)::WasmModule
     # Register return type if it's a struct/array/string
     if is_struct_type(return_type)
         register_struct_type!(mod, type_registry, return_type)
-    elseif return_type <: AbstractVector
+    elseif return_type <: AbstractArray
         elem_type = eltype(return_type)
         get_array_type!(mod, type_registry, elem_type)
     elseif return_type === String
@@ -4564,8 +4564,8 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
             end
         end
 
-        # Handle Vector field access (:ref and :size)
-        if obj_type <: AbstractVector
+        # Handle Array field access (:ref and :size) - works for Vector, Matrix, etc.
+        if obj_type <: AbstractArray
             field_sym = if field_ref isa QuoteNode
                 field_ref.value
             else
@@ -4574,33 +4574,106 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
 
             if field_sym === :ref
                 # :ref returns the underlying array reference
-                # In WasmGC, the Vector IS the array, so just return it
+                # In WasmGC, the Array IS stored as a flat array, so just return it
                 append!(bytes, compile_value(obj_arg, ctx))
                 return bytes
             elseif field_sym === :size
-                # :size returns a Tuple{Int64} containing the length
-                # Create a tuple struct with the array length
+                # :size returns a Tuple containing the dimensions
+                # For Vector: Tuple{Int64}, for Matrix: Tuple{Int64, Int64}, etc.
 
-                # Register the Tuple{Int64} type if needed
-                size_tuple_type = Tuple{Int64}
+                # Determine the size tuple type based on array dimensionality
+                if obj_type <: AbstractVector
+                    size_tuple_type = Tuple{Int64}
+                elseif obj_type <: AbstractMatrix
+                    size_tuple_type = Tuple{Int64, Int64}
+                else
+                    # General N-dimensional array - extract N from type
+                    N = ndims(obj_type)
+                    size_tuple_type = NTuple{N, Int64}
+                end
+
+                # Register the size tuple type if needed
                 if !haskey(ctx.type_registry.structs, size_tuple_type)
                     register_tuple_type!(ctx.mod, ctx.type_registry, size_tuple_type)
                 end
 
-                # Emit: array.len -> extend to i64 -> struct.new for tuple
+                # For Vector (1D): array.len -> extend to i64 -> struct.new
+                if obj_type <: AbstractVector
+                    append!(bytes, compile_value(obj_arg, ctx))
+                    push!(bytes, Opcode.GC_PREFIX)
+                    push!(bytes, Opcode.ARRAY_LEN)
+                    push!(bytes, Opcode.I64_EXTEND_I32_S)
+
+                    if haskey(ctx.type_registry.structs, size_tuple_type)
+                        info = ctx.type_registry.structs[size_tuple_type]
+                        push!(bytes, Opcode.GC_PREFIX)
+                        push!(bytes, Opcode.STRUCT_NEW)
+                        append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
+                    end
+                    return bytes
+                else
+                    # For Matrix/higher-dim: need to return stored size tuple
+                    # In our WasmGC representation, multi-dim arrays store size separately
+                    # TODO: Implement proper multi-dim array representation
+                    # For now, just return the array length as first dimension
+                    append!(bytes, compile_value(obj_arg, ctx))
+                    push!(bytes, Opcode.GC_PREFIX)
+                    push!(bytes, Opcode.ARRAY_LEN)
+                    push!(bytes, Opcode.I64_EXTEND_I32_S)
+
+                    # Create a tuple with array length (placeholder - needs proper impl)
+                    if haskey(ctx.type_registry.structs, Tuple{Int64})
+                        info = ctx.type_registry.structs[Tuple{Int64}]
+                        push!(bytes, Opcode.GC_PREFIX)
+                        push!(bytes, Opcode.STRUCT_NEW)
+                        append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
+                    end
+                    return bytes
+                end
+            end
+        end
+
+        # Handle MemoryRef field access (:mem, :ptr_or_offset)
+        # In WasmGC, MemoryRef IS the array, so :mem just returns it
+        if obj_type <: MemoryRef
+            field_sym = if field_ref isa QuoteNode
+                field_ref.value
+            else
+                field_ref
+            end
+
+            if field_sym === :mem
+                # :mem returns the underlying Memory - in WasmGC this is the array itself
+                append!(bytes, compile_value(obj_arg, ctx))
+                return bytes
+            elseif field_sym === :ptr_or_offset
+                # Not needed in WasmGC - return 0 as placeholder
+                push!(bytes, Opcode.I64_CONST)
+                push!(bytes, 0x00)
+                return bytes
+            end
+        end
+
+        # Handle Memory field access (:length, :ptr)
+        # In WasmGC, Memory IS the array
+        if obj_type <: Memory
+            field_sym = if field_ref isa QuoteNode
+                field_ref.value
+            else
+                field_ref
+            end
+
+            if field_sym === :length
+                # Return array length
                 append!(bytes, compile_value(obj_arg, ctx))
                 push!(bytes, Opcode.GC_PREFIX)
                 push!(bytes, Opcode.ARRAY_LEN)
-                # Convert i32 to i64 for Julia compatibility
                 push!(bytes, Opcode.I64_EXTEND_I32_S)
-
-                # Create a tuple struct with this value
-                if haskey(ctx.type_registry.structs, size_tuple_type)
-                    info = ctx.type_registry.structs[size_tuple_type]
-                    push!(bytes, Opcode.GC_PREFIX)
-                    push!(bytes, Opcode.STRUCT_NEW)
-                    append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
-                end
+                return bytes
+            elseif field_sym === :ptr
+                # Not meaningful in WasmGC - return 0
+                push!(bytes, Opcode.I64_CONST)
+                push!(bytes, 0x00)
                 return bytes
             end
         end

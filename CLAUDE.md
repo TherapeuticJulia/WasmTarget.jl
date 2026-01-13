@@ -235,22 +235,42 @@ Julia source → Julia compiler → IR (Base.code_typed) → WasmTarget.jl → W
 
 4. **JS runtime companion**: dart2wasm outputs a `.mjs` file alongside WASM. We'll need similar for DOM bindings.
 
-### Two Compilation Paths
+### Key Architectural Insight
 
-1. **Build-time path (Therapy.jl apps)**: Compile user code at build time
-   - Parse/analyze using Julia's compiler
-   - Generate WASM via WasmTarget.jl
-   - Ship pre-compiled WASM to browser
+**Julia's compiler does the hard work.** When we call `Base.code_typed()`, Julia handles:
+- Parsing (JuliaSyntax)
+- Macro expansion
+- Lowering
+- **Full type inference**
+- Optimization
 
-2. **Runtime path (Browser REPL)**: Compile Julia tools to WASM so the compiler runs in-browser
-   - JuliaSyntax.jl in WASM for parsing
-   - JuliaLowering.jl in WASM for lowering
-   - WasmTarget.jl in WASM for codegen
-   - Result: Like Rust Playground - write Julia, compile & execute entirely in browser, no server
+We receive fully-typed IR and just generate WASM bytecode. This is why we can already support:
+- ✅ Exceptions, closures, union types, complex control flow
+- ✅ 29+ JuliaSyntax functions compile and run
+- ✅ 259 tests passing
 
-## Roadmap: Path to dart2wasm Parity
+This is the same architecture as dart2wasm - leverage the existing compiler, just add a WASM backend.
 
-The goal is full dart2wasm parity: being able to compile arbitrary Julia code to WASM for browser execution. Unlike dart2wasm (where the Dart compiler runs natively), our ultimate goal is to have WasmTarget.jl itself run in the browser as WASM - enabling a fully client-side Julia REPL like Rust Playground.
+### Compilation Paths
+
+1. **Build-time (Therapy.jl apps)**: Julia compiler → typed IR → WasmTarget.jl → WASM → ship to browser
+
+2. **Browser REPL (server-assisted)**: Practical path to Rust Playground experience
+   ```
+   Browser: Julia source → Server: code_typed() → Typed IR →
+   Server: WasmTarget.jl → WASM → Browser: Execute
+   ```
+   The server runs Julia's compiler (parsing, type inference). Browser just executes WASM.
+   This can work TODAY with what we have.
+
+3. **Browser REPL (full self-hosting)**: Long-term goal
+   - Compile JuliaSyntax.jl, type inference, WasmTarget.jl to WASM
+   - Everything runs in browser, no server needed
+   - Much harder due to type inference complexity
+
+## Roadmap: Incremental Julia Support
+
+The goal is incremental expansion of Julia language support. Because we hook into `Base.code_typed()`, we get Julia's full compiler power. Each new IR pattern we handle expands what Julia code compiles to WASM.
 
 ### Current Status (as of Jan 2026)
 

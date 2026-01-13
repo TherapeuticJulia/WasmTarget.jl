@@ -10,7 +10,7 @@ JuliaSyntax = "70703baa-626e-46a2-a12c-08ffd08c73b4"
 [compat]
 JSON = "0.21"
 JuliaSyntax = "1.0.2"
-julia = "1.9"
+julia = "1.12"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"

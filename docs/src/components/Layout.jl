@@ -23,10 +23,11 @@ function Layout(children...; title="WasmTarget.jl")
                     # Navigation Links
                     Div(:class => "hidden sm:flex sm:items-center sm:space-x-6",
                         NavItem("./", "Home"),
+                        NavItem("guide/", "Guide"),
                         NavItem("demo/", "Demo"),
                         NavItem("api/", "API"),
                         # GitHub link
-                        A(:href => "https://github.com/TherapeuticJulia/WasmTarget.jl",
+                        A(:href => "https://github.com/GroupTherapyOrg/WasmTarget.jl",
                           :class => "text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-200 transition-colors",
                           :target => "_blank",
                           :title => "View on GitHub",
@@ -52,7 +53,7 @@ function Layout(children...; title="WasmTarget.jl")
                 Div(:class => "flex justify-between items-center",
                     P(:class => "text-stone-500 dark:text-stone-400 text-sm",
                         "Built with ",
-                        A(:href => "https://github.com/TherapeuticJulia/Therapy.jl", :class => "text-cyan-500 dark:text-cyan-400 hover:text-cyan-600 dark:hover:text-cyan-300", :target => "_blank", "Therapy.jl"),
+                        A(:href => "https://github.com/GroupTherapyOrg/Therapy.jl", :class => "text-cyan-500 dark:text-cyan-400 hover:text-cyan-600 dark:hover:text-cyan-300", :target => "_blank", "Therapy.jl"),
                         " - Powered by ",
                         A(:href => "./", :class => "text-cyan-500 dark:text-cyan-400 hover:text-cyan-600 dark:hover:text-cyan-300", "WasmTarget.jl")
                     ),

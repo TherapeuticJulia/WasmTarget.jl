@@ -101,8 +101,8 @@ end""",
                 FeatureItem("Strings", "Concat, compare", true),
                 FeatureItem("JS Interop", "externref, imports", true),
                 FeatureItem("Multi-dispatch", "Type-based selection", true),
-                FeatureItem("Closures", "Coming soon", false),
-                FeatureItem("Exceptions", "Use Result types", false),
+                FeatureItem("Closures", "Captured variables", true),
+                FeatureItem("Exceptions", "try/catch/throw", true),
                 FeatureItem("Async/Await", "Use callbacks", false)
             )
         ),
@@ -112,7 +112,7 @@ end""",
             P(:class => "text-stone-500 dark:text-stone-400 mb-4",
                 "Ready to compile your own Julia to Wasm?"
             ),
-            A(:href => "https://github.com/TherapeuticJulia/WasmTarget.jl",
+            A(:href => "https://github.com/GroupTherapyOrg/WasmTarget.jl",
               :class => "inline-block bg-cyan-500 hover:bg-cyan-600 text-white px-6 py-3 rounded-lg font-medium transition-colors",
               :target => "_blank",
               "Get Started on GitHub"

@@ -20,7 +20,7 @@ function Index()
                       :class => "bg-cyan-500 hover:bg-cyan-600 dark:bg-cyan-600 dark:hover:bg-cyan-500 text-white px-6 py-3 rounded-lg font-medium transition-colors shadow-lg shadow-cyan-500/20",
                       "View Examples"
                     ),
-                    A(:href => "https://github.com/TherapeuticJulia/WasmTarget.jl",
+                    A(:href => "https://github.com/GroupTherapyOrg/WasmTarget.jl",
                       :class => "bg-stone-100 dark:bg-stone-800 text-stone-700 dark:text-stone-200 px-6 py-3 rounded-lg font-medium hover:bg-stone-200 dark:hover:bg-stone-700 transition-colors",
                       :target => "_blank",
                       "View on GitHub"

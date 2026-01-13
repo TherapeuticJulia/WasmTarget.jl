@@ -251,31 +251,36 @@ We receive fully-typed IR and just generate WASM bytecode. This is why we can al
 
 This is the same architecture as dart2wasm - leverage the existing compiler, just add a WASM backend.
 
-### Compilation Paths
+### Two Use Cases
 
-1. **Build-time (Therapy.jl apps)**: Julia compiler → typed IR → WasmTarget.jl → WASM → ship to browser
+#### 1. Build-Time Compilation (Main Product - Therapy.jl apps)
+```
+Dev machine: Julia code → WasmTarget.jl → WASM
+Deploy: Just the compiled WASM (KB to few MB)
+Browser: Runs WASM - NO Julia runtime shipped
+```
+- **This is the core product**
+- dart2wasm parity = more Julia code compiles correctly
+- Each IR pattern we support = more Julia works
+- Compiled output is small and fast
 
-2. **Browser REPL (self-hosting via trimmed runtime)**: THE PATH FORWARD
-   ```
-   Julia 1.12 + --trim + LLVM WASM backend
-            ↓
-   Tiny Julia runtime (~2-5MB WASM) containing:
-     - JuliaSyntax.jl (parsing)
-     - Core.Compiler subset (type inference)
-     - WasmTarget.jl (codegen)
-            ↓
-   Ship to browser ONCE
-            ↓
-   Browser compiles & executes ANY Julia code (no server!)
-   ```
+#### 2. Interactive REPL Playground (Optional Stretch Goal)
+```
+Ship ONCE: Trimmed Julia compiler (~2-5MB WASM)
+User types arbitrary code → compiler IN browser → executes
+```
+- Only for "try Julia in browser" experience
+- Leverages Julia 1.12 trimming (1.1MB hello world, 90% smaller)
+- Uses JuliaC.jl + LLVM WASM target
+- WasmGC handles memory (no Julia GC needed)
+- Like Rust Playground - compiler ships to browser
 
-   This leverages:
-   - **Julia 1.12 trimming**: 1.1MB "hello world" binaries (90% smaller than before)
-   - **JuliaC.jl**: CLI for building trimmed binaries
-   - **LLVM WASM target**: Julia uses LLVM, LLVM outputs WASM
-   - **WasmGC**: Browser handles GC, don't need Julia's GC
+**The trimmed runtime is NOT needed for normal apps.** It's only for letting users write arbitrary code live in a playground.
 
-   This is EXACTLY how dart2wasm works - ship the compiler to browser.
+| Use Case | What Ships to Browser |
+|----------|----------------------|
+| Therapy.jl app | Just compiled WASM (small) |
+| Interactive REPL playground | Trimmed Julia compiler (~2-5MB) |
 
 ## Roadmap: Incremental Julia Support
 

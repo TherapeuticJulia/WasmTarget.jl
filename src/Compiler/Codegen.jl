@@ -3881,52 +3881,138 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
             end
         end
 
-        # Handle phi pattern specially - generates boolean IF and continues
+        # Handle phi pattern specially
         if found_phi_pattern !== nothing
             phi_idx, goto_idx = found_phi_pattern
+            phi_node = code[phi_idx]::Core.PhiNode
+            phi_type = get(ctx.ssa_types, phi_idx, Bool)
 
-            # Push condition
-            append!(inner_bytes, compile_value(goto_if_not.cond, ctx))
+            # Check if this is a boolean && pattern or a ternary with computed values
+            is_boolean_phi = phi_type === Bool
 
-            # IF block with i32 (boolean) result type
-            push!(inner_bytes, Opcode.IF)
-            push!(inner_bytes, 0x7f)  # i32 result type
+            if is_boolean_phi
+                # Boolean && pattern: generates IF with i32 result, else = 0
+                append!(inner_bytes, compile_value(goto_if_not.cond, ctx))
+                push!(inner_bytes, Opcode.IF)
+                push!(inner_bytes, 0x7f)  # i32 result type
 
-            # Then-branch: compute cond2 (the expression before the goto)
-            for i in then_start:goto_idx-1
-                stmt = code[i]
-                if stmt !== nothing && !(stmt isa Core.GotoIfNot) && !(stmt isa Core.GotoNode)
-                    append!(inner_bytes, compile_statement(stmt, i, ctx))
+                # Then-branch: compute cond2 (the expression before the goto)
+                for i in then_start:goto_idx-1
+                    stmt = code[i]
+                    if stmt !== nothing && !(stmt isa Core.GotoIfNot) && !(stmt isa Core.GotoNode)
+                        append!(inner_bytes, compile_statement(stmt, i, ctx))
+                    end
                 end
-            end
 
-            # Else-branch: push false (0)
-            push!(inner_bytes, Opcode.ELSE)
-            push!(inner_bytes, Opcode.I32_CONST)
-            append!(inner_bytes, encode_leb128_signed(0))
+                # Else-branch: push false (0)
+                push!(inner_bytes, Opcode.ELSE)
+                push!(inner_bytes, Opcode.I32_CONST)
+                append!(inner_bytes, encode_leb128_signed(0))
 
-            # End IF - boolean result on stack
-            push!(inner_bytes, Opcode.END)
+                push!(inner_bytes, Opcode.END)
 
-            # Store to phi local if we have one
-            if haskey(ctx.phi_locals, phi_idx)
-                local_idx = ctx.phi_locals[phi_idx]
-                push!(inner_bytes, Opcode.LOCAL_SET)
-                append!(inner_bytes, encode_leb128_unsigned(local_idx))
-            end
-
-            # Continue with conditionals after the phi
-            # Find the conditional that USES the phi as its condition
-            for (j, (_, b)) in enumerate(conditionals)
-                goto_if_not = b.terminator::Core.GotoIfNot
-                # Check if this conditional tests the phi
-                if goto_if_not.cond isa Core.SSAValue && goto_if_not.cond.id == phi_idx
-                    append!(inner_bytes, gen_conditional(j; target_idx=0))
-                    break
+                # Store to phi local if we have one
+                if haskey(ctx.phi_locals, phi_idx)
+                    local_idx = ctx.phi_locals[phi_idx]
+                    push!(inner_bytes, Opcode.LOCAL_SET)
+                    append!(inner_bytes, encode_leb128_unsigned(local_idx))
                 end
-            end
 
-            return inner_bytes  # Done with this conditional
+                # Continue with conditionals after the phi
+                for (j, (_, b)) in enumerate(conditionals)
+                    goto_if_not = b.terminator::Core.GotoIfNot
+                    if goto_if_not.cond isa Core.SSAValue && goto_if_not.cond.id == phi_idx
+                        append!(inner_bytes, gen_conditional(j; target_idx=0))
+                        break
+                    end
+                end
+
+                return inner_bytes
+            else
+                # Ternary pattern with computed values (e.g., from Julia 1.12 inlining)
+                # Get actual phi values for then and else branches
+                phi_wasm_type = julia_to_wasm_type_concrete(phi_type, ctx)
+
+                then_value = nothing
+                else_value = nothing
+                else_edge = nothing
+                for (edge_idx, edge) in enumerate(phi_node.edges)
+                    if edge < goto_if_not.dest
+                        # Edge from then-branch (before else target)
+                        then_value = phi_node.values[edge_idx]
+                    else
+                        # Edge from else-branch
+                        else_value = phi_node.values[edge_idx]
+                        else_edge = edge
+                    end
+                end
+
+                # Push condition
+                append!(inner_bytes, compile_value(goto_if_not.cond, ctx))
+
+                # IF block with phi's result type
+                push!(inner_bytes, Opcode.IF)
+                append!(inner_bytes, encode_block_type(phi_wasm_type))
+
+                # Then-branch: compile any statements, then push the value
+                for i in then_start:goto_idx-1
+                    stmt = code[i]
+                    if stmt !== nothing && !(stmt isa Core.GotoIfNot) && !(stmt isa Core.GotoNode) && !(stmt isa Core.PhiNode)
+                        append!(inner_bytes, compile_statement(stmt, i, ctx))
+                    end
+                end
+                if then_value !== nothing
+                    append!(inner_bytes, compile_value(then_value, ctx))
+                end
+
+                # Else-branch: compile statements from dest to else_edge, then push the value
+                push!(inner_bytes, Opcode.ELSE)
+
+                if else_edge !== nothing
+                    for i in goto_if_not.dest:else_edge
+                        stmt = code[i]
+                        if stmt === nothing
+                            continue
+                        elseif stmt isa Core.GotoNode || stmt isa Core.PhiNode
+                            continue
+                        elseif stmt isa Core.ReturnNode
+                            continue
+                        else
+                            append!(inner_bytes, compile_statement(stmt, i, ctx))
+                        end
+                    end
+                end
+
+                if else_value !== nothing
+                    append!(inner_bytes, compile_value(else_value, ctx))
+                end
+
+                push!(inner_bytes, Opcode.END)
+
+                # Store to phi local if we have one
+                if haskey(ctx.phi_locals, phi_idx)
+                    local_idx = ctx.phi_locals[phi_idx]
+                    push!(inner_bytes, Opcode.LOCAL_SET)
+                    append!(inner_bytes, encode_leb128_unsigned(local_idx))
+                end
+
+                # After the phi, continue generating code from phi_idx+1 to the return
+                for i in phi_idx+1:length(code)
+                    stmt = code[i]
+                    if stmt isa Core.ReturnNode
+                        if isdefined(stmt, :val)
+                            append!(inner_bytes, compile_value(stmt.val, ctx))
+                        end
+                        break
+                    elseif stmt === nothing || stmt isa Core.GotoNode || stmt isa Core.PhiNode
+                        continue
+                    else
+                        append!(inner_bytes, compile_statement(stmt, i, ctx))
+                    end
+                end
+
+                return inner_bytes
+            end
         end
 
         # Push condition for normal pattern
@@ -5416,7 +5502,15 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
                arg_type === Int16 || arg_type === UInt16 || arg_type === Int8 || arg_type === UInt8 ||
                (isprimitivetype(arg_type) && sizeof(arg_type) <= 4)
 
-    mi = expr.args[1]
+    mi_or_ci = expr.args[1]
+    # Handle both MethodInstance (Julia 1.11) and CodeInstance (Julia 1.12+)
+    mi = if mi_or_ci isa Core.MethodInstance
+        mi_or_ci
+    elseif isdefined(Core, :CodeInstance) && mi_or_ci isa Core.CodeInstance
+        mi_or_ci.def
+    else
+        nothing
+    end
     if mi isa Core.MethodInstance
         meth = mi.def
         if meth isa Method

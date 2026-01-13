@@ -255,18 +255,27 @@ This is the same architecture as dart2wasm - leverage the existing compiler, jus
 
 1. **Build-time (Therapy.jl apps)**: Julia compiler → typed IR → WasmTarget.jl → WASM → ship to browser
 
-2. **Browser REPL (server-assisted)**: Practical path to Rust Playground experience
+2. **Browser REPL (self-hosting via trimmed runtime)**: THE PATH FORWARD
    ```
-   Browser: Julia source → Server: code_typed() → Typed IR →
-   Server: WasmTarget.jl → WASM → Browser: Execute
+   Julia 1.12 + --trim + LLVM WASM backend
+            ↓
+   Tiny Julia runtime (~2-5MB WASM) containing:
+     - JuliaSyntax.jl (parsing)
+     - Core.Compiler subset (type inference)
+     - WasmTarget.jl (codegen)
+            ↓
+   Ship to browser ONCE
+            ↓
+   Browser compiles & executes ANY Julia code (no server!)
    ```
-   The server runs Julia's compiler (parsing, type inference). Browser just executes WASM.
-   This can work TODAY with what we have.
 
-3. **Browser REPL (full self-hosting)**: Long-term goal
-   - Compile JuliaSyntax.jl, type inference, WasmTarget.jl to WASM
-   - Everything runs in browser, no server needed
-   - Much harder due to type inference complexity
+   This leverages:
+   - **Julia 1.12 trimming**: 1.1MB "hello world" binaries (90% smaller than before)
+   - **JuliaC.jl**: CLI for building trimmed binaries
+   - **LLVM WASM target**: Julia uses LLVM, LLVM outputs WASM
+   - **WasmGC**: Browser handles GC, don't need Julia's GC
+
+   This is EXACTLY how dart2wasm works - ship the compiler to browser.
 
 ## Roadmap: Incremental Julia Support
 

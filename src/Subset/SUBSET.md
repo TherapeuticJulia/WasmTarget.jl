@@ -1,167 +1,168 @@
-# Julia Subset for Browser REPL
+# WasmTarget.jl - Supported Julia Subset
 
-This document defines the Julia subset supported by WasmTarget.jl's browser REPL.
-The goal is a minimal but useful subset that can be compiled directly from AST to WASM
-without full type inference.
+This document defines what Julia code WasmTarget.jl can compile to WebAssembly.
+**We use Julia's full type inference** - no explicit type annotations required.
 
-## Design Principles
+## Comparison to Other Julia-to-WASM Compilers
 
-1. **Explicit types required** - Function signatures must have type annotations
-2. **No runtime dispatch** - Types known at compile time
-3. **Subset of Base Julia** - Every program in our subset runs identically in real Julia
-4. **Progressive expansion** - Start minimal, add features as needed
+| Feature | WasmTarget.jl | WebAssemblyCompiler.jl | WasmCompiler.jl | StaticCompiler.jl |
+|---------|---------------|------------------------|-----------------|-------------------|
+| **Memory model** | WasmGC | WasmGC | WasmGC | Linear memory |
+| **Type inference** | ✅ Julia's | ✅ Julia's | ✅ Julia's | ✅ Julia's |
+| **GC** | ✅ Browser | ✅ Browser | ✅ Browser | ❌ None |
+| **Structs** | ✅ | ✅ | ✅ | ✅ |
+| **Tuples** | ✅ | ✅ | ✅ | ✅ |
+| **1D Arrays** | ✅ Vector{T} | ✅ Vector{T}/Any | ❌ | ⚠️ StaticTools |
+| **Multi-dim Arrays** | 🚧 Planned | ❌ | ❌ | ❌ |
+| **Strings** | ✅ | ✅ | ⚠️ Limited | ❌ |
+| **Exceptions** | ✅ try/catch | ❌ | ⚠️ WIP | ❌ |
+| **Closures** | ✅ | ❌ | ❌ | ❌ |
+| **Union{Nothing,T}** | ✅ | ❌ | ❌ | ❌ |
+| **Hash tables** | ✅ Dict-like | ✅ Dict | ❌ | ❌ |
+| **Recursion** | ✅ | ✅ | ✅ | ✅ |
+| **Mutual recursion** | ✅ | ✅ | ✅ | ❌ |
+| **@goto/@label** | ❌ | ❌ | ✅ | ❌ |
+
+### Key Advantages of WasmTarget.jl
+1. **Exceptions** - Full try/catch/throw support (others don't have this)
+2. **Closures** - Captured variables work (others don't support this)
+3. **Union types** - `Union{Nothing, T}` with `isa` operator
+4. **Multi-dim arrays** - Coming soon (NO other Julia-to-WASM compiler has this)
+
+## How It Works
+
+```julia
+# Write normal Julia code - NO explicit types needed
+function fibonacci(n)
+    if n <= 1
+        return n
+    end
+    return fibonacci(n - 1) + fibonacci(n - 2)
+end
+
+# Compile by specifying argument types at compile time
+# Julia's compiler infers everything else
+bytes = compile(fibonacci, (Int32,))
+```
+
+Julia's `Base.code_typed()` does full type inference, giving us typed IR.
+We then generate WASM from that IR.
 
 ## Supported Types
 
 ### Primitives
-| Type | WASM | Notes |
-|------|------|-------|
-| `Int32` | i32 | 32-bit signed integer |
-| `Int64` | i64 | 64-bit signed integer |
-| `Float32` | f32 | 32-bit float |
-| `Float64` | f64 | 64-bit float |
+| Julia Type | WASM Type | Notes |
+|------------|-----------|-------|
+| `Int32` | i32 | |
+| `UInt32` | i32 | |
+| `Int64` / `Int` | i64 | |
+| `UInt64` | i64 | |
+| `Float32` | f32 | |
+| `Float64` | f64 | |
 | `Bool` | i32 | 0 or 1 |
 
-### Compound Types (Phase 2)
-| Type | WASM | Notes |
-|------|------|-------|
-| `String` | GC array (i32) | Immutable |
+### Compound Types
+| Julia Type | WASM Type | Notes |
+|------------|-----------|-------|
+| `String` | GC array (i32) | Immutable, supports ==, sizeof, length |
 | `Vector{T}` | GC array | Mutable, T must be concrete |
-| `struct` | GC struct | User-defined, concrete fields |
-| `Tuple{...}` | GC struct | Immutable |
+| `struct Foo ... end` | GC struct | User-defined |
+| `Tuple{A,B,...}` | GC struct | Immutable |
+| `Union{Nothing,T}` | Tagged union | `isa` operator supported |
 
-## Supported Syntax
+### Special Types
+| Julia Type | WASM Type | Notes |
+|------------|-----------|-------|
+| `JSValue` | externref | JavaScript object reference |
+| `WasmGlobal{T,IDX}` | global | Compile-time global access |
 
-### Expressions
-```julia
-# Literals
-42              # Int64 (default) or Int32 if annotated
-3.14            # Float64 (default) or Float32 if annotated
-true, false     # Bool
-"hello"         # String (Phase 2)
+## Supported Language Features
 
-# Arithmetic
-x + y, x - y, x * y, x / y, x % y
-x ^ y           # Power (integer only initially)
-
-# Comparisons
-x == y, x != y, x < y, x <= y, x > y, x >= y
-
-# Logical
-x && y, x || y, !x
-
-# Bitwise
-x & y, x | y, x ⊻ y, ~x, x << n, x >> n
-```
-
-### Statements
-```julia
-# Variable declaration (type inferred from RHS or explicit)
-x = 42
-y::Int32 = 10
-
-# If/else
-if condition
-    ...
-elseif condition
-    ...
-else
-    ...
-end
-
-# While loop
-while condition
-    ...
-end
-
-# For loop (ranges only)
-for i in 1:10
-    ...
-end
-
-# Return
-return value
-```
+### Control Flow
+- ✅ `if`/`elseif`/`else`
+- ✅ `while` loops
+- ✅ `for` loops (ranges)
+- ✅ `&&` and `||` (short-circuit)
+- ✅ `try`/`catch`/`throw`
+- ✅ Recursion
 
 ### Functions
+- ✅ Regular functions
+- ✅ Multiple functions calling each other (`compile_multi`)
+- ✅ Closures (captured variables)
+- ✅ Multiple dispatch (same name, different types)
+
+### Operators
+- ✅ Arithmetic: `+`, `-`, `*`, `/`, `%`, `^`
+- ✅ Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`
+- ✅ Logical: `&&`, `||`, `!`
+- ✅ Bitwise: `&`, `|`, `⊻`, `~`, `<<`, `>>`
+
+### Data Structures
+- ✅ Struct creation and field access
+- ✅ Tuple creation and indexing
+- ✅ Array creation, indexing, mutation
+- ✅ String operations (equality, length, concatenation)
+- ✅ SimpleDict / StringDict (hash tables)
+
+## NOT Yet Supported (Roadmap)
+
+### HIGH PRIORITY (differentiators)
+- 🚧 **Multi-dimensional arrays** (`Matrix`, `Array{T,N}`) - NO other Julia-WASM compiler has this!
+- 🚧 **Full dynamic dispatch** - Runtime method lookup
+
+### MEDIUM PRIORITY
+- ❌ Full `Dict` (use SimpleDict/StringDict for now)
+- ❌ `@goto` / `@label` (WasmCompiler.jl has this)
+- ❌ Varargs and keyword arguments
+
+### LOW PRIORITY
+- ❌ `@generated` functions
+- ❌ FFI / `ccall`
+- ❌ I/O operations
+- ❌ Metaprogramming at runtime
+
+## Comparison Test Suite
+
+Every feature is tested against base Julia to ensure identical behavior:
+
 ```julia
-# REQUIRED: All parameters and return type must be annotated
-function add(x::Int32, y::Int32)::Int32
-    return x + y
+# Test runs in BOTH Julia and WASM, compares results
+function test_add()
+    source = "add(x, y) = x + y"
+
+    # Run in Julia
+    julia_result = run_julia(source, "add", 3, 4)
+
+    # Compile to WASM, run in Node.js
+    wasm_result = run_wasm(source, "add", 3, 4)
+
+    # Must match!
+    @test julia_result == wasm_result
 end
-
-# Short form OK
-f(x::Int32)::Int32 = x * 2
 ```
 
-### NOT Supported (Phase 1)
-- Multiple dispatch (only one method per function name)
-- Abstract types (`Any`, `Number`, `Integer`, etc.)
-- Union types (`Union{Int, Nothing}`)
-- Closures and anonymous functions
-- Macros
-- Modules/imports
-- Exceptions (try/catch)
-- Mutable structs (Phase 2)
-- Arrays (Phase 2)
-- Strings (Phase 2)
+Current test coverage: **48 comparison tests** across arithmetic, comparisons, control flow, type conversions, and edge cases.
 
-## Compilation Strategy
+## Browser REPL Architecture
 
+For the interactive browser REPL, we need type inference to run somewhere:
+
+**Option A: Server-assisted** (simpler, full Julia support)
 ```
-Julia source (subset)
-    ↓ JuliaSyntax.jl (parse)
-SyntaxNode (AST)
-    ↓ SubsetCompiler (type check + codegen)
-WASM bytecode
+Browser: Julia source → Server: code_typed() → Browser: WASM codegen → Execute
 ```
 
-No type inference needed because:
-1. All function signatures are fully typed
-2. Local variable types inferred from initialization or annotation
-3. No dynamic dispatch - function calls resolved at compile time
-
-## Testing Strategy
-
-Every feature has dual tests:
-1. **Base Julia test** - Run in real Julia, capture result
-2. **WASM test** - Compile with WasmTarget, run in Node.js, compare
-
-```julia
-# Test macro that runs both
-@subset_test "addition" begin
-    function add(x::Int32, y::Int32)::Int32
-        return x + y
-    end
-end args=(Int32(3), Int32(4)) expected=Int32(7)
+**Option B: Full client-side** (harder, requires compiling type inferencer)
+```
+Browser: Julia source → JuliaSyntax.jl (WASM) → JuliaLowering.jl (WASM) →
+         Type inference (WASM) → WasmTarget.jl (WASM) → Execute
 ```
 
-## Comparison to Other Subsets
+**Option C: Hybrid** (practical middle ground)
+```
+Browser: Julia source + type hints → Simple inferencer (WASM) →
+         WasmTarget.jl (WASM) → Execute
+```
 
-| Feature | Our Subset | AssemblyScript | Dart (subset) |
-|---------|------------|----------------|---------------|
-| Static types | Required | Required | Optional |
-| Generics | No (Phase 2) | Yes | Yes |
-| Classes/Structs | Phase 2 | Yes | Yes |
-| Closures | No | Yes | Yes |
-| GC | WasmGC | Linear memory | WasmGC |
-
-## Roadmap
-
-### Phase 1: Primitives + Control Flow
-- [x] Int32, Int64, Float32, Float64, Bool
-- [ ] Arithmetic, comparisons, logical ops
-- [ ] If/else, while, for (range)
-- [ ] Functions with type annotations
-- [ ] AST-to-WASM compiler
-
-### Phase 2: Compound Types
-- [ ] Strings
-- [ ] Arrays (Vector{T})
-- [ ] Structs
-- [ ] Tuples
-
-### Phase 3: Browser REPL
-- [ ] Compile subset compiler to WASM
-- [ ] Terminal UI with Therapy.jl
-- [ ] Live compilation and execution
+The goal is maximum Julia compatibility while being practical about browser constraints.

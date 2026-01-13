@@ -254,21 +254,23 @@ The goal is full dart2wasm parity: being able to compile arbitrary Julia code to
 
 ### Current Status (as of Jan 2026)
 
-| Feature | dart2wasm | WasmTarget.jl |
-|---------|-----------|---------------|
-| Basic types, structs, arrays | ✅ | ✅ |
-| Simple control flow | ✅ | ✅ |
-| Multi-function modules | ✅ | ✅ |
-| JS interop (externref) | ✅ | ✅ |
-| `\|\|`/`&&` operators | ✅ | ✅ |
-| Try/catch exceptions | ✅ | ✅ |
-| Closures | ✅ | ✅ |
-| Full multiple dispatch | ✅ | ⚠️ partial |
-| Standard library | ✅ | ⚠️ SimpleDict + StringDict done |
-| DOM runtime | ✅ | ⚠️ via Therapy.jl (imports work) |
-| JuliaSyntax.jl | ✅ | ✅ 29+ functions compile and run |
+| Feature | dart2wasm | WasmTarget.jl | WebAssemblyCompiler.jl | WasmCompiler.jl |
+|---------|-----------|---------------|------------------------|-----------------|
+| Basic types, structs | ✅ | ✅ | ✅ | ✅ |
+| 1D Arrays (Vector) | ✅ | ✅ | ✅ | ❌ |
+| **Multi-dim Arrays** | ✅ | 🚧 HIGH PRIORITY | ❌ | ❌ |
+| Control flow | ✅ | ✅ | ✅ | ✅ |
+| JS interop (externref) | ✅ | ✅ | ✅ | ❌ |
+| `\|\|`/`&&` operators | ✅ | ✅ | ✅ | ✅ |
+| Try/catch exceptions | ✅ | ✅ | ❌ | ⚠️ WIP |
+| Closures | ✅ | ✅ | ❌ | ❌ |
+| Union{Nothing,T} | ✅ | ✅ | ❌ | ❌ |
+| Multiple dispatch | ✅ | ⚠️ partial | ❌ | ❌ |
+| Standard library | ✅ | ⚠️ Dict-like done | ✅ Dict | ❌ |
+| JuliaSyntax.jl | N/A | ✅ 29+ functions | N/A | N/A |
 
-**Estimated parity: ~70%** (JuliaSyntax.jl functions working, DOM via Therapy.jl)
+**WasmTarget.jl advantages**: Exceptions, Closures, Union types, Multi-dim arrays (coming)
+**Estimated parity: ~70%**
 
 ### Phase 1: Control Flow Completeness ✅ COMPLETE
 

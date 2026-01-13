@@ -284,7 +284,8 @@ function compile_function(f, arg_types::Tuple, func_name::String)::WasmModule
 
     # Generate function body with the function reference for self-call detection
     ctx = CompilationContext(code_info, arg_types, return_type, mod, type_registry;
-                            func_idx=expected_func_idx, func_ref=f, global_args=global_args)
+                            func_idx=expected_func_idx, func_ref=f, global_args=global_args,
+                            is_compiled_closure=is_closure)
     body = generate_body(ctx)
 
     # Add function to module
@@ -341,6 +342,14 @@ function compile_module(functions::Vector)::WasmModule
     function_data = []  # Store (f, arg_types, name, code_info, return_type, global_args) for each function
 
     for (f, arg_types, name) in normalized
+        # Check if this is a closure (function with captured variables)
+        closure_type = typeof(f)
+        is_closure = is_closure_type(closure_type)
+        if is_closure
+            # Prepend the closure type to arg_types
+            arg_types = (closure_type, arg_types...)
+        end
+
         # Get typed IR
         code_info, return_type = get_typed_ir(f, arg_types)
 
@@ -361,7 +370,9 @@ function compile_module(functions::Vector)::WasmModule
             if i in global_args
                 continue
             end
-            if is_struct_type(T)
+            if is_closure_type(T)
+                register_closure_type!(mod, type_registry, T)
+            elseif is_struct_type(T)
                 register_struct_type!(mod, type_registry, T)
             elseif T <: AbstractVector
                 elem_type = eltype(T)
@@ -372,7 +383,9 @@ function compile_module(functions::Vector)::WasmModule
         end
 
         # Register return type
-        if is_struct_type(return_type)
+        if is_closure_type(return_type)
+            register_closure_type!(mod, type_registry, return_type)
+        elseif is_struct_type(return_type)
             register_struct_type!(mod, type_registry, return_type)
         elseif return_type <: AbstractVector
             elem_type = eltype(return_type)
@@ -381,7 +394,7 @@ function compile_module(functions::Vector)::WasmModule
             get_string_array_type!(mod, type_registry)
         end
 
-        push!(function_data, (f, arg_types, name, code_info, return_type, global_args))
+        push!(function_data, (f, arg_types, name, code_info, return_type, global_args, is_closure))
     end
 
     # Add all required globals to the module
@@ -395,19 +408,19 @@ function compile_module(functions::Vector)::WasmModule
     # Calculate function indices (accounting for imports)
     # Functions are added in order, so index = n_imports + position - 1
     n_imports = length(mod.imports)
-    for (i, (f, arg_types, name, _, _, _)) in enumerate(function_data)
+    for (i, (f, arg_types, name, _, _, _, _)) in enumerate(function_data)
         func_idx = UInt32(n_imports + i - 1)
         register_function!(func_registry, name, f, arg_types, func_idx)
     end
 
     # Second pass: compile function bodies
-    for (i, (f, arg_types, name, code_info, return_type, global_args)) in enumerate(function_data)
+    for (i, (f, arg_types, name, code_info, return_type, global_args, is_closure)) in enumerate(function_data)
         func_idx = UInt32(n_imports + i - 1)
 
         # Generate function body
         ctx = CompilationContext(code_info, arg_types, return_type, mod, type_registry;
                                 func_registry=func_registry, func_idx=func_idx, func_ref=f,
-                                global_args=global_args)
+                                global_args=global_args, is_compiled_closure=is_closure)
         body = generate_body(ctx)
 
         # Get param/result types (skip WasmGlobal args)
@@ -785,6 +798,7 @@ mutable struct CompilationContext
     func_idx::UInt32             # Index of the function being compiled (for recursion)
     func_ref::Any                # Reference to original function (for self-call detection)
     global_args::Set{Int}        # Argument indices (1-based) that are WasmGlobal (phantom params)
+    is_compiled_closure::Bool    # True if function being compiled is itself a closure
     # Signal substitution for Therapy.jl closures
     signal_ssa_getters::Dict{Int, UInt32}   # SSA id (from getfield) -> Wasm global index
     signal_ssa_setters::Dict{Int, UInt32}   # SSA id (from getfield) -> Wasm global index
@@ -798,6 +812,7 @@ function CompilationContext(code_info, arg_types::Tuple, return_type, mod::WasmM
                            func_registry::Union{FunctionRegistry, Nothing}=nothing,
                            func_idx::UInt32=UInt32(0), func_ref=nothing,
                            global_args::Set{Int}=Set{Int}(),
+                           is_compiled_closure::Bool=false,
                            captured_signal_fields::Dict{Symbol, Tuple{Bool, UInt32}}=Dict{Symbol, Tuple{Bool, UInt32}}(),
                            dom_bindings::Dict{UInt32, Vector{Tuple{UInt32, Vector{Int32}}}}=Dict{UInt32, Vector{Tuple{UInt32, Vector{Int32}}}}())
     # Calculate n_params excluding WasmGlobal arguments (they're phantom)
@@ -818,6 +833,7 @@ function CompilationContext(code_info, arg_types::Tuple, return_type, mod::WasmM
         func_idx,
         func_ref,
         global_args,
+        is_compiled_closure,    # Is this function itself a closure?
         Dict{Int, UInt32}(),    # signal_ssa_getters
         Dict{Int, UInt32}(),    # signal_ssa_setters
         captured_signal_fields, # captured signal field mappings
@@ -1487,11 +1503,11 @@ end
 
 function infer_value_type(val, ctx::CompilationContext)
     if val isa Core.Argument
-        # For closures, _1 is the closure object (arg_types[1])
+        # For closures being compiled, _1 is the closure object (arg_types[1])
         # For regular functions, arguments start at _2 (arg_types[1])
-        # We detect closures by checking if arg_types[1] is a closure type
-        if length(ctx.arg_types) >= 1 && is_closure_type(ctx.arg_types[1])
-            # Closure: direct mapping
+        # Use is_compiled_closure flag to distinguish (not the type of first arg)
+        if ctx.is_compiled_closure
+            # Closure: direct mapping (_1 = closure, _2 = first arg)
             idx = val.n
         else
             # Regular function: skip _1 (function type in IR)
@@ -3580,8 +3596,12 @@ function compile_new(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt
 
     # Get the registered struct info
     if !haskey(ctx.type_registry.structs, struct_type)
-        # Register it now
-        register_struct_type!(ctx.mod, ctx.type_registry, struct_type)
+        # Register it now - use appropriate registration for closures vs regular structs
+        if is_closure_type(struct_type)
+            register_closure_type!(ctx.mod, ctx.type_registry, struct_type)
+        else
+            register_struct_type!(ctx.mod, ctx.type_registry, struct_type)
+        end
     end
 
     info = ctx.type_registry.structs[struct_type]
@@ -3624,10 +3644,11 @@ function compile_value(val, ctx::CompilationContext)::Vector{UInt8}
         # Otherwise, assume it's on the stack (for single-use SSAs in sequence)
 
     elseif val isa Core.Argument
-        # For closures, _1 is the closure object (arg_types[1])
+        # For closures being compiled, _1 is the closure object (arg_types[1])
         # For regular functions, arguments start at _2 (arg_types[1])
-        if length(ctx.arg_types) >= 1 && is_closure_type(ctx.arg_types[1])
-            # Closure: direct mapping
+        # Use is_compiled_closure flag (not the type of first arg)
+        if ctx.is_compiled_closure
+            # Closure: direct mapping (_1 = closure, _2 = first arg)
             arg_idx = val.n
         else
             # Regular function: skip _1 (function type in IR)

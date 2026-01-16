@@ -12,13 +12,14 @@ Theme toggle island - compiled to WebAssembly.
 """
 ThemeToggle = island(:ThemeToggle) do
     # Create reactive state - 0 for light mode, 1 for dark mode
-    dark, set_dark = create_signal(0)
+    # Use Int32 explicitly to avoid BigInt issues in JavaScript
+    dark, set_dark = create_signal(Int32(0))
 
     # The :dark_mode prop tells the compiler to call set_dark_mode(value) when signal changes
     Div(:dark_mode => dark,
         Button(
             :class => "p-2 rounded-lg hover:bg-stone-100 dark:hover:bg-stone-700 transition-colors",
-            :on_click => () -> set_dark(dark() == 0 ? 1 : 0),
+            :on_click => () -> set_dark(dark() == Int32(0) ? Int32(1) : Int32(0)),
             :title => "Toggle dark mode",
             # Sun/Moon icon
             Svg(:class => "w-5 h-5 text-stone-600 dark:text-stone-300",

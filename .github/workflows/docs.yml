@@ -26,7 +26,7 @@ jobs:
       - name: Checkout Therapy.jl
         uses: actions/checkout@v4
         with:
-          repository: TherapeuticJulia/Therapy.jl
+          repository: GroupTherapyOrg/Therapy.jl
           path: Therapy.jl
 
       - name: Setup Julia

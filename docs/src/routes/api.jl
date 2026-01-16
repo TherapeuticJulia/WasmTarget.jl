@@ -322,7 +322,7 @@ write("output.wasm", bytes)"""
                 "Check out the interactive demos or explore the source code on GitHub."
             ),
             Div(:class => "flex justify-center gap-4",
-                A(:href => "demo/",
+                A(:href => "../features/",
                   :class => "bg-cyan-500 hover:bg-cyan-600 text-white px-6 py-3 rounded-lg font-medium transition-colors",
                   "Interactive Demos"
                 ),

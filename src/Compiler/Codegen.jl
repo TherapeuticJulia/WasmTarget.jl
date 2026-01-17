@@ -122,6 +122,67 @@ function get_function(registry::FunctionRegistry, func_ref, arg_types::Tuple)::U
 end
 
 """
+Compile a constant value to WASM bytecode (for global initializers).
+This is a simplified version of compile_value for use in constant expressions.
+"""
+function compile_const_value(val, mod::WasmModule, registry::TypeRegistry)::Vector{UInt8}
+    bytes = UInt8[]
+
+    if val isa Int32
+        push!(bytes, Opcode.I32_CONST)
+        append!(bytes, encode_leb128_signed(val))
+    elseif val isa Int64
+        push!(bytes, Opcode.I64_CONST)
+        append!(bytes, encode_leb128_signed(val))
+    elseif val isa Float32
+        push!(bytes, Opcode.F32_CONST)
+        append!(bytes, reinterpret(UInt8, [val]))
+    elseif val isa Float64
+        push!(bytes, Opcode.F64_CONST)
+        append!(bytes, reinterpret(UInt8, [val]))
+    elseif val isa Bool
+        push!(bytes, Opcode.I32_CONST)
+        push!(bytes, val ? 0x01 : 0x00)
+    elseif val isa String
+        # Strings are compiled as WasmGC arrays of i32 (character codes)
+        # Get or create string array type
+        str_type_idx = get_string_array_type!(mod, registry)
+
+        # Push each character code
+        for c in val
+            push!(bytes, Opcode.I32_CONST)
+            append!(bytes, encode_leb128_signed(Int32(c)))
+        end
+
+        # array.new_fixed $type_idx $length
+        push!(bytes, Opcode.GC_PREFIX)
+        push!(bytes, Opcode.ARRAY_NEW_FIXED)
+        append!(bytes, encode_leb128_unsigned(str_type_idx))
+        append!(bytes, encode_leb128_unsigned(length(val)))
+    elseif val === nothing
+        # For Nothing type, we use ref.null with any heap type
+        push!(bytes, Opcode.REF_NULL)
+        push!(bytes, 0x6E)  # none heap type
+    else
+        # For other types, try to push as integer if small enough
+        T = typeof(val)
+        if isprimitivetype(T) && sizeof(T) <= 4
+            int_val = Core.Intrinsics.bitcast(UInt32, val)
+            push!(bytes, Opcode.I32_CONST)
+            append!(bytes, encode_leb128_signed(Int32(int_val)))
+        elseif isprimitivetype(T) && sizeof(T) <= 8
+            int_val = Core.Intrinsics.bitcast(UInt64, val)
+            push!(bytes, Opcode.I64_CONST)
+            append!(bytes, encode_leb128_signed(Int64(int_val)))
+        else
+            error("Cannot compile constant value of type $(typeof(val)) for global initializer")
+        end
+    end
+
+    return bytes
+end
+
+"""
 Get or create an array type for a given element type.
 """
 function get_array_type!(mod::WasmModule, registry::TypeRegistry, elem_type::Type)::UInt32
@@ -465,6 +526,46 @@ function compile_module(functions::Vector)::WasmModule
         end
     end
 
+    # Scan all function IR for GlobalRef to mutable structs (module-level globals)
+    # These need to be shared across all functions as WASM globals
+    module_globals = Dict{Tuple{Module, Symbol}, UInt32}()
+    for (f, arg_types, name, code_info, return_type, global_args, is_closure) in function_data
+        for stmt in code_info.code
+            if stmt isa GlobalRef
+                # Check if this GlobalRef points to a mutable struct instance
+                try
+                    actual_val = getfield(stmt.mod, stmt.name)
+                    T = typeof(actual_val)
+                    # Check if it's a mutable struct (but not a type, function, or module)
+                    if ismutabletype(T) && !isa(actual_val, Type) && !isa(actual_val, Function) && !isa(actual_val, Module)
+                        key = (stmt.mod, stmt.name)
+                        if !haskey(module_globals, key)
+                            # Register the struct type first
+                            info = register_struct_type!(mod, type_registry, T)
+                            type_idx = info.wasm_type_idx
+
+                            # Build initialization expression: struct.new with default values
+                            init_bytes = UInt8[]
+                            for field_name in fieldnames(T)
+                                field_val = getfield(actual_val, field_name)
+                                append!(init_bytes, compile_const_value(field_val, mod, type_registry))
+                            end
+                            push!(init_bytes, Opcode.GC_PREFIX)
+                            push!(init_bytes, Opcode.STRUCT_NEW)
+                            append!(init_bytes, encode_leb128_unsigned(type_idx))
+
+                            # Add global with reference type
+                            global_idx = add_global_ref!(mod, type_idx, true, init_bytes; nullable=false)
+                            module_globals[key] = global_idx
+                        end
+                    end
+                catch
+                    # If we can't evaluate, skip it
+                end
+            end
+        end
+    end
+
     # Calculate function indices (accounting for imports)
     # Functions are added in order, so index = n_imports + position - 1
     n_imports = length(mod.imports)
@@ -480,7 +581,8 @@ function compile_module(functions::Vector)::WasmModule
         # Generate function body
         ctx = CompilationContext(code_info, arg_types, return_type, mod, type_registry;
                                 func_registry=func_registry, func_idx=func_idx, func_ref=f,
-                                global_args=global_args, is_compiled_closure=is_closure)
+                                global_args=global_args, is_compiled_closure=is_closure,
+                                module_globals=module_globals)
         body = generate_body(ctx)
 
         # Get param/result types (skip WasmGlobal args)
@@ -2580,6 +2682,9 @@ mutable struct CompilationContext
     # DOM bindings for Therapy.jl - emit DOM update calls after signal writes
     # Maps global_idx -> [(import_idx, [hk_arg, ...]), ...]
     dom_bindings::Dict{UInt32, Vector{Tuple{UInt32, Vector{Int32}}}}
+    # Module-level globals: maps (Module, Symbol) -> Wasm global index
+    # Used for const mutable struct instances that should be shared across functions
+    module_globals::Dict{Tuple{Module, Symbol}, UInt32}
 end
 
 function CompilationContext(code_info, arg_types::Tuple, return_type, mod::WasmModule, type_registry::TypeRegistry;
@@ -2588,7 +2693,8 @@ function CompilationContext(code_info, arg_types::Tuple, return_type, mod::WasmM
                            global_args::Set{Int}=Set{Int}(),
                            is_compiled_closure::Bool=false,
                            captured_signal_fields::Dict{Symbol, Tuple{Bool, UInt32}}=Dict{Symbol, Tuple{Bool, UInt32}}(),
-                           dom_bindings::Dict{UInt32, Vector{Tuple{UInt32, Vector{Int32}}}}=Dict{UInt32, Vector{Tuple{UInt32, Vector{Int32}}}}())
+                           dom_bindings::Dict{UInt32, Vector{Tuple{UInt32, Vector{Int32}}}}=Dict{UInt32, Vector{Tuple{UInt32, Vector{Int32}}}}(),
+                           module_globals::Dict{Tuple{Module, Symbol}, UInt32}=Dict{Tuple{Module, Symbol}, UInt32}())
     # Calculate n_params excluding WasmGlobal arguments (they're phantom)
     n_real_params = count(i -> !(i in global_args), 1:length(arg_types))
     ctx = CompilationContext(
@@ -2611,7 +2717,8 @@ function CompilationContext(code_info, arg_types::Tuple, return_type, mod::WasmM
         Dict{Int, UInt32}(),    # signal_ssa_getters
         Dict{Int, UInt32}(),    # signal_ssa_setters
         captured_signal_fields, # captured signal field mappings
-        dom_bindings            # DOM bindings for Therapy.jl
+        dom_bindings,           # DOM bindings for Therapy.jl
+        module_globals          # Module-level globals (const mutable structs)
     )
     # Analyze SSA types and allocate locals for multi-use SSAs
     analyze_ssa_types!(ctx)
@@ -7209,11 +7316,13 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
         # TODO: Implement full try/catch with try_table instruction
 
     elseif stmt isa GlobalRef
-        # GlobalRef statement - evaluate the constant and push it
-        # This handles things like Main.SLOT_EMPTY that are module-level constants
-        try
-            val = getfield(stmt.mod, stmt.name)
-            append!(bytes, compile_value(val, ctx))
+        # GlobalRef statement - check if it's a module-level global first
+        key = (stmt.mod, stmt.name)
+        if haskey(ctx.module_globals, key)
+            # Emit global.get for module-level mutable struct instances
+            global_idx = ctx.module_globals[key]
+            push!(bytes, Opcode.GLOBAL_GET)
+            append!(bytes, encode_leb128_unsigned(global_idx))
 
             # If this SSA value needs a local, store it
             if haskey(ctx.ssa_locals, idx)
@@ -7221,8 +7330,22 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
                 push!(bytes, Opcode.LOCAL_SET)
                 append!(bytes, encode_leb128_unsigned(local_idx))
             end
-        catch
-            # If we can't evaluate, it might be a type reference which has no runtime value
+        else
+            # Regular GlobalRef - evaluate the constant and push it
+            # This handles things like Main.SLOT_EMPTY that are module-level constants
+            try
+                val = getfield(stmt.mod, stmt.name)
+                append!(bytes, compile_value(val, ctx))
+
+                # If this SSA value needs a local, store it
+                if haskey(ctx.ssa_locals, idx)
+                    local_idx = ctx.ssa_locals[idx]
+                    push!(bytes, Opcode.LOCAL_SET)
+                    append!(bytes, encode_leb128_unsigned(local_idx))
+                end
+            catch
+                # If we can't evaluate, it might be a type reference which has no runtime value
+            end
         end
 
     elseif stmt isa Expr
@@ -7434,12 +7557,21 @@ function compile_value(val, ctx::CompilationContext)::Vector{UInt8}
         append!(bytes, encode_leb128_unsigned(length(val)))
 
     elseif val isa GlobalRef
-        # GlobalRef to a constant - evaluate and compile the value
-        try
-            actual_val = getfield(val.mod, val.name)
-            append!(bytes, compile_value(actual_val, ctx))
-        catch
-            # If we can't evaluate, might be a type reference (no runtime value)
+        # Check if this GlobalRef is a module-level global (mutable struct instance)
+        key = (val.mod, val.name)
+        if haskey(ctx.module_globals, key)
+            # Emit global.get instead of creating a new struct instance
+            global_idx = ctx.module_globals[key]
+            push!(bytes, Opcode.GLOBAL_GET)
+            append!(bytes, encode_leb128_unsigned(global_idx))
+        else
+            # GlobalRef to a constant - evaluate and compile the value
+            try
+                actual_val = getfield(val.mod, val.name)
+                append!(bytes, compile_value(actual_val, ctx))
+            catch
+                # If we can't evaluate, might be a type reference (no runtime value)
+            end
         end
 
     elseif val isa QuoteNode

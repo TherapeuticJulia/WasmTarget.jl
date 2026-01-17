@@ -1,7 +1,7 @@
 # WebAssembly Instructions and Opcodes
 # Reference: https://webassembly.github.io/spec/core/binary/instructions.html
 
-export Opcode, WasmModule, WasmImport, WasmTable, WasmMemory, WasmDataSegment, WasmTag, add_function!, add_import!, add_export!, add_struct_type!, add_array_type!, add_table!, add_table_export!, add_elem_segment!, add_memory!, add_memory_export!, add_data_segment!, add_tag!, to_bytes
+export Opcode, WasmModule, WasmImport, WasmTable, WasmMemory, WasmDataSegment, WasmTag, add_function!, add_import!, add_export!, add_struct_type!, add_array_type!, add_table!, add_table_export!, add_elem_segment!, add_memory!, add_memory_export!, add_data_segment!, add_tag!, add_global_ref!, to_bytes
 
 # ============================================================================
 # Opcodes (Section 5.4)
@@ -530,6 +530,40 @@ function add_global!(mod::WasmModule, valtype::WasmValType, mutable_::Bool, init
     else
         error("Unsupported global type: $valtype")
     end
+    push!(init, Opcode.END)
+
+    push!(mod.globals, WasmGlobalDef(valtype, mutable_, init))
+    return UInt32(length(mod.globals) - 1)
+end
+
+"""
+    add_global_ref!(mod, type_idx, mutable, init_expr) -> global_idx
+
+Add a global variable with a WasmGC reference type to the module.
+The init_expr should be the bytecode for the initialization expression
+(e.g., struct.new instructions) WITHOUT the trailing END byte.
+
+# Arguments
+- `mod`: The WasmModule to add the global to
+- `type_idx`: The type index of the WasmGC struct/array type
+- `mutable_`: Whether the global is mutable
+- `init_expr`: The initialization bytecode (without END byte)
+- `nullable`: Whether the reference is nullable (default: true)
+
+# Example
+```julia
+# Create a global holding a struct instance
+struct_type_idx = add_struct_type!(mod, [...])
+init_bytes = [Opcode.GC_PREFIX, Opcode.STRUCT_NEW_DEFAULT, ...type_idx_leb...]
+global_idx = add_global_ref!(mod, struct_type_idx, true, init_bytes)
+```
+"""
+function add_global_ref!(mod::WasmModule, type_idx::Integer, mutable_::Bool, init_expr::Vector{UInt8}; nullable::Bool=true)::UInt32
+    # Reference type to the struct (ConcreteRef: type_idx first, then nullable)
+    valtype = ConcreteRef(UInt32(type_idx), nullable)
+
+    # Add END byte to init expression
+    init = copy(init_expr)
     push!(init, Opcode.END)
 
     push!(mod.globals, WasmGlobalDef(valtype, mutable_, init))

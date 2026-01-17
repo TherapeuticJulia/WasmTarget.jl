@@ -9623,11 +9623,67 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
                 push!(bytes, is_32bit ? Opcode.I32_SUB : Opcode.I64_SUB)
             elseif name === :* || name === :mul_int
                 push!(bytes, is_32bit ? Opcode.I32_MUL : Opcode.I64_MUL)
-            elseif name === :throw_boundserror || name === :throw
+            elseif name === :throw_boundserror || name === :throw || name === :throw_inexacterror
                 # Error throwing functions - emit unreachable
                 # Clear the stack first (arguments were pushed but not needed)
                 bytes = UInt8[]  # Reset - don't need the pushed args
                 push!(bytes, Opcode.UNREACHABLE)
+
+            # Power operator: x ^ y for floats
+            # WASM doesn't have a native pow instruction, so we need to handle this
+            # For now, we require the pow import to be available
+            elseif name === :^ && length(args) == 2
+                arg1_type = infer_value_type(args[1], ctx)
+                arg2_type = infer_value_type(args[2], ctx)
+
+                if (arg1_type === Float64 || arg1_type === Float32) &&
+                   (arg2_type === Float64 || arg2_type === Float32)
+                    # Float power - need Math.pow import
+                    # Check if we have a pow import
+                    pow_import_idx = nothing
+                    for (i, imp) in enumerate(ctx.mod.imports)
+                        if imp.kind == 0x00 && imp.name == "pow"  # function import
+                            pow_import_idx = UInt32(i - 1)
+                            break
+                        end
+                    end
+
+                    if pow_import_idx !== nothing
+                        # Args already compiled, call pow import
+                        # Convert to f64 if needed (Math.pow expects f64, f64 -> f64)
+                        if arg1_type === Float32
+                            # First arg is f32, need to insert promotion before second arg
+                            # This is tricky with stack order. For now, just promote both
+                            bytes = UInt8[]  # Reset
+                            append!(bytes, compile_value(args[1], ctx))
+                            push!(bytes, 0xBB)  # f64.promote_f32
+                            append!(bytes, compile_value(args[2], ctx))
+                            if arg2_type === Float32
+                                push!(bytes, 0xBB)  # f64.promote_f32
+                            end
+                        end
+                        push!(bytes, Opcode.CALL)
+                        append!(bytes, encode_leb128_unsigned(pow_import_idx))
+                        # Convert back to f32 if needed
+                        if arg1_type === Float32
+                            push!(bytes, 0xB6)  # f32.demote_f64
+                        end
+                    else
+                        # No pow import - emit approximation using exp(y * log(x))
+                        # This is hacky but works for basic cases
+                        # For now, error out requesting the import
+                        error("Float power (^) requires 'pow' import from Math module. " *
+                              "Add (\"Math\", \"pow\", [F64, F64], [F64]) to imports.")
+                    end
+                elseif (arg1_type === Int32 || arg1_type === Int64) &&
+                       (arg2_type === Int32 || arg2_type === Int64)
+                    # Integer power - can implement with loop
+                    # For simplicity, error out for now
+                    error("Integer power (^) not yet implemented. Use float power instead.")
+                else
+                    error("Unsupported power types: $(arg1_type) ^ $(arg2_type)")
+                end
+
             elseif name === :length
                 # String/array length - argument already pushed, emit array.len
                 push!(bytes, Opcode.GC_PREFIX)

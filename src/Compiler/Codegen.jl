@@ -412,6 +412,213 @@ function compile_function(f, arg_types::Tuple, func_name::String)::WasmModule
     return mod
 end
 
+# ============================================================================
+# WASM-057: Auto-discover function dependencies
+# ============================================================================
+
+"""
+Set of WasmTarget runtime function names that can be auto-discovered.
+These are intrinsic functions that have special compilation support.
+"""
+const WASMTARGET_RUNTIME_FUNCTIONS = Set([
+    # String operations (StringOps.jl)
+    :str_char, :str_setchar!, :str_len, :str_new, :str_copy, :str_substr,
+    :str_eq, :str_hash, :str_find, :str_contains, :str_startswith, :str_endswith,
+    :str_uppercase, :str_lowercase, :str_trim,
+    # String conversion (WASM-054, WASM-055)
+    :digit_to_str, :int_to_string,
+    # Array operations (ArrayOps.jl)
+    :arr_new, :arr_get, :arr_set!, :arr_len, :arr_fill!,
+    # SimpleDict operations
+    :sd_new, :sd_get, :sd_set!, :sd_haskey, :sd_length,
+    # StringDict operations
+    :sdict_new, :sdict_get, :sdict_set!, :sdict_haskey, :sdict_length,
+])
+
+"""
+    discover_dependencies(functions::Vector) -> Vector
+
+Scan the IR of all functions and discover WasmTarget runtime function dependencies.
+Returns an expanded function list with auto-discovered dependencies added.
+
+This enables calling runtime functions like str_eq without explicitly including them.
+"""
+function discover_dependencies(functions::Vector)::Vector
+    # Normalize input first
+    normalized = Vector{Tuple{Any, Tuple, String}}()
+    for entry in functions
+        if length(entry) == 2
+            f, arg_types = entry
+            name = string(nameof(f))
+            push!(normalized, (f, arg_types, name))
+        else
+            push!(normalized, (entry[1], entry[2], entry[3]))
+        end
+    end
+
+    # Track which functions we've already seen (by (func_ref, arg_types))
+    seen_funcs = Set{Tuple{Any, Tuple}}()
+    for (f, arg_types, _) in normalized
+        push!(seen_funcs, (f, arg_types))
+    end
+
+    # Track discovered dependencies
+    to_add = Vector{Tuple{Any, Tuple, String}}()
+
+    # Queue of functions to scan (using Any-typed vector)
+    to_scan = Vector{Tuple{Any, Tuple, String}}(normalized)
+
+    while !isempty(to_scan)
+        f, arg_types, name = popfirst!(to_scan)
+
+        # Get IR for this function
+        code_info = try
+            ir, _ = Base.code_ircode(f, arg_types)[1]
+            ir
+        catch
+            continue  # Skip if we can't get IR
+        end
+
+        # Scan IR for GlobalRef calls to WasmTarget runtime functions
+        for stmt in code_info.stmts.stmt
+            if stmt isa Expr
+                scan_expr_for_deps!(stmt, seen_funcs, to_add, to_scan)
+            end
+        end
+    end
+
+    # Add discovered dependencies to the function list
+    result = copy(normalized)
+    append!(result, to_add)
+    return result
+end
+
+"""
+Scan an expression for WasmTarget runtime function calls.
+"""
+function scan_expr_for_deps!(expr::Expr, seen_funcs::Set, to_add::Vector, to_scan::Vector)
+    # Check if this is an invoke expression
+    if expr.head === :invoke && length(expr.args) >= 2
+        func_ref = expr.args[2]
+        if func_ref isa GlobalRef
+            check_and_add_runtime_func!(func_ref, seen_funcs, to_add, to_scan)
+        end
+    elseif expr.head === :call && length(expr.args) >= 1
+        func_ref = expr.args[1]
+        if func_ref isa GlobalRef
+            check_and_add_runtime_func!(func_ref, seen_funcs, to_add, to_scan)
+        end
+    end
+
+    # Recursively scan nested expressions
+    for arg in expr.args
+        if arg isa Expr
+            scan_expr_for_deps!(arg, seen_funcs, to_add, to_scan)
+        end
+    end
+end
+
+"""
+Check if a GlobalRef is a WasmTarget runtime function and add it if needed.
+"""
+function check_and_add_runtime_func!(ref::GlobalRef, seen_funcs::Set, to_add::Vector, to_scan::Vector)
+    # Check if this is a WasmTarget module function
+    if ref.mod !== WasmTarget
+        return
+    end
+
+    # Check if this is a known runtime function
+    if ref.name in WASMTARGET_RUNTIME_FUNCTIONS
+        # Get the actual function
+        func = try
+            getfield(ref.mod, ref.name)
+        catch
+            return  # Can't get function
+        end
+
+        # Determine argument types based on the function name
+        arg_types = infer_runtime_func_arg_types(ref.name)
+        if arg_types === nothing
+            return  # Can't infer types
+        end
+
+        # Check if we've already seen this (func, arg_types)
+        key = (func, arg_types)
+        if key in seen_funcs
+            return
+        end
+
+        # Add to seen and to_add
+        push!(seen_funcs, key)
+        name = string(ref.name)
+        entry = (func, arg_types, name)
+        push!(to_add, entry)
+        push!(to_scan, entry)  # Also scan this function for its deps
+    end
+end
+
+"""
+Infer argument types for WasmTarget runtime functions.
+Returns Nothing if types cannot be inferred.
+"""
+function infer_runtime_func_arg_types(name::Symbol)::Union{Tuple, Nothing}
+    # String operations typically use String and Int32
+    if name in [:str_char]
+        return (String, Int32)
+    elseif name in [:str_setchar!]
+        return (String, Int32, Int32)
+    elseif name in [:str_len]
+        return (String,)
+    elseif name in [:str_new]
+        return (Int32,)
+    elseif name in [:str_copy]
+        return (String, Int32, String, Int32, Int32)
+    elseif name in [:str_substr]
+        return (String, Int32, Int32)
+    elseif name in [:str_eq, :str_find, :str_contains]
+        return (String, String)
+    elseif name in [:str_startswith, :str_endswith]
+        return (String, String)
+    elseif name in [:str_hash]
+        return (String,)
+    elseif name in [:str_uppercase, :str_lowercase, :str_trim]
+        return (String,)
+    elseif name in [:digit_to_str]
+        return (Int32,)
+    elseif name in [:int_to_string]
+        return (Int32,)
+    # Array operations
+    elseif name in [:arr_len]
+        return nothing  # Can't infer element type
+    elseif name in [:arr_new]
+        return nothing  # Can't infer element type
+    elseif name in [:arr_get]
+        return nothing  # Can't infer element type
+    elseif name in [:arr_set!]
+        return nothing  # Can't infer element type
+    # SimpleDict operations
+    elseif name in [:sd_new]
+        return (Int32,)
+    elseif name in [:sd_get, :sd_haskey]
+        return nothing  # Need SimpleDict type
+    elseif name in [:sd_set!]
+        return nothing  # Need SimpleDict type
+    elseif name in [:sd_length]
+        return nothing  # Need SimpleDict type
+    # StringDict operations
+    elseif name in [:sdict_new]
+        return (Int32,)
+    elseif name in [:sdict_get, :sdict_haskey]
+        return nothing  # Need StringDict type
+    elseif name in [:sdict_set!]
+        return nothing  # Need StringDict type
+    elseif name in [:sdict_length]
+        return nothing  # Need StringDict type
+    else
+        return nothing
+    end
+end
+
 """
     compile_module(functions::Vector) -> WasmModule
 
@@ -432,6 +639,8 @@ mod = compile_module([
 Functions can call each other within the module.
 """
 function compile_module(functions::Vector)::WasmModule
+    # WASM-057: Auto-discover function dependencies
+    functions = discover_dependencies(functions)
     # Create shared module and registries
     mod = WasmModule()
     type_registry = TypeRegistry()

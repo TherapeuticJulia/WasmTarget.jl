@@ -3137,4 +3137,92 @@ end
 
     end
 
+    # ========================================================================
+    # Phase 25: Interpreter Tokenizer (BROWSER-020)
+    # Tests for the Julia interpreter tokenizer that will be compiled to WASM
+    # ========================================================================
+    @testset "Phase 25: Interpreter Tokenizer" begin
+
+        # Include the tokenizer module
+        include("../src/Interpreter/Tokenizer.jl")
+
+        @testset "Character classification (Int32 returns)" begin
+            # Compile character classifiers
+            wasm_bytes = WasmTarget.compile_multi([
+                (is_digit, (Int32,)),
+                (is_alpha, (Int32,)),
+                (is_alnum, (Int32,)),
+                (is_whitespace, (Int32,)),
+                (is_newline, (Int32,))
+            ])
+            @test length(wasm_bytes) > 0
+
+            # Test is_digit
+            @test run_wasm(wasm_bytes, "is_digit", Int32(48)) == 1   # '0'
+            @test run_wasm(wasm_bytes, "is_digit", Int32(57)) == 1   # '9'
+            @test run_wasm(wasm_bytes, "is_digit", Int32(65)) == 0   # 'A'
+            @test run_wasm(wasm_bytes, "is_digit", Int32(97)) == 0   # 'a'
+
+            # Test is_alpha
+            @test run_wasm(wasm_bytes, "is_alpha", Int32(97)) == 1   # 'a'
+            @test run_wasm(wasm_bytes, "is_alpha", Int32(122)) == 1  # 'z'
+            @test run_wasm(wasm_bytes, "is_alpha", Int32(65)) == 1   # 'A'
+            @test run_wasm(wasm_bytes, "is_alpha", Int32(90)) == 1   # 'Z'
+            @test run_wasm(wasm_bytes, "is_alpha", Int32(95)) == 1   # '_'
+            @test run_wasm(wasm_bytes, "is_alpha", Int32(48)) == 0   # '0'
+
+            # Test is_whitespace
+            @test run_wasm(wasm_bytes, "is_whitespace", Int32(32)) == 1  # ' '
+            @test run_wasm(wasm_bytes, "is_whitespace", Int32(9)) == 1   # '\t'
+            @test run_wasm(wasm_bytes, "is_whitespace", Int32(13)) == 1  # '\r'
+            @test run_wasm(wasm_bytes, "is_whitespace", Int32(10)) == 0  # '\n' - not whitespace in our lexer
+
+            # Test is_newline
+            @test run_wasm(wasm_bytes, "is_newline", Int32(10)) == 1  # '\n'
+            @test run_wasm(wasm_bytes, "is_newline", Int32(13)) == 0  # '\r'
+        end
+
+        @testset "Tokenizer Julia-side functionality" begin
+            # Test tokenize function in Julia (this tests the algorithm, not WASM)
+            tokens = tokenize("x = 5", Int32(100))
+            @test tokens.count == 4
+            @test token_list_get(tokens, Int32(1)).type == TOK_IDENT
+            @test token_list_get(tokens, Int32(2)).type == TOK_EQ
+            @test token_list_get(tokens, Int32(3)).type == TOK_INT
+            @test token_list_get(tokens, Int32(3)).int_value == 5
+            @test token_list_get(tokens, Int32(4)).type == TOK_EOF
+
+            # Test arithmetic
+            tokens2 = tokenize("3 + 4 * 2", Int32(100))
+            @test tokens2.count == 6
+            @test token_list_get(tokens2, Int32(1)).type == TOK_INT
+            @test token_list_get(tokens2, Int32(1)).int_value == 3
+            @test token_list_get(tokens2, Int32(2)).type == TOK_PLUS
+            @test token_list_get(tokens2, Int32(3)).type == TOK_INT
+            @test token_list_get(tokens2, Int32(3)).int_value == 4
+            @test token_list_get(tokens2, Int32(4)).type == TOK_STAR
+
+            # Test keywords
+            tokens3 = tokenize("if x end", Int32(100))
+            @test token_list_get(tokens3, Int32(1)).type == TOK_KW_IF
+            @test token_list_get(tokens3, Int32(2)).type == TOK_IDENT
+            @test token_list_get(tokens3, Int32(3)).type == TOK_KW_END
+
+            # Test comparison operators
+            tokens4 = tokenize("a == b != c", Int32(100))
+            @test token_list_get(tokens4, Int32(2)).type == TOK_EQ_EQ
+            @test token_list_get(tokens4, Int32(4)).type == TOK_NE
+
+            # Test float
+            tokens5 = tokenize("3.14", Int32(100))
+            @test token_list_get(tokens5, Int32(1)).type == TOK_FLOAT
+            @test token_list_get(tokens5, Int32(1)).float_value ≈ Float32(3.14)
+
+            # Test string
+            tokens6 = tokenize("\"hello\"", Int32(100))
+            @test token_list_get(tokens6, Int32(1)).type == TOK_STRING
+        end
+
+    end
+
 end

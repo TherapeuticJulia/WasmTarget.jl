@@ -5,7 +5,8 @@
 # These functions compile to direct array operations.
 
 export str_char, str_setchar!, str_len, str_new, str_copy, str_substr, str_eq, str_hash,
-       str_contains, str_find, str_uppercase, str_lowercase, str_trim, str_startswith, str_endswith
+       str_contains, str_find, str_uppercase, str_lowercase, str_trim, str_startswith, str_endswith,
+       digit_to_str, int_to_string
 
 """
     str_char(s::String, i::Int)::Int32
@@ -442,4 +443,91 @@ str_trim("\\t\\nhello\\n")  # Returns "hello"
     # Extract substring
     new_len = end_pos - start_pos + Int32(1)
     return str_substr(s, start_pos, new_len)
+end
+
+# =============================================================================
+# WASM-054: Integer to String Conversion
+# =============================================================================
+
+"""
+    digit_to_str(d::Int32)::String
+
+Convert a single digit (0-9) to its string representation.
+This is a helper function for int_to_string.
+
+Works in both Julia and compiles to WASM.
+
+# Example
+```julia
+digit_to_str(Int32(5))  # Returns "5"
+digit_to_str(Int32(0))  # Returns "0"
+```
+"""
+@noinline function digit_to_str(d::Int32)::String
+    if d == Int32(0)
+        return "0"
+    elseif d == Int32(1)
+        return "1"
+    elseif d == Int32(2)
+        return "2"
+    elseif d == Int32(3)
+        return "3"
+    elseif d == Int32(4)
+        return "4"
+    elseif d == Int32(5)
+        return "5"
+    elseif d == Int32(6)
+        return "6"
+    elseif d == Int32(7)
+        return "7"
+    elseif d == Int32(8)
+        return "8"
+    else  # d == 9
+        return "9"
+    end
+end
+
+"""
+    int_to_string(n::Int32)::String
+
+Convert an Int32 to its string representation.
+Handles positive, negative, and zero values.
+
+This function is designed to work in both Julia and compile to WASM.
+It uses string concatenation which compiles to WASM operations.
+
+# Example
+```julia
+int_to_string(Int32(12345))  # Returns "12345"
+int_to_string(Int32(-42))    # Returns "-42"
+int_to_string(Int32(0))      # Returns "0"
+```
+"""
+@noinline function int_to_string(n::Int32)::String
+    # Handle zero special case
+    if n == Int32(0)
+        return "0"
+    end
+
+    # Handle negative numbers
+    negative = n < Int32(0)
+    if negative
+        n = -n
+    end
+
+    # Build string from least significant digit
+    # We prepend each digit to build the string
+    result = ""
+    while n > Int32(0)
+        digit = n % Int32(10)
+        result = digit_to_str(digit) * result  # prepend digit
+        n = n ÷ Int32(10)
+    end
+
+    # Add sign if negative
+    if negative
+        result = "-" * result
+    end
+
+    return result
 end

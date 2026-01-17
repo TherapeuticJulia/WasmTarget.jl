@@ -527,68 +527,8 @@ end
     return "<unknown>"
 end
 
-"""Convert Int32 to string.
-
-Note: This uses Julia's built-in string() for the Julia fallback.
-In WASM, str_new/str_setchar! work correctly, but in Julia they are no-ops
-since Julia strings are immutable. Using string() provides correct behavior
-for both Julia testing and WASM execution.
-"""
-@noinline function int_to_string(n::Int32)::String
-    # Use Julia's string conversion - works in both Julia and WASM contexts
-    # In Julia, this is the actual implementation
-    # In WASM, the compiler may optimize or use different implementation
-    return Base.inferencebarrier(string(n))::String
-end
-
-"""Convert Int32 to string - WASM-native version (for future use).
-This is the version that would work in pure WASM using str_new/str_setchar!.
-Currently unused because str_setchar! is a no-op in Julia.
-"""
-@noinline function _int_to_string_wasm(n::Int32)::String
-    if n == Int32(0)
-        return "0"
-    end
-
-    negative = n < Int32(0)
-    if negative
-        n = -n
-    end
-
-    # Build digits in reverse
-    digits = arr_new(Int32, Int32(12))  # Max 10 digits + sign + null
-    count = Int32(0)
-
-    while n > Int32(0)
-        count = count + Int32(1)
-        arr_set!(digits, count, n % Int32(10))
-        n = n ÷ Int32(10)
-    end
-
-    # Build result string
-    result_len = count
-    if negative
-        result_len = result_len + Int32(1)
-    end
-    result = str_new(result_len)
-
-    pos = Int32(1)
-    if negative
-        str_setchar!(result, pos, Int32(45))  # '-'
-        pos = pos + Int32(1)
-    end
-
-    # Copy digits in reverse order
-    i = count
-    while i >= Int32(1)
-        d = arr_get(digits, i)
-        str_setchar!(result, pos, d + Int32(48))  # '0' = 48
-        pos = pos + Int32(1)
-        i = i - Int32(1)
-    end
-
-    return result
-end
+# Note: int_to_string and digit_to_str are now defined in Runtime/StringOps.jl
+# They are exported and available as WasmTarget.int_to_string
 
 """Convert Float32 to string (simplified)."""
 @noinline function float_to_string(f::Float32)::String

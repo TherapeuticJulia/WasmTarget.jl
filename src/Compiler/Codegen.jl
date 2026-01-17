@@ -2997,6 +2997,18 @@ function julia_to_wasm_type_concrete(T, ctx::CompilationContext)::WasmValType
             type_idx = get_array_type!(ctx.mod, ctx.type_registry, elem_type)
             return ConcreteRef(type_idx, true)
         end
+    elseif T isa DataType && T.name.name === :GenericMemory
+        # GenericMemory is the backing storage for Vector (Julia 1.11+)
+        # Parameters are: (atomicity, element_type, addrspace)
+        # In WasmGC, it's the same as the array
+        elem_type = T.parameters[2]  # Element type is second parameter
+        if haskey(ctx.type_registry.arrays, elem_type)
+            type_idx = ctx.type_registry.arrays[elem_type]
+            return ConcreteRef(type_idx, true)
+        else
+            type_idx = get_array_type!(ctx.mod, ctx.type_registry, elem_type)
+            return ConcreteRef(type_idx, true)
+        end
     elseif T === Int128 || T === UInt128
         # 128-bit integers are represented as WasmGC structs with two i64 fields
         if haskey(ctx.type_registry.structs, T)
@@ -7362,6 +7374,9 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
             # This is a no-op that produces a Bool (we push false since we're not doing checks)
             push!(stmt_bytes, Opcode.I32_CONST)
             push!(stmt_bytes, 0x00)  # false = no bounds checking
+        elseif stmt.head === :foreigncall
+            # Handle foreign calls - specifically for Vector allocation
+            stmt_bytes = compile_foreigncall(stmt, idx, ctx)
         elseif stmt.head === :leave
             # Exception handling: Leave try block
             # For now, skip - full implementation requires try_table control flow
@@ -7412,6 +7427,18 @@ function compile_new(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt
         error("Unknown struct type reference: $struct_type_ref")
     end
 
+    # Special case: Vector{T} construction
+    # In WasmGC, Vector IS just the underlying WasmGC array
+    # The %new(Vector{T}, memref, size_tuple) just needs to return the array
+    # that was created by the foreigncall :jl_alloc_genericmemory
+    if struct_type <: AbstractVector && length(field_values) >= 1
+        # field_values[1] is the MemoryRef (which is actually our array)
+        # field_values[2] is the size tuple (ignored in WasmGC, array already has length)
+        # Just compile the first value (the array reference) and return it
+        append!(bytes, compile_value(field_values[1], ctx))
+        return bytes
+    end
+
     # Get the registered struct info
     if !haskey(ctx.type_registry.structs, struct_type)
         # Register it now - use appropriate registration for closures vs regular structs
@@ -7434,6 +7461,98 @@ function compile_new(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt
     push!(bytes, Opcode.STRUCT_NEW)
     append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
 
+    return bytes
+end
+
+"""
+Compile a foreign call expression.
+Handles specific patterns like jl_alloc_genericmemory for Vector allocation.
+"""
+function compile_foreigncall(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt8}
+    bytes = UInt8[]
+
+    # foreigncall format: Expr(:foreigncall, name, return_type, arg_types, nreq, calling_conv, args...)
+    # For jl_alloc_genericmemory:
+    #   args[1] = :(:jl_alloc_genericmemory)
+    #   args[2] = return type (e.g., Ref{Memory{Int32}})
+    #   args[7] = element type (e.g., Memory{Int32})
+    #   args[8] = length
+
+    if length(expr.args) >= 1
+        name_arg = expr.args[1]
+        name = if name_arg isa QuoteNode
+            name_arg.value
+        elseif name_arg isa Symbol
+            name_arg
+        else
+            nothing
+        end
+
+        if name === :jl_alloc_genericmemory
+            # Extract element type from return type
+            # args[2] is like Ref{Memory{Int32}}
+            # args[7] is Memory{Int32}
+            ret_type = length(expr.args) >= 2 ? expr.args[2] : nothing
+
+            # Get the element type from Memory{T}
+            # Memory{T} is actually GenericMemory{:not_atomic, T, ...}
+            elem_type = Int32  # default
+            if length(expr.args) >= 7
+                mem_type = expr.args[7]
+                if mem_type isa DataType && mem_type.name.name === :GenericMemory && length(mem_type.parameters) >= 2
+                    # GenericMemory parameters: (atomicity, element_type, addrspace)
+                    elem_type = mem_type.parameters[2]
+                elseif mem_type isa DataType && mem_type.name.name === :Memory && length(mem_type.parameters) >= 1
+                    elem_type = mem_type.parameters[1]
+                elseif mem_type isa GlobalRef
+                    resolved = try getfield(mem_type.mod, mem_type.name) catch; nothing end
+                    if resolved isa DataType && resolved.name.name === :GenericMemory && length(resolved.parameters) >= 2
+                        elem_type = resolved.parameters[2]
+                    elseif resolved isa DataType && resolved.name.name === :Memory && length(resolved.parameters) >= 1
+                        elem_type = resolved.parameters[1]
+                    end
+                end
+            end
+
+            # Get the length argument (usually args[8])
+            len_arg = length(expr.args) >= 8 ? expr.args[8] : nothing
+
+            # Get or create array type for this element type
+            arr_type_idx = if elem_type <: AbstractVector || (elem_type isa DataType && isstructtype(elem_type))
+                # For struct element types, register the element struct first
+                if isconcretetype(elem_type) && isstructtype(elem_type) && !haskey(ctx.type_registry.structs, elem_type)
+                    register_struct_type!(ctx.mod, ctx.type_registry, elem_type)
+                end
+                get_array_type!(ctx.mod, ctx.type_registry, elem_type)
+            elseif elem_type === String
+                get_string_array_type!(ctx.mod, ctx.type_registry)
+            else
+                get_array_type!(ctx.mod, ctx.type_registry, elem_type)
+            end
+
+            # Compile length argument
+            if len_arg !== nothing
+                append!(bytes, compile_value(len_arg, ctx))
+                len_type = infer_value_type(len_arg, ctx)
+                if len_type === Int64 || len_type === Int
+                    push!(bytes, Opcode.I32_WRAP_I64)
+                end
+            else
+                # Default length of 0
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x00)
+            end
+
+            # array.new_default creates array filled with default value (0 for primitives, null for refs)
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.ARRAY_NEW_DEFAULT)
+            append!(bytes, encode_leb128_unsigned(arr_type_idx))
+
+            return bytes
+        end
+    end
+
+    # Unknown foreigncall - return empty bytes (will be skipped)
     return bytes
 end
 
@@ -8216,36 +8335,71 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         return bytes
     end
 
-    # Special case for memoryrefnew - create offset reference
-    # memoryrefnew(base_ref, index, boundscheck) -> MemoryRef at offset
-    # In WasmGC, this translates to keeping the array ref and converting index to i32
-    if is_func(func, :memoryrefnew) && length(args) >= 2
-        base_ref = args[1]
-        index = args[2]
+    # Special case for memoryrefset! - array element assignment
+    # memoryrefset!(ref, value, ordering, boundscheck) -> stores value in array
+    if is_func(func, :memoryrefset!) && length(args) >= 2
+        ref_arg = args[1]
+        value_arg = args[2]
+        ref_type = infer_value_type(ref_arg, ctx)
 
-        # Compile the base array reference
-        append!(bytes, compile_value(base_ref, ctx))
-
-        # Compile and convert index to i32 (Julia uses 1-based Int64, Wasm uses 0-based i32)
-        append!(bytes, compile_value(index, ctx))
-
-        # Check if index is already Int32
-        idx_type = infer_value_type(index, ctx)
-        if idx_type === Int64 || idx_type === Int
-            # Convert to i32 and subtract 1 for 0-based indexing
-            push!(bytes, Opcode.I32_WRAP_I64)  # i64 -> i32
-            push!(bytes, Opcode.I32_CONST)
-            push!(bytes, 0x01)  # 1
-            push!(bytes, Opcode.I32_SUB)  # index - 1 for 0-based
-        else
-            # Already i32, just subtract 1
-            push!(bytes, Opcode.I32_CONST)
-            push!(bytes, 0x01)  # 1
-            push!(bytes, Opcode.I32_SUB)  # index - 1 for 0-based
+        # Extract element type from MemoryRef{T}
+        elem_type = Int32  # default
+        if ref_type isa DataType && ref_type.name.name === :MemoryRef
+            elem_type = ref_type.parameters[1]
         end
 
-        # Now stack has [array_ref, i32_index] which is what memoryrefget needs
+        # Get or create array type for this element type
+        array_type_idx = get_array_type!(ctx.mod, ctx.type_registry, elem_type)
+
+        # Compile ref_arg which will leave [array_ref, i32_index] on stack
+        append!(bytes, compile_value(ref_arg, ctx))
+
+        # Compile the value to store
+        append!(bytes, compile_value(value_arg, ctx))
+
+        # array.set
+        push!(bytes, Opcode.GC_PREFIX)
+        push!(bytes, Opcode.ARRAY_SET)
+        append!(bytes, encode_leb128_unsigned(array_type_idx))
         return bytes
+    end
+
+    # Special case for memoryrefnew - handle both patterns:
+    # 1. memoryrefnew(memory) -> MemoryRef (for Vector allocation, just pass through)
+    # 2. memoryrefnew(base_ref, index, boundscheck) -> MemoryRef at offset
+    if is_func(func, :memoryrefnew)
+        if length(args) == 1
+            # Single arg: just wrapping a Memory - pass through the array reference
+            append!(bytes, compile_value(args[1], ctx))
+            return bytes
+        elseif length(args) >= 2
+            base_ref = args[1]
+            index = args[2]
+
+            # Compile the base array reference
+            append!(bytes, compile_value(base_ref, ctx))
+
+            # Compile and convert index to i32 (Julia uses 1-based Int64, Wasm uses 0-based i32)
+            append!(bytes, compile_value(index, ctx))
+
+            # Check if index is already Int32
+            idx_type = infer_value_type(index, ctx)
+            if idx_type === Int64 || idx_type === Int
+                # Convert to i32 and subtract 1 for 0-based indexing
+                push!(bytes, Opcode.I32_WRAP_I64)  # i64 -> i32
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)  # 1
+                push!(bytes, Opcode.I32_SUB)  # index - 1 for 0-based
+            else
+                # Already i32, just subtract 1
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)  # 1
+                push!(bytes, Opcode.I32_SUB)  # index - 1 for 0-based
+            end
+
+            # Now stack has [array_ref, i32_index] which is what memoryrefget needs
+            return bytes
+        end
     end
 
     # Special case for Core.tuple - tuple creation
@@ -8961,6 +9115,16 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         else  # UInt64
             push!(bytes, source_is_f32 ? Opcode.I64_TRUNC_F32_U : Opcode.I64_TRUNC_F64_U)
         end
+
+    elseif is_func(func, :fpext)  # Float precision extension (Float32 → Float64)
+        # fpext(TargetType, value) - extend Float32 to Float64
+        # The source is always Float32, target is Float64
+        push!(bytes, 0xBB)  # f64.promote_f32
+
+    elseif is_func(func, :fptrunc)  # Float precision truncation (Float64 → Float32)
+        # fptrunc(TargetType, value) - truncate Float64 to Float32
+        # The source is always Float64, target is Float32
+        push!(bytes, 0xB6)  # f32.demote_f64
 
     elseif is_func(func, :trunc_llvm)  # Truncate float towards zero (returns float)
         push!(bytes, arg_type === Float32 ? Opcode.F32_TRUNC : Opcode.F64_TRUNC)

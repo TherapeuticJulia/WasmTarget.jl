@@ -4287,10 +4287,12 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
         end
     end
 
-    # Identify inner conditional GotoIfNot statements (target within loop)
+    # Identify inner conditional GotoIfNot statements (target within loop body)
     # Only for REAL conditionals (not boundscheck always-jump patterns or dead code)
+    # IMPORTANT: Only scan from loop_header to back_edge_idx, NOT from line 1
+    # Pre-loop conditionals (early returns) are NOT inner conditionals
     inner_conditionals = Dict{Int, Int}()  # GotoIfNot line → merge point
-    for i in 1:back_edge_idx
+    for i in loop_header:back_edge_idx
         # Skip dead code and boundscheck jumps
         if i in dead_regions || haskey(boundscheck_jumps, i)
             continue
@@ -4336,6 +4338,189 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
         end
     end
 
+    # ============================================================
+    # PHASE 1: Generate PRE-LOOP code (lines 1 to loop_header - 1)
+    # This handles early return guards, pre-loop conditionals, etc.
+    # These must be generated BEFORE the block/loop structure.
+    # ============================================================
+    if loop_header > 1
+        # Track pre-loop block depth for nested conditionals
+        pre_loop_blocks = Dict{Int, Bool}()  # merge_point → is_open
+        pre_loop_depth = 0
+
+        for i in 1:(loop_header - 1)
+            # Skip dead code
+            if i in dead_regions
+                continue
+            end
+
+            # Check if we need to close a pre-loop block at this merge point
+            if haskey(pre_loop_blocks, i) && pre_loop_blocks[i]
+                # Handle pre-loop phi at merge point
+                if code[i] isa Core.PhiNode && haskey(ctx.phi_locals, i)
+                    phi_stmt = code[i]::Core.PhiNode
+                    for (edge_idx, edge) in enumerate(phi_stmt.edges)
+                        edge_stmt = get(code, edge, nothing)
+                        if edge_stmt !== nothing && !(edge_stmt isa Core.GotoIfNot)
+                            val = phi_stmt.values[edge_idx]
+                            append!(bytes, compile_value(val, ctx))
+                            local_idx = ctx.phi_locals[i]
+                            push!(bytes, Opcode.LOCAL_SET)
+                            append!(bytes, encode_leb128_unsigned(local_idx))
+                            break
+                        end
+                    end
+                end
+                push!(bytes, Opcode.END)
+                pre_loop_blocks[i] = false
+                pre_loop_depth -= 1
+            end
+
+            stmt = code[i]
+
+            if stmt isa Core.PhiNode
+                # Pre-loop phi nodes - they should have been initialized
+                # by their incoming edges. Just skip.
+                continue
+            elseif stmt isa Core.GotoIfNot
+                target = stmt.dest
+                # Skip boundscheck always-jump patterns
+                if haskey(boundscheck_jumps, i)
+                    continue
+                elseif target >= loop_header
+                    # This conditional jumps to or past the loop header
+                    # It's a pre-loop conditional with fall-through to loop
+                    # We need to handle this with a block for the then-branch
+
+                    # Check if there's a pre-loop phi at the target
+                    if target < loop_header && code[target] isa Core.PhiNode && haskey(ctx.phi_locals, target)
+                        phi_stmt = code[target]::Core.PhiNode
+                        for (edge_idx, edge) in enumerate(phi_stmt.edges)
+                            if edge == i
+                                val = phi_stmt.values[edge_idx]
+                                append!(bytes, compile_value(val, ctx))
+                                local_idx = ctx.phi_locals[target]
+                                push!(bytes, Opcode.LOCAL_SET)
+                                append!(bytes, encode_leb128_unsigned(local_idx))
+                                break
+                            end
+                        end
+                    end
+
+                    # Open block for the then-branch (fall-through path)
+                    push!(bytes, Opcode.BLOCK)
+                    push!(bytes, 0x40)
+                    pre_loop_blocks[target] = true
+                    pre_loop_depth += 1
+
+                    # Branch to target if condition is FALSE (skip then-branch)
+                    append!(bytes, compile_value(stmt.cond, ctx))
+                    push!(bytes, Opcode.I32_EQZ)
+                    push!(bytes, Opcode.BR_IF)
+                    push!(bytes, 0x00)
+                elseif target > i && target < loop_header
+                    # Inner pre-loop conditional (both branches before loop)
+                    # Pattern: GotoIfNot jumps to target, fall-through is then-branch
+                    #
+                    # CRITICAL: Compile condition BEFORE the block, because:
+                    # 1. The condition value may be on the stack from previous statement
+                    # 2. BLOCK starts with empty operand stack
+                    # 3. We need the condition INSIDE the block for br_if
+                    #
+                    # Solution: Use if/else structure instead of block+br_if
+
+                    # Handle pre-loop phi at target (set else-branch value)
+                    if code[target] isa Core.PhiNode && haskey(ctx.phi_locals, target)
+                        phi_stmt = code[target]::Core.PhiNode
+                        for (edge_idx, edge) in enumerate(phi_stmt.edges)
+                            if edge == i
+                                val = phi_stmt.values[edge_idx]
+                                append!(bytes, compile_value(val, ctx))
+                                local_idx = ctx.phi_locals[target]
+                                push!(bytes, Opcode.LOCAL_SET)
+                                append!(bytes, encode_leb128_unsigned(local_idx))
+                                break
+                            end
+                        end
+                    end
+
+                    # Compile condition BEFORE any control structure
+                    append!(bytes, compile_value(stmt.cond, ctx))
+
+                    # Use if-then structure: if condition is TRUE, execute then-branch
+                    push!(bytes, Opcode.IF)
+                    push!(bytes, 0x40)  # void block type
+                    pre_loop_blocks[target] = true
+                    pre_loop_depth += 1
+                    # The then-branch code follows (lines i+1 to target-1)
+                    # When we reach target, we'll emit END
+                end
+            elseif stmt isa Core.GotoNode
+                # Unconditional jump in pre-loop code
+                if stmt.label >= loop_header
+                    # Jump to loop - becomes fall-through (we're about to enter loop)
+                    # Handle phi at target if needed
+                    if stmt.label == loop_header
+                        for (j, phi_stmt) in enumerate(code)
+                            if j >= loop_header && phi_stmt isa Core.PhiNode && haskey(ctx.phi_locals, j)
+                                for (edge_idx, edge) in enumerate(phi_stmt.edges)
+                                    if edge == i
+                                        val = phi_stmt.values[edge_idx]
+                                        append!(bytes, compile_value(val, ctx))
+                                        local_idx = ctx.phi_locals[j]
+                                        push!(bytes, Opcode.LOCAL_SET)
+                                        append!(bytes, encode_leb128_unsigned(local_idx))
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    # No actual jump needed - will fall through to loop
+                elseif haskey(pre_loop_blocks, stmt.label) && pre_loop_blocks[stmt.label]
+                    # Jump to a pre-loop merge point
+                    if code[stmt.label] isa Core.PhiNode && haskey(ctx.phi_locals, stmt.label)
+                        phi_stmt = code[stmt.label]::Core.PhiNode
+                        for (edge_idx, edge) in enumerate(phi_stmt.edges)
+                            if edge == i
+                                val = phi_stmt.values[edge_idx]
+                                append!(bytes, compile_value(val, ctx))
+                                local_idx = ctx.phi_locals[stmt.label]
+                                push!(bytes, Opcode.LOCAL_SET)
+                                append!(bytes, encode_leb128_unsigned(local_idx))
+                                break
+                            end
+                        end
+                    end
+                    push!(bytes, Opcode.BR)
+                    push!(bytes, 0x00)
+                end
+            elseif stmt isa Core.ReturnNode
+                # Early return in pre-loop code
+                if isdefined(stmt, :val)
+                    append!(bytes, compile_value(stmt.val, ctx))
+                end
+                push!(bytes, Opcode.RETURN)
+            elseif stmt === nothing
+                # Skip nothing statements
+            else
+                # Regular statement
+                append!(bytes, compile_statement(stmt, i, ctx))
+            end
+        end
+
+        # Close any remaining pre-loop blocks
+        for (merge_point, is_open) in pre_loop_blocks
+            if is_open
+                push!(bytes, Opcode.END)
+            end
+        end
+    end
+
+    # ============================================================
+    # PHASE 2: Generate LOOP code (lines loop_header to back_edge_idx)
+    # ============================================================
+
     # block $exit (for breaking out of loop)
     push!(bytes, Opcode.BLOCK)
     push!(bytes, 0x40)  # void block type
@@ -4349,8 +4534,8 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
     open_blocks = Dict{Int, Bool}()
     current_depth = 0  # 0 = inside loop, additional depth for inner blocks
 
-    # Generate loop body (only statements within loop bounds)
-    i = 1
+    # Generate loop body (statements from loop_header to back_edge_idx)
+    i = loop_header
     while i <= back_edge_idx
         # Check if we need to close any blocks at this merge point
         if haskey(open_blocks, i) && open_blocks[i]
@@ -6931,10 +7116,11 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                         elseif !(stmt isa Core.GotoIfNot)
                             append!(inner_bytes, compile_statement(stmt, i, ctx))
 
-                            # Drop unused values
+                            # Drop unused values (but NOT for Union{} which never returns)
                             if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
                                 stmt_type = get(ctx.ssa_types, i, Any)
-                                if stmt_type !== Nothing
+                                # Union{} means the call never returns (throws), so no value to drop
+                                if stmt_type !== Nothing && stmt_type !== Union{}
                                     is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
                                     if !is_nothing_union
                                         if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
@@ -6955,14 +7141,18 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                         if stmt isa Core.ReturnNode
                             if isdefined(stmt, :val)
                                 append!(inner_bytes, compile_value(stmt.val, ctx))
+                            else
+                                # ReturnNode without val is `unreachable` - emit WASM unreachable
+                                push!(inner_bytes, Opcode.UNREACHABLE)
                             end
                         elseif !(stmt isa Core.GotoIfNot)
                             append!(inner_bytes, compile_statement(stmt, i, ctx))
 
-                            # Drop unused values
+                            # Drop unused values (but NOT for Union{} which never returns)
                             if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
                                 stmt_type = get(ctx.ssa_types, i, Any)
-                                if stmt_type !== Nothing
+                                # Union{} means the call never returns (throws), so no value to drop
+                                if stmt_type !== Nothing && stmt_type !== Union{}
                                     is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
                                     if !is_nothing_union
                                         if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
@@ -7337,12 +7527,30 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
         # Push condition for normal pattern
         append!(inner_bytes, compile_value(goto_if_not.cond, ctx))
 
+        # Check if both branches terminate (then: return, else: unreachable or return)
+        # If so, use void result type for IF block
+        else_terminates = false
+        for i in goto_if_not.dest:length(code)
+            stmt = code[i]
+            if stmt isa Core.ReturnNode
+                else_terminates = true
+                break
+            elseif stmt isa Core.GotoIfNot || stmt isa Core.GotoNode
+                break  # Hit another control flow
+            end
+        end
+
         # if block
         push!(inner_bytes, Opcode.IF)
-        append!(inner_bytes, encode_block_type(result_type))
+        if found_forward_goto !== nothing && else_terminates
+            # Both branches terminate - use void result type
+            push!(inner_bytes, 0x40)  # void block type
+        else
+            append!(inner_bytes, encode_block_type(result_type))
+        end
 
         if found_forward_goto !== nothing
-            # The then-branch is a forward goto to a merge point (|| pattern)
+            # The then-branch is a forward goto to a merge point
             # Generate the code at the merge point target
             for i in found_forward_goto:length(code)
                 stmt = code[i]
@@ -7350,22 +7558,28 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                     if isdefined(stmt, :val)
                         append!(inner_bytes, compile_value(stmt.val, ctx))
                     end
+                    # Emit RETURN since we're in a void IF block
+                    if else_terminates
+                        push!(inner_bytes, Opcode.RETURN)
+                    end
                     break
                 elseif stmt === nothing
                     # Skip nothing statements
                 elseif !(stmt isa Core.GotoIfNot) && !(stmt isa Core.GotoNode)
                     append!(inner_bytes, compile_statement(stmt, i, ctx))
 
-                    # Drop unused values
-                    if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
-                        stmt_type = get(ctx.ssa_types, i, Any)
-                        if stmt_type !== Nothing
-                            is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
-                            if !is_nothing_union
-                                if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
-                                    use_count = get(ssa_use_count, i, 0)
-                                    if use_count == 0
-                                        push!(inner_bytes, Opcode.DROP)
+                    # Drop unused values (only if not going to return)
+                    if !else_terminates
+                        if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                            stmt_type = get(ctx.ssa_types, i, Any)
+                            if stmt_type !== Nothing
+                                is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                                if !is_nothing_union
+                                    if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                                        use_count = get(ssa_use_count, i, 0)
+                                        if use_count == 0
+                                            push!(inner_bytes, Opcode.DROP)
+                                        end
                                     end
                                 end
                             end
@@ -7484,7 +7698,30 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
     end
 
     append!(bytes, gen_conditional(1))
-    push!(bytes, Opcode.RETURN)
+
+    # Check if all code paths terminate inside the conditionals
+    # This is the case when:
+    # 1. All blocks that are return blocks (have ReturnNode terminator)
+    # 2. The function uses void IF blocks because both branches terminate
+    #
+    # A simpler check: if there are only return blocks (no fall-through needed),
+    # then the code after gen_conditional is unreachable.
+    #
+    # Count actual return blocks vs total blocks
+    return_blocks = count(b -> b.terminator isa Core.ReturnNode, blocks)
+    total_blocks = length(blocks)
+
+    # If there are multiple return blocks (at least 2), it means different branches return.
+    # In this case, the code after the IF is unreachable.
+    # We emit UNREACHABLE to mark this as dead code (WASM still validates it).
+    # For single-return-block functions (simple if-else with one return at end),
+    # we need the outer RETURN.
+    if return_blocks >= 2
+        # Multiple return blocks - branches return inside, code after IF is unreachable
+        push!(bytes, Opcode.UNREACHABLE)
+    else
+        push!(bytes, Opcode.RETURN)
+    end
 
     return bytes
 end

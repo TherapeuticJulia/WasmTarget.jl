@@ -4993,6 +4993,30 @@ function generate_branched_loops(ctx::CompilationContext, first_header::Int, fir
     bytes = UInt8[]
     code = ctx.code_info.code
 
+    # Identify dead code regions (boundscheck patterns)
+    # Since we emit i32.const 0 for ALL boundscheck expressions,
+    # the GotoIfNot following a boundscheck ALWAYS jumps to the target.
+    # Pattern: boundscheck at line N, GotoIfNot %N at line N+1
+    # Dead code: lines from N+2 to target-1 (the fall-through path)
+    # Note: We DON'T skip the boundscheck or GotoIfNot - we compile them normally
+    # so the control flow (BR) is properly emitted.
+    dead_regions = Set{Int}()
+    for i in 1:length(code)
+        stmt = code[i]
+        if stmt isa Expr && stmt.head === :boundscheck && length(stmt.args) == 1
+            if i + 1 <= length(code) && code[i + 1] isa Core.GotoIfNot
+                goto_stmt = code[i + 1]
+                if goto_stmt.cond isa Core.SSAValue && goto_stmt.cond.id == i
+                    # Mark lines between the GotoIfNot and its target as dead
+                    # (the fall-through path that's never taken)
+                    for j in (i + 2):(goto_stmt.dest - 1)
+                        push!(dead_regions, j)
+                    end
+                end
+            end
+        end
+    end
+
     # For now, just use simple sequential code generation with explicit returns
     # Both branches end with return, so we can just compile sequentially
 
@@ -5002,6 +5026,11 @@ function generate_branched_loops(ctx::CompilationContext, first_header::Int, fir
 
     # First, compile statements before the conditional
     for i in 1:(cond_idx - 1)
+        # Skip dead code (boundscheck patterns)
+        if i in dead_regions
+            continue
+        end
+
         stmt = code[i]
         if stmt === nothing
             continue
@@ -5026,18 +5055,35 @@ function generate_branched_loops(ctx::CompilationContext, first_header::Int, fir
     # THEN branch: first loop branch (lines cond_idx+1 to second_branch_start-1)
     # This includes the first loop
     for i in (cond_idx + 1):(second_branch_start - 1)
+        # Skip dead code (boundscheck patterns)
+        if i in dead_regions
+            continue
+        end
+
         stmt = code[i]
         if stmt === nothing
             continue
         elseif stmt isa Core.ReturnNode
             if isdefined(stmt, :val)
                 append!(bytes, compile_value(stmt.val, ctx))
+                push!(bytes, Opcode.RETURN)
+            else
+                # ReturnNode without val is `unreachable` - should be skipped if in dead_regions
+                # but if we reach here, emit WASM unreachable
+                push!(bytes, Opcode.UNREACHABLE)
             end
-            push!(bytes, Opcode.RETURN)
         elseif stmt isa Core.GotoIfNot
-            # Inner conditional - compile normally
+            # Inner conditional - use IF to properly consume the condition
+            # GotoIfNot: if NOT condition, jump to target
+            # With IF: if condition is TRUE, execute then-branch (do nothing)
+            #          if condition is FALSE, skip (which matches GotoIfNot semantics)
+            # Since the dead code is already skipped via dead_regions,
+            # we just need to consume the condition value
             append!(bytes, compile_value(stmt.cond, ctx))
-            # TODO: Handle inner if/else
+            push!(bytes, Opcode.IF)
+            push!(bytes, 0x40)  # void
+            push!(bytes, Opcode.END)  # Empty then-branch
+            # Fall through to continue (else branch is the continuation)
         elseif stmt isa Core.GotoNode
             # Skip goto - control flow handled
             if stmt.label == first_header
@@ -5072,6 +5118,11 @@ function generate_branched_loops(ctx::CompilationContext, first_header::Int, fir
     push!(bytes, Opcode.ELSE)
 
     for i in second_branch_start:length(code)
+        # Skip dead code (boundscheck patterns)
+        if i in dead_regions
+            continue
+        end
+
         stmt = code[i]
         if stmt === nothing
             continue
@@ -5081,9 +5132,11 @@ function generate_branched_loops(ctx::CompilationContext, first_header::Int, fir
             end
             push!(bytes, Opcode.RETURN)
         elseif stmt isa Core.GotoIfNot
-            # Inner conditional
+            # Inner conditional - use IF to consume condition
             append!(bytes, compile_value(stmt.cond, ctx))
-            # TODO: Handle inner if/else
+            push!(bytes, Opcode.IF)
+            push!(bytes, 0x40)  # void
+            push!(bytes, Opcode.END)  # Empty then-branch
         elseif stmt isa Core.GotoNode
             # Skip goto
             continue
@@ -5160,18 +5213,30 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
 
     # Check for "branch past first loop" pattern (e.g., float_to_string)
     # This is when a conditional BEFORE the loop jumps PAST the loop to an alternate code path
+    # that also contains its own loop (both branches have loops and end with return)
     branch_past_target = nothing
     branch_past_cond_idx = nothing
     for i in 1:(first_header - 1)
         stmt = code[i]
         if stmt isa Core.GotoIfNot && stmt.dest > back_edge_idx
-            branch_past_target = stmt.dest
-            branch_past_cond_idx = i
-            break
+            # Check if the alternate path actually has a SECOND LOOP
+            # (i.e., there's a backward jump in the alternate path)
+            has_second_loop = false
+            for j in stmt.dest:length(code)
+                if code[j] isa Core.GotoNode && code[j].label < j && code[j].label >= stmt.dest
+                    has_second_loop = true
+                    break
+                end
+            end
+            if has_second_loop
+                branch_past_target = stmt.dest
+                branch_past_cond_idx = i
+                break
+            end
         end
     end
 
-    # If we have a branch-past-loop pattern, use a special handler
+    # If we have a branch-past-loop pattern (both branches have loops), use a special handler
     if branch_past_target !== nothing
         return generate_branched_loops(ctx, first_header, back_edge_idx,
                                        branch_past_cond_idx, branch_past_target, ssa_use_count)
@@ -5180,22 +5245,26 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
     # Original single-loop code follows
     loop_header = first_header
 
-    # Identify dead code regions (boundscheck false patterns)
-    # Pattern: boundscheck(false) at line N, GotoIfNot %N at line N+1
-    # The boundscheck, GotoIfNot, and code from N+2 to target-1 are all dead
+    # Identify dead code regions (boundscheck patterns)
+    # Since we emit i32.const 0 for ALL boundscheck expressions (both true and false),
+    # the GotoIfNot following a boundscheck ALWAYS jumps to the target.
+    # Pattern: boundscheck(true/false) at line N, GotoIfNot %N at line N+1
+    # With boundscheck=0: GotoIfNot "if NOT 0" = "if TRUE" = always jump
+    # Dead code: lines from N+2 to target-1 (the fall-through path)
     dead_regions = Set{Int}()
     boundscheck_jumps = Dict{Int, Int}()  # GotoIfNot line → target (for always-jump)
     for i in 1:length(code)
         stmt = code[i]
-        if stmt isa Expr && stmt.head === :boundscheck && length(stmt.args) == 1 && stmt.args[1] === false
+        # Handle BOTH boundscheck(true) and boundscheck(false) - we emit 0 for both
+        if stmt isa Expr && stmt.head === :boundscheck && length(stmt.args) == 1
             # Check if next line is GotoIfNot using this boundscheck
             if i + 1 <= length(code) && code[i + 1] isa Core.GotoIfNot
                 goto_stmt = code[i + 1]
                 if goto_stmt.cond isa Core.SSAValue && goto_stmt.cond.id == i
-                    # This GotoIfNot always jumps (boundscheck is always false)
+                    # This GotoIfNot always jumps (we emit 0 for boundscheck)
                     boundscheck_jumps[i + 1] = goto_stmt.dest
                     # Mark the boundscheck itself and lines from i+2 to target-1 as dead
-                    push!(dead_regions, i)  # boundscheck(false) - no need to emit
+                    push!(dead_regions, i)  # boundscheck - no need to emit (it's always 0)
                     for j in (i + 2):(goto_stmt.dest - 1)
                         push!(dead_regions, j)
                     end
@@ -5229,6 +5298,11 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
     # This handles early return guards, pre-loop conditionals, etc.
     # These must be generated BEFORE the block/loop structure.
     # ============================================================
+
+    # Track if we open an IF for a pre-loop conditional that skips past the loop
+    # This IF will be closed AFTER the loop ends
+    post_loop_skip_phi_target = nothing  # phi target line if we have such a pattern
+
     if loop_header > 1
         # Track pre-loop blocks and their types:
         # :if_end - simple if-then, emit END at this line
@@ -5336,8 +5410,38 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
                 # Skip boundscheck always-jump patterns
                 if haskey(boundscheck_jumps, i)
                     continue
+                elseif target > back_edge_idx
+                    # This conditional jumps PAST the loop (skip if-body AND loop)
+                    # We need to use IF/ELSE: if condition true, execute if-body+loop
+                    #                         if condition false, skip to post-loop
+
+                    # Check for phi at target (post-loop phi)
+                    # We need to set the phi local BEFORE the IF
+                    if code[target] isa Core.PhiNode && haskey(ctx.phi_locals, target)
+                        phi_stmt = code[target]::Core.PhiNode
+                        for (edge_idx, edge) in enumerate(phi_stmt.edges)
+                            if edge == i
+                                val = phi_stmt.values[edge_idx]
+                                append!(bytes, compile_value(val, ctx))
+                                local_idx = ctx.phi_locals[target]
+                                push!(bytes, Opcode.LOCAL_SET)
+                                append!(bytes, encode_leb128_unsigned(local_idx))
+                                break
+                            end
+                        end
+                    end
+
+                    # Use IF structure: if condition is TRUE, fall through to if-body
+                    # The ELSE branch (implicit) skips to post-loop
+                    append!(bytes, compile_value(stmt.cond, ctx))
+                    push!(bytes, Opcode.IF)
+                    push!(bytes, 0x40)  # void block type
+                    # This IF will be closed after the loop completes
+                    # Store the target for later (we'll close this IF after loop ends)
+                    post_loop_skip_phi_target = target  # Track phi target for post-loop skip
+                    pre_loop_depth += 1
                 elseif target >= loop_header
-                    # This conditional jumps to or past the loop header
+                    # This conditional jumps to or near the loop header
                     # It's a pre-loop conditional with fall-through to loop
                     # We need to handle this with a block for the then-branch
 
@@ -5767,6 +5871,30 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
 
     # End block
     push!(bytes, Opcode.END)
+
+    # Close any IF block for pre-loop conditional that skips past the loop
+    # This was opened by `target > back_edge_idx` case in pre-loop handling
+    if post_loop_skip_phi_target !== nothing
+        # Before closing the IF, we need to set the phi value for the then-branch (loop completed)
+        if code[post_loop_skip_phi_target] isa Core.PhiNode && haskey(ctx.phi_locals, post_loop_skip_phi_target)
+            phi_stmt = code[post_loop_skip_phi_target]::Core.PhiNode
+            # Find the edge that comes from inside/after the loop (not the pre-loop skip)
+            # This is the edge that leads to here (end of loop, before post-loop code)
+            for (edge_idx, edge) in enumerate(phi_stmt.edges)
+                # The loop exit edge is the one from the loop exit condition (line 27 in our IR)
+                # or any edge that's > the loop header and <= back_edge_idx
+                if edge >= loop_header && edge <= back_edge_idx
+                    val = phi_stmt.values[edge_idx]
+                    append!(bytes, compile_value(val, ctx))
+                    local_idx = ctx.phi_locals[post_loop_skip_phi_target]
+                    push!(bytes, Opcode.LOCAL_SET)
+                    append!(bytes, encode_leb128_unsigned(local_idx))
+                    break
+                end
+            end
+        end
+        push!(bytes, Opcode.END)  # Close the IF block
+    end
 
     # Generate code AFTER the loop (statements that run after loop exits)
     # This code may contain conditionals (GotoIfNot) that need proper handling

@@ -53,6 +53,7 @@ struct FunctionInfo
     func_ref::Any           # Original Julia function
     arg_types::Tuple        # Argument types for dispatch
     wasm_idx::UInt32        # Index in the Wasm module
+    return_type::Type       # Return type (Nothing means void)
 end
 
 """
@@ -68,8 +69,8 @@ FunctionRegistry() = FunctionRegistry(Dict{String, FunctionInfo}(), Dict{Any, Ve
 """
 Register a function in the registry.
 """
-function register_function!(registry::FunctionRegistry, name::String, func_ref, arg_types::Tuple, wasm_idx::UInt32)
-    info = FunctionInfo(name, func_ref, arg_types, wasm_idx)
+function register_function!(registry::FunctionRegistry, name::String, func_ref, arg_types::Tuple, wasm_idx::UInt32, return_type::Type=Any)
+    info = FunctionInfo(name, func_ref, arg_types, wasm_idx, return_type)
     registry.functions[name] = info
 
     # Also index by function reference for dispatch
@@ -318,6 +319,16 @@ function get_concrete_wasm_type(T::Type, mod::WasmModule, registry::TypeRegistry
         else
             info = register_int128_type!(mod, registry, T)
             return ConcreteRef(info.wasm_type_idx, true)
+        end
+    elseif T isa Union
+        # Handle Union types - use the inner type for Union{Nothing, T}
+        inner_type = get_nullable_inner_type(T)
+        if inner_type !== nothing
+            # Union{Nothing, T} -> concrete type of T (nullable reference)
+            return get_concrete_wasm_type(inner_type, mod, registry)
+        else
+            # Multi-variant union - fall back to generic type
+            return julia_to_wasm_type(T)
         end
     else
         return julia_to_wasm_type(T)
@@ -652,7 +663,7 @@ Returns true if the function should be generated as an intrinsic instead of comp
 """
 function is_intrinsic_function(f::Function)::Bool
     fname = nameof(f)
-    return fname in [:str_char, :str_len, :str_eq, :str_new, :str_setchar!, :str_concat]
+    return fname in [:str_char, :str_len, :str_eq, :str_new, :str_setchar!, :str_concat, :str_substr]
 end
 
 """
@@ -741,6 +752,24 @@ function generate_intrinsic_body(f::Function, arg_types::Tuple, mod::WasmModule,
         push!(bytes, Opcode.GC_PREFIX)
         push!(bytes, Opcode.ARRAY_SET)
         append!(bytes, encode_leb128_unsigned(str_type_idx))
+        push!(bytes, Opcode.END)
+        return bytes
+
+    elseif fname === :str_substr
+        # str_substr(s::String, start::Int32, len::Int32)::String
+        # Extracts substring by creating new string and copying characters
+        # local 0 = source string (array ref)
+        # local 1 = start (1-based Int32)
+        # local 2 = len (Int32)
+
+        # NOTE: The inline version at call sites properly implements this using
+        # array.new + array.copy with scratch locals from the caller's context.
+        # This intrinsic body is only used when str_substr is called as a
+        # standalone function. We return a stub that returns the source string.
+        # The proper implementation requires extra locals which intrinsics don't support.
+
+        push!(bytes, Opcode.LOCAL_GET)
+        push!(bytes, 0x00)  # return source string as placeholder
         push!(bytes, Opcode.END)
         return bytes
     end
@@ -911,9 +940,9 @@ function compile_module(functions::Vector)::WasmModule
     # Calculate function indices (accounting for imports)
     # Functions are added in order, so index = n_imports + position - 1
     n_imports = length(mod.imports)
-    for (i, (f, arg_types, name, _, _, _, _)) in enumerate(function_data)
+    for (i, (f, arg_types, name, _, return_type, _, _)) in enumerate(function_data)
         func_idx = UInt32(n_imports + i - 1)
-        register_function!(func_registry, name, f, arg_types, func_idx)
+        register_function!(func_registry, name, f, arg_types, func_idx, return_type)
     end
 
     # Second pass: compile function bodies
@@ -1715,6 +1744,51 @@ function get_nullable_inner_type(T::Union)::Union{Type, Nothing}
         return non_nothing[1]
     end
     return nothing
+end
+
+"""
+Check if a type is a reference type (struct or Union containing struct).
+Used to determine if ref.eq should be used for comparison.
+"""
+function is_ref_type_or_union(T::Type)::Bool
+    # Direct struct types (excluding primitive types)
+    if T isa DataType && isstructtype(T) && !isprimitivetype(T)
+        return true
+    end
+    # Union types - check if any component is a ref type
+    if T isa Union
+        types = Base.uniontypes(T)
+        for t in types
+            if t !== Nothing && is_ref_type_or_union(t)
+                return true
+            end
+        end
+    end
+    # Arrays/Vectors are refs
+    if T <: AbstractArray
+        return true
+    end
+    return false
+end
+
+"""
+Check if a value represents `nothing` (literal or GlobalRef to nothing).
+"""
+function is_nothing_value(val, ctx)::Bool
+    # Literal nothing
+    if val === nothing
+        return true
+    end
+    # GlobalRef to nothing (e.g., WasmTarget.nothing or Core.nothing)
+    if val isa GlobalRef && val.name === :nothing
+        return true
+    end
+    # SSA that has Nothing type
+    if val isa Core.SSAValue
+        ssa_type = get(ctx.ssa_types, val.id, Any)
+        return ssa_type === Nothing
+    end
+    return false
 end
 
 """
@@ -3770,6 +3844,25 @@ function allocate_ssa_locals!(ctx::CompilationContext)
         end
     end
 
+    # Find SSA values referenced by PiNodes that have control flow between definition and use
+    # PiNodes narrow types after branch conditions, but the original value must be preserved
+    for (i, stmt) in enumerate(code)
+        if stmt isa Core.PiNode && stmt.val isa Core.SSAValue
+            val_id = stmt.val.id
+            # Check if there's control flow between the definition and this PiNode
+            has_control_flow = false
+            for j in (val_id + 1):(i - 1)
+                if code[j] isa Core.GotoNode || code[j] isa Core.GotoIfNot
+                    has_control_flow = true
+                    break
+                end
+            end
+            if has_control_flow
+                push!(needs_local_set, val_id)
+            end
+        end
+    end
+
     # Find SSAs that produce values and are followed by control flow
     # In Wasm, stack values don't persist across block boundaries
     # So any value produced before a GotoNode/GotoIfNot/PhiNode must be stored
@@ -3877,6 +3970,26 @@ function allocate_ssa_locals!(ctx::CompilationContext)
                     is_numeric = ssa_type in (Int32, UInt32, Int64, UInt64, Int, Float32, Float64, Bool)
                     if is_numeric
                         push!(needs_local_set, arg.id)
+                    end
+                end
+            end
+        end
+
+        # Handle Core.tuple calls - same as :new, need locals for SSA args
+        # when there are multiple elements to ensure correct struct.new field ordering
+        if stmt isa Expr && stmt.head === :call
+            func = stmt.args[1]
+            is_tuple = func isa GlobalRef && func.mod === Core && func.name === :tuple
+            if is_tuple
+                args = stmt.args[2:end]
+                ssa_args = [arg.id for arg in args if arg isa Core.SSAValue]
+                # If there are multiple SSA args, all of them need locals to ensure
+                # correct ordering (even if there are no non-SSA args)
+                # Also need locals if there are non-SSA args mixed with SSA args
+                has_non_ssa_args = any(!(arg isa Core.SSAValue) for arg in args)
+                if (has_non_ssa_args && !isempty(ssa_args)) || length(ssa_args) > 1
+                    for id in ssa_args
+                        push!(needs_local_set, id)
                     end
                 end
             end
@@ -4000,6 +4113,47 @@ function produces_stack_value(stmt)
 end
 
 """
+Check if a statement is a passthrough that doesn't emit bytecode but relies on
+a value already being on the stack from an earlier SSA.
+Examples:
+- memoryrefnew(memory) - just passes through the array reference
+- %new(Vector{T}, memref, ...) - just passes through the memref which is the array
+"""
+function is_passthrough_statement(stmt, ctx::CompilationContext)
+    if !(stmt isa Expr)
+        return false
+    end
+
+    # Check for memoryrefnew with single arg (passthrough pattern)
+    if stmt.head === :call
+        func = stmt.args[1]
+        is_memrefnew = (func isa GlobalRef && func.mod === Core && func.name === :memoryrefnew) ||
+                       (func === :(Core.memoryrefnew))
+        if is_memrefnew && length(stmt.args) == 2
+            # Single arg memoryrefnew is a passthrough
+            return true
+        end
+    end
+
+    # Check for Vector %new (passthrough to the underlying array)
+    if stmt.head === :new
+        struct_type_ref = stmt.args[1]
+        struct_type = if struct_type_ref isa GlobalRef
+            try getfield(struct_type_ref.mod, struct_type_ref.name) catch; nothing end
+        elseif struct_type_ref isa DataType
+            struct_type_ref
+        else
+            nothing
+        end
+        if struct_type !== nothing && struct_type <: AbstractVector
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
 Count SSA uses in a statement.
 """
 function count_ssa_uses!(stmt, uses::Dict{Int, Int})
@@ -4083,6 +4237,34 @@ function analyze_ssa_types!(ctx::CompilationContext)
         if !haskey(ctx.ssa_types, i)
             if stmt isa Expr && stmt.head === :call
                 ctx.ssa_types[i] = infer_call_type(stmt, ctx)
+            elseif stmt isa Expr && stmt.head === :invoke
+                # For invoke expressions with Any type, get the actual method return type
+                mi_or_ci = stmt.args[1]
+                mi = if mi_or_ci isa Core.MethodInstance
+                    mi_or_ci
+                elseif isdefined(Core, :CodeInstance) && mi_or_ci isa Core.CodeInstance
+                    mi_or_ci.def
+                else
+                    nothing
+                end
+                if mi isa Core.MethodInstance
+                    meth = mi.def
+                    if meth isa Method
+                        # Get the function reference from the invoke expression
+                        func_ref = stmt.args[2]
+                        if func_ref isa GlobalRef
+                            func = try getfield(func_ref.mod, func_ref.name) catch; nothing end
+                            if func !== nothing && ctx.func_registry !== nothing && haskey(ctx.func_registry.by_ref, func)
+                                # Look up in registry by function reference
+                                infos = ctx.func_registry.by_ref[func]
+                                if !isempty(infos)
+                                    # Use the first matching function's return type
+                                    ctx.ssa_types[i] = infos[1].return_type
+                                end
+                            end
+                        end
+                    end
+                end
             end
         end
     end
@@ -4186,8 +4368,7 @@ end
 """
 Check if a call/invoke statement produces a value on the WASM stack.
 Returns false for calls to functions that return Nothing (void).
-This checks the MethodInstance's return type for invoke, which is more reliable
-than the SSA type which can be `Any` in some contexts.
+This checks the function registry first (most reliable), then MethodInstance return type.
 """
 function statement_produces_wasm_value(stmt::Expr, idx::Int, ctx::CompilationContext)::Bool
     # Get the SSA type first
@@ -4198,9 +4379,69 @@ function statement_produces_wasm_value(stmt::Expr, idx::Int, ctx::CompilationCon
         return false
     end
 
-    # If SSA type is a Union containing Nothing, no value produced (void in WASM)
-    if stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+    # If SSA type is Union{} (bottom type), the statement never returns so no value
+    if stmt_type === Union{}
         return false
+    end
+
+    # NOTE: Union{T, Nothing} DOES produce a value (a union struct in WASM)
+    # Only exact Nothing type means void return
+
+    # Check the function registry first - this is the most reliable source
+    # because it reflects what we actually compiled the function with
+    if ctx.func_registry !== nothing
+        # Extract the called function from the statement
+        called_func = nothing
+        call_arg_types = nothing
+
+        if stmt.head === :invoke && length(stmt.args) >= 2
+            # For invoke, args[2] is typically a GlobalRef to the function
+            func_ref = stmt.args[2]
+            if func_ref isa GlobalRef
+                try
+                    called_func = getfield(func_ref.mod, func_ref.name)
+                    # Skip built-in functions that aren't in the registry
+                    if called_func !== Base.getfield && called_func !== Core.getfield &&
+                       called_func !== Base.setfield! && called_func !== Core.setfield!
+                        # Get argument types from the remaining args
+                        call_arg_types = Tuple{[infer_value_type(arg, ctx) for arg in stmt.args[3:end]]...}
+                    end
+                catch
+                end
+            end
+        elseif stmt.head === :call && length(stmt.args) >= 1
+            func_ref = stmt.args[1]
+            if func_ref isa GlobalRef
+                try
+                    called_func = getfield(func_ref.mod, func_ref.name)
+                    # Skip built-in functions that aren't in the registry
+                    if called_func !== Base.getfield && called_func !== Core.getfield &&
+                       called_func !== Base.setfield! && called_func !== Core.setfield!
+                        call_arg_types = Tuple{[infer_value_type(arg, ctx) for arg in stmt.args[2:end]]...}
+                    end
+                catch
+                end
+            end
+        end
+
+        if called_func !== nothing && call_arg_types !== nothing
+            # Only look up if the function is in our registry
+            if haskey(ctx.func_registry.by_ref, called_func)
+                try
+                    target_info = get_function(ctx.func_registry, called_func, call_arg_types)
+                    if target_info !== nothing
+                        # Use the return type we actually compiled with
+                        if target_info.return_type === Nothing
+                            return false
+                        else
+                            return true
+                        end
+                    end
+                catch
+                    # If lookup fails (e.g., type mismatch), fall through to other checks
+                end
+            end
+        end
     end
 
     # For invoke statements, check the MethodInstance's return type
@@ -4871,6 +5112,10 @@ function generate_branched_loops(ctx::CompilationContext, first_header::Int, fir
 
     push!(bytes, Opcode.END)  # End if/else
 
+    # Both branches return, so code after the if/else is unreachable
+    # Add UNREACHABLE to satisfy WASM validation (function end needs result value on stack)
+    push!(bytes, Opcode.UNREACHABLE)
+
     return bytes
 end
 
@@ -5351,7 +5596,8 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
                                 val = phi_stmt.values[edge_idx]
                                 append!(bytes, compile_value(val, ctx))
                                 local_idx = ctx.phi_locals[stmt.label]
-                                push!(bytes, Opcode.LOCAL_SET)
+                                # Use LOCAL_TEE to keep value on stack for branch target
+                                push!(bytes, Opcode.LOCAL_TEE)
                                 append!(bytes, encode_leb128_unsigned(local_idx))
                                 break
                             end
@@ -5373,17 +5619,38 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
 
             # Drop unused values from calls (prevents stack pollution in loops)
             if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
-                stmt_type = get(ctx.ssa_types, i, Any)
-                if stmt_type !== Nothing
-                    is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
-                    if !is_nothing_union
-                        if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
-                            use_count = get(ssa_use_count, i, 0)
-                            if use_count == 0
-                                push!(bytes, Opcode.DROP)
-                            end
+                # Use statement_produces_wasm_value for consistent handling
+                # This checks the function registry for accurate return type info
+                if statement_produces_wasm_value(stmt, i, ctx)
+                    if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                        use_count = get(ssa_use_count, i, 0)
+                        if use_count == 0
+                            push!(bytes, Opcode.DROP)
                         end
                     end
+                end
+            end
+
+            # Check if this statement has Union{} type (never returns) - stop generating code
+            # Code after unreachable/throw is dead and causes validation errors
+            stmt_type = get(ctx.ssa_types, i, Any)
+            if stmt_type === Union{}
+                # Skip to next merge point (block end) or back-edge
+                # Find the next merge point
+                next_merge = nothing
+                for (merge_point, is_open) in open_blocks
+                    if is_open && merge_point > i
+                        if next_merge === nothing || merge_point < next_merge
+                            next_merge = merge_point
+                        end
+                    end
+                end
+                if next_merge !== nothing
+                    # Skip to just before merge point
+                    i = next_merge - 1
+                else
+                    # No merge point - skip to back edge
+                    i = back_edge_idx
                 end
             end
         end
@@ -5587,7 +5854,70 @@ function generate_if_then_else(ctx::CompilationContext, blocks::Vector{BasicBloc
             end
         end
     else
-        # Return-based pattern (original logic)
+        # Return-based pattern OR void-if-then pattern
+        # First, check if then-branch contains a return
+        then_has_return = false
+        for i in then_start:else_start-1
+            if code[i] isa Core.ReturnNode
+                then_has_return = true
+                break
+            end
+        end
+
+        if !then_has_return
+            # Void-if-then pattern: then-branch has no return, falls through to common return
+            # Generate void IF block for side effects, then continue to shared return path
+            push!(bytes, Opcode.IF)
+            push!(bytes, 0x40)  # void block type
+
+            for i in then_start:else_start-1
+                stmt = code[i]
+                if stmt === nothing
+                    # Skip nothing statements
+                elseif stmt isa Core.GotoNode
+                    # Skip goto - handled by control flow
+                else
+                    append!(bytes, compile_statement(stmt, i, ctx))
+
+                    # Drop unused values from calls
+                    if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                        stmt_type = get(ctx.ssa_types, i, Any)
+                        if stmt_type !== Nothing
+                            is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                            if !is_nothing_union
+                                if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                                    use_count = get(ssa_use_count, i, 0)
+                                    if use_count == 0
+                                        push!(bytes, Opcode.DROP)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            push!(bytes, Opcode.END)  # End the void IF block
+
+            # Generate the common return path (else-branch which both paths reach)
+            for i in else_start:length(code)
+                stmt = code[i]
+                if stmt isa Core.ReturnNode
+                    if isdefined(stmt, :val)
+                        append!(bytes, compile_value(stmt.val, ctx))
+                    end
+                    push!(bytes, Opcode.RETURN)
+                elseif stmt === nothing
+                    # Skip
+                else
+                    append!(bytes, compile_statement(stmt, i, ctx))
+                end
+            end
+
+            return bytes
+        end
+
+        # Original return-based pattern: both branches have returns
         # Determine result type for the if block
         result_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
 
@@ -5988,10 +6318,14 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                         if edge >= block.start_idx && edge < i
                             # This is an internal fallthrough edge - set the phi local
                             val = stmt.values[edge_idx]
-                            append!(block_bytes, compile_phi_value(val))
-                            local_idx = ctx.phi_locals[i]
-                            push!(block_bytes, Opcode.LOCAL_SET)
-                            append!(block_bytes, encode_leb128_unsigned(local_idx))
+                            phi_value_bytes = compile_phi_value(val, i)
+                            # Only emit local_set if we actually have a value on the stack
+                            if !isempty(phi_value_bytes)
+                                append!(block_bytes, phi_value_bytes)
+                                local_idx = ctx.phi_locals[i]
+                                push!(block_bytes, Opcode.LOCAL_SET)
+                                append!(block_bytes, encode_leb128_unsigned(local_idx))
+                            end
                             break
                         end
                     end
@@ -6138,7 +6472,8 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
 
     # Helper to compile a value, ensuring it actually produces bytes
     # For SSAValues without locals, we need to recompute the value
-    function compile_phi_value(val)::Vector{UInt8}
+    # phi_idx: the SSA index of the phi node we're setting (to get the phi's type)
+    function compile_phi_value(val, phi_idx::Int)::Vector{UInt8}
         result = UInt8[]
         if val isa Core.SSAValue
             # Debug trace for specific SSAs
@@ -6166,8 +6501,21 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                     append!(result, compile_value(val, ctx))
                 end
             end
+        elseif val === nothing || (val isa GlobalRef && val.name === :nothing)
+            # Value is `nothing` (can be Core.nothing or Main.nothing in IR)
+            # Check if we need to emit ref.null for Union{T, Nothing} phi
+            phi_type = get(ctx.ssa_types, phi_idx, nothing)
+            if phi_type !== nothing && phi_type !== Nothing
+                # Phi expects a value but we have nothing - emit ref.null
+                wasm_type = julia_to_wasm_type_concrete(phi_type, ctx)
+                if wasm_type isa ConcreteRef
+                    push!(result, Opcode.REF_NULL)
+                    append!(result, encode_leb128_unsigned(wasm_type.type_idx))
+                end
+            end
+            # If phi_type is Nothing, return empty bytes (nothing to push)
         else
-            # Not an SSA - just compile directly
+            # Not an SSA and not nothing - just compile directly
             append!(result, compile_value(val, ctx))
         end
         return result
@@ -6193,11 +6541,15 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                     for (edge_idx, edge) in enumerate(stmt.edges)
                         if edge == terminator_idx
                             val = stmt.values[edge_idx]
-                            append!(bytes, compile_phi_value(val))
-                            local_idx = ctx.phi_locals[i]
-                            push!(bytes, Opcode.LOCAL_SET)
-                            append!(bytes, encode_leb128_unsigned(local_idx))
-                            phi_count += 1
+                            phi_value_bytes = compile_phi_value(val, i)
+                            # Only emit local_set if we actually have a value on the stack
+                            if !isempty(phi_value_bytes)
+                                append!(bytes, phi_value_bytes)
+                                local_idx = ctx.phi_locals[i]
+                                push!(bytes, Opcode.LOCAL_SET)
+                                append!(bytes, encode_leb128_unsigned(local_idx))
+                                phi_count += 1
+                            end
                             found_edge = true
                             break
                         end
@@ -6598,7 +6950,11 @@ function generate_void_flow(ctx::CompilationContext, blocks::Vector{BasicBlock},
                     push!(compiled, j)
                 elseif inner isa Core.ReturnNode
                     # Early return inside conditional - emit return instruction
-                    push!(bytes, Opcode.RETURN)
+                    # BUT: If the return type is Union{} (unreachable), don't emit RETURN
+                    stmt_type = get(ctx.ssa_types, j, Any)
+                    if stmt_type !== Union{}
+                        push!(bytes, Opcode.RETURN)
+                    end
                     push!(compiled, j)
                 elseif inner isa Core.GotoIfNot
                     # Check if this GotoIfNot is a ternary pattern (has a phi node)
@@ -6632,6 +6988,14 @@ function generate_void_flow(ctx::CompilationContext, blocks::Vector{BasicBlock},
                 else
                     append!(bytes, compile_statement(inner, j, ctx))
                     push!(compiled, j)
+
+                    # Check if this statement produces Union{} (never returns, e.g., throw)
+                    # If so, stop compiling - any code after is dead code
+                    stmt_type = get(ctx.ssa_types, j, Any)
+                    if stmt_type === Union{}
+                        break
+                    end
+
                     # Check if this statement leaves a value on stack that we need to drop
                     # In void functions, return statements are skipped, so values meant for
                     # returns stay on stack. We need to drop them.
@@ -6690,7 +7054,11 @@ function generate_void_flow(ctx::CompilationContext, blocks::Vector{BasicBlock},
                         push!(compiled, j)
                     elseif inner isa Core.ReturnNode
                         # Early return inside else branch - emit return instruction
-                        push!(bytes, Opcode.RETURN)
+                        # BUT: If the return type is Union{} (unreachable), don't emit RETURN
+                        stmt_type = get(ctx.ssa_types, j, Any)
+                        if stmt_type !== Union{}
+                            push!(bytes, Opcode.RETURN)
+                        end
                         push!(compiled, j)
                     elseif inner isa Core.GotoNode
                         push!(compiled, j)
@@ -6721,6 +7089,13 @@ function generate_void_flow(ctx::CompilationContext, blocks::Vector{BasicBlock},
                     else
                         append!(bytes, compile_statement(inner, j, ctx))
                         push!(compiled, j)
+
+                        # Check if this statement produces Union{} (never returns, e.g., throw)
+                        # If so, stop compiling - any code after is dead code
+                        stmt_type = get(ctx.ssa_types, j, Any)
+                        if stmt_type === Union{}
+                            break
+                        end
 
                         # Drop unused values in void context (else branch)
                         if inner isa Expr && (inner.head === :call || inner.head === :invoke)
@@ -6764,6 +7139,15 @@ function generate_void_flow(ctx::CompilationContext, blocks::Vector{BasicBlock},
         # Regular statement
         append!(bytes, compile_statement(stmt, i, ctx))
         push!(compiled, i)
+
+        # Check if this statement produces Union{} (never returns, e.g., throw)
+        # If so, stop compiling - any code after is dead code
+        stmt_type = get(ctx.ssa_types, i, Any)
+        if stmt_type === Union{}
+            # Don't add more code, just return what we have
+            # The function ends with unreachable code path
+            return bytes
+        end
 
         # Drop unused values from statements that produce values
         if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
@@ -6851,10 +7235,15 @@ function compile_void_nested_conditional(ctx::CompilationContext, code, start_id
             push!(compiled, j)
         elseif inner isa Core.ReturnNode
             # Early return inside conditional
-            if isdefined(inner, :val) && inner.val !== nothing
-                # Non-void return - but we're in void handler, just return
+            # BUT: If the return type is Union{} (unreachable), don't emit RETURN
+            # This happens after throw statements - the code is dead
+            stmt_type = get(ctx.ssa_types, j, Any)
+            if stmt_type !== Union{}
+                if isdefined(inner, :val) && inner.val !== nothing
+                    # Non-void return - but we're in void handler, just return
+                end
+                push!(bytes, Opcode.RETURN)
             end
-            push!(bytes, Opcode.RETURN)
             push!(compiled, j)
         elseif inner isa Core.GotoIfNot
             # Check if this GotoIfNot is a ternary pattern (has a phi node)
@@ -6886,6 +7275,13 @@ function compile_void_nested_conditional(ctx::CompilationContext, code, start_id
             # Regular statement (including setter calls)
             append!(bytes, compile_statement(inner, j, ctx))
             push!(compiled, j)
+
+            # Check if this statement produces Union{} (never returns, e.g., throw)
+            # If so, stop compiling - any code after is dead code
+            stmt_type = get(ctx.ssa_types, j, Any)
+            if stmt_type === Union{}
+                break
+            end
 
             # Drop unused values in void context
             if inner isa Expr && (inner.head === :call || inner.head === :invoke)
@@ -7104,6 +7500,29 @@ function generate_and_pattern(ctx::CompilationContext, blocks, code, conditional
         end
     end
 
+    # Check if there's a phi node at or after else_target that we need to provide a value for
+    phi_idx = nothing
+    phi_node = nothing
+    for i in else_target:length(code)
+        if code[i] isa Core.PhiNode
+            phi_idx = i
+            phi_node = code[i]
+            break
+        end
+    end
+
+    # If there's a phi, push the then-value before branching
+    if phi_node !== nothing
+        # Find the phi value from the then-branch (before else_target)
+        for (edge_idx, edge) in enumerate(phi_node.edges)
+            if edge < else_target && edge > 0
+                val = phi_node.values[edge_idx]
+                append!(bytes, compile_value(val, ctx))
+                break
+            end
+        end
+    end
+
     # br past else to outer block end
     push!(bytes, Opcode.BR)
     append!(bytes, encode_leb128_unsigned(1))  # br to outer block (depth 1)
@@ -7111,27 +7530,55 @@ function generate_and_pattern(ctx::CompilationContext, blocks, code, conditional
     # End inner block (else target)
     push!(bytes, Opcode.END)
 
-    # Generate else code
-    for i in else_target:length(code)
-        stmt = code[i]
-        if stmt isa Core.ReturnNode
-            if isdefined(stmt, :val)
-                append!(bytes, compile_value(stmt.val, ctx))
+    # Generate else code - if there's a phi, push its else-value directly
+    if phi_node !== nothing
+        # Find the phi value from an else-branch (at or after else_target)
+        else_value_pushed = false
+        for (edge_idx, edge) in enumerate(phi_node.edges)
+            # Else edges come from conditionals that jump to else_target
+            # These are the GotoIfNot statements - their line numbers are stored in edges
+            edge_stmt = edge <= length(code) ? code[edge] : nothing
+            if edge_stmt isa Core.GotoIfNot
+                # This is an else-edge from a conditional
+                val = phi_node.values[edge_idx]
+                append!(bytes, compile_value(val, ctx))
+                else_value_pushed = true
+                break
             end
-            break
-        elseif stmt !== nothing && !(stmt isa Core.GotoIfNot) && !(stmt isa Core.GotoNode)
-            append!(bytes, compile_statement(stmt, i, ctx))
+        end
+        if !else_value_pushed
+            # Fallback: look for else-value (edge from else_target or later)
+            for (edge_idx, edge) in enumerate(phi_node.edges)
+                if edge >= else_target
+                    val = phi_node.values[edge_idx]
+                    append!(bytes, compile_value(val, ctx))
+                    break
+                end
+            end
+        end
+    else
+        # No phi - iterate through else code looking for return
+        for i in else_target:length(code)
+            stmt = code[i]
+            if stmt isa Core.ReturnNode
+                if isdefined(stmt, :val)
+                    append!(bytes, compile_value(stmt.val, ctx))
+                end
+                break
+            elseif stmt !== nothing && !(stmt isa Core.GotoIfNot) && !(stmt isa Core.GotoNode)
+                append!(bytes, compile_statement(stmt, i, ctx))
 
-            # Drop unused values
-            if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
-                stmt_type = get(ctx.ssa_types, i, Any)
-                if stmt_type !== Nothing
-                    is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
-                    if !is_nothing_union
-                        if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
-                            use_count = get(ssa_use_count, i, 0)
-                            if use_count == 0
-                                push!(bytes, Opcode.DROP)
+                # Drop unused values
+                if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                    stmt_type = get(ctx.ssa_types, i, Any)
+                    if stmt_type !== Nothing
+                        is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                        if !is_nothing_union
+                            if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                                use_count = get(ssa_use_count, i, 0)
+                                if use_count == 0
+                                    push!(bytes, Opcode.DROP)
+                                end
                             end
                         end
                     end
@@ -8112,14 +8559,41 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                         append!(inner_bytes, compile_statement(stmt, i, ctx))
                     end
                 end
-                if then_value !== nothing
-                    append!(inner_bytes, compile_value(then_value, ctx))
+                # Push then-branch result value
+                # Handle cases:
+                # 1. then_value is nothing (Julia's nothing) - need ref.null if ref type expected
+                # 2. then_value compiles to nothing (SSA with Nothing type) - need ref.null
+                # 3. then_value compiles to actual value - use that
+                if then_value === nothing
+                    # Phi value is Julia's nothing - emit ref.null if ref type expected
+                    if phi_wasm_type isa ConcreteRef
+                        push!(inner_bytes, Opcode.REF_NULL)
+                        append!(inner_bytes, encode_leb128_unsigned(phi_wasm_type.type_idx))
+                    end
+                    # For non-ref types, nothing produces no value (shouldn't happen for valid code)
+                elseif then_value !== nothing
+                    value_bytes = compile_value(then_value, ctx)
+                    if isempty(value_bytes) && phi_wasm_type isa ConcreteRef
+                        # Value compiled to nothing but we need a ref type - emit ref.null
+                        push!(inner_bytes, Opcode.REF_NULL)
+                        append!(inner_bytes, encode_leb128_unsigned(phi_wasm_type.type_idx))
+                    else
+                        append!(inner_bytes, value_bytes)
+                    end
                 end
 
                 # Else-branch: compile statements from dest to else_edge, then push the value
                 push!(inner_bytes, Opcode.ELSE)
 
-                if else_edge !== nothing
+                # Check if the GotoIfNot's type is Union{} (bottom type) - this means the else branch is dead code
+                # The type of the GotoIfNot is stored at block.end_idx (the line with the conditional)
+                goto_if_not_type = get(ctx.ssa_types, block.end_idx, Any)
+                is_else_unreachable = goto_if_not_type === Union{}
+
+                if is_else_unreachable
+                    # Else branch is dead code - just emit unreachable
+                    push!(inner_bytes, Opcode.UNREACHABLE)
+                elseif else_edge !== nothing
                     for i in goto_if_not.dest:else_edge
                         stmt = code[i]
                         if stmt === nothing
@@ -8134,8 +8608,25 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                     end
                 end
 
-                if else_value !== nothing
-                    append!(inner_bytes, compile_value(else_value, ctx))
+                # Push else-branch result value (same logic as then-branch)
+                # But skip if else branch is unreachable (code after unreachable is dead)
+                if !is_else_unreachable
+                    if else_value === nothing
+                        # Phi value is Julia's nothing - emit ref.null if ref type expected
+                        if phi_wasm_type isa ConcreteRef
+                            push!(inner_bytes, Opcode.REF_NULL)
+                            append!(inner_bytes, encode_leb128_unsigned(phi_wasm_type.type_idx))
+                        end
+                    elseif else_value !== nothing
+                        value_bytes = compile_value(else_value, ctx)
+                        if isempty(value_bytes) && phi_wasm_type isa ConcreteRef
+                            # Value compiled to nothing but we need a ref type - emit ref.null
+                            push!(inner_bytes, Opcode.REF_NULL)
+                            append!(inner_bytes, encode_leb128_unsigned(phi_wasm_type.type_idx))
+                        else
+                            append!(inner_bytes, value_bytes)
+                        end
+                    end
                 end
 
                 push!(inner_bytes, Opcode.END)
@@ -8406,14 +8897,20 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
 
     elseif stmt isa Core.PiNode
         # PiNode is a type assertion - just pass through the value
-        append!(bytes, compile_value(stmt.val, ctx))
+        # BUT: If the result type is Nothing, the value won't be used in a meaningful way
+        # (consumers will emit ref.null instead), so don't push anything
+        pi_type = get(ctx.ssa_types, idx, Any)
+        if pi_type !== Nothing
+            append!(bytes, compile_value(stmt.val, ctx))
 
-        # If this SSA value needs a local, store it (and remove from stack)
-        if haskey(ctx.ssa_locals, idx)
-            local_idx = ctx.ssa_locals[idx]
-            push!(bytes, Opcode.LOCAL_SET)  # Use SET not TEE to not leave on stack
-            append!(bytes, encode_leb128_unsigned(local_idx))
+            # If this SSA value needs a local, store it (and remove from stack)
+            if haskey(ctx.ssa_locals, idx)
+                local_idx = ctx.ssa_locals[idx]
+                push!(bytes, Opcode.LOCAL_SET)  # Use SET not TEE to not leave on stack
+                append!(bytes, encode_leb128_unsigned(local_idx))
+            end
         end
+        # If pi_type is Nothing, emit nothing - consumers will handle it
 
     elseif stmt isa Core.EnterNode
         # Exception handling: Enter try block
@@ -8441,10 +8938,12 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
             # This handles things like Main.SLOT_EMPTY that are module-level constants
             try
                 val = getfield(stmt.mod, stmt.name)
-                append!(bytes, compile_value(val, ctx))
+                value_bytes = compile_value(val, ctx)
+                append!(bytes, value_bytes)
 
-                # If this SSA value needs a local, store it
-                if haskey(ctx.ssa_locals, idx)
+                # If this SSA value needs a local, store it (only if we actually pushed a value)
+                # compile_value returns empty bytes for Functions, Types, etc.
+                if !isempty(value_bytes) && haskey(ctx.ssa_locals, idx)
                     local_idx = ctx.ssa_locals[idx]
                     push!(bytes, Opcode.LOCAL_SET)
                     append!(bytes, encode_leb128_unsigned(local_idx))
@@ -8487,12 +8986,23 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
         # We use LOCAL_SET (not LOCAL_TEE) to avoid leaving extra values on stack
         # that would interfere with later operations. Values will be retrieved
         # via local.get when needed.
-        # IMPORTANT: Only do this if the statement actually produced bytecode
-        # (skipped signal statements return empty bytes)
-        if haskey(ctx.ssa_locals, idx) && !isempty(stmt_bytes)
-            local_idx = ctx.ssa_locals[idx]
-            push!(bytes, Opcode.LOCAL_SET)
-            append!(bytes, encode_leb128_unsigned(local_idx))
+        #
+        # We emit local.set if:
+        # 1. The statement produced bytecode (!isempty(stmt_bytes)), OR
+        # 2. The statement is a passthrough (memoryrefnew, Vector %new) where the value
+        #    is expected to be on the stack from an earlier SSA
+        #
+        # Skipped signal statements return empty bytes and are NOT passthroughs, so
+        # they correctly get no local.set.
+        if haskey(ctx.ssa_locals, idx)
+            # Also store for passthrough statements that have a value on the stack
+            # but don't emit their own bytecode (like memoryrefnew, Vector %new)
+            should_store = !isempty(stmt_bytes) || is_passthrough_statement(stmt, ctx)
+            if should_store
+                local_idx = ctx.ssa_locals[idx]
+                push!(bytes, Opcode.LOCAL_SET)
+                append!(bytes, encode_leb128_unsigned(local_idx))
+            end
         end
     end
 
@@ -8508,6 +9018,8 @@ function compile_new(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt
     # expr.args[1] is the type, rest are field values
     struct_type_ref = expr.args[1]
     field_values = expr.args[2:end]
+
+
 
     # Resolve the struct type if it's a GlobalRef
     struct_type = if struct_type_ref isa GlobalRef
@@ -8577,8 +9089,15 @@ function compile_new(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt
                 typeof(val)
             end
 
-            if val_type === Nothing
-                # For Nothing, emit ref.null with the appropriate type
+            # Check if this value is nothing - either literally or via an SSA with Nothing type
+            # SSA values with Nothing type (e.g., from GlobalRef to nothing) produce no bytecode,
+            # so we need to emit ref.null directly instead of trying to load a non-existent value
+            is_literal_nothing = val === nothing || (val isa GlobalRef && val.name === :nothing)
+            is_nothing_type_ssa = val isa Core.SSAValue && val_type === Nothing
+            should_emit_null = is_literal_nothing || is_nothing_type_ssa
+
+            if should_emit_null
+                # Nothing value (literal or SSA with Nothing type) - emit ref.null
                 if inner_type !== nothing && isconcretetype(inner_type) && isstructtype(inner_type)
                     # Nullable struct ref - emit null reference
                     if haskey(ctx.type_registry.structs, inner_type)
@@ -8741,8 +9260,30 @@ function compile_value(val, ctx::CompilationContext)::Vector{UInt8}
             local_idx = ctx.phi_locals[val.id]
             push!(bytes, Opcode.LOCAL_GET)
             append!(bytes, encode_leb128_unsigned(local_idx))
+        else
+            # No local - check if this is a PiNode with Nothing type
+            # In that case, we need to emit ref.null for the union type
+            stmt = ctx.code_info.code[val.id]
+            if stmt isa Core.PiNode
+                pi_type = get(ctx.ssa_types, val.id, Any)
+                if pi_type === Nothing
+                    # PiNode narrowed to Nothing - we need to emit ref.null
+                    # Get the type of the underlying value to find the union's other type
+                    if stmt.val isa Core.SSAValue
+                        underlying_type = get(ctx.ssa_types, stmt.val.id, Any)
+                        # For Union{Nothing, T}, emit ref.null $T
+                        if underlying_type !== Nothing && underlying_type !== Any
+                            wasm_type = julia_to_wasm_type_concrete(underlying_type, ctx)
+                            if wasm_type isa ConcreteRef
+                                push!(bytes, Opcode.REF_NULL)
+                                append!(bytes, encode_leb128_unsigned(wasm_type.type_idx))
+                            end
+                        end
+                    end
+                end
+            end
+            # Otherwise, assume it's on the stack (for single-use SSAs in sequence)
         end
-        # Otherwise, assume it's on the stack (for single-use SSAs in sequence)
 
     elseif val isa Core.Argument
         # For closures being compiled, _1 is the closure object (arg_types[1])
@@ -9073,6 +9614,7 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
 
     # Skip getfield(CompilableSignal/Setter, :signal) - intermediate step
     # We track this in analyze_signal_captures! but don't need to emit anything
+    # IMPORTANT: Only skip for actual CompilableSignal/Setter types, not any struct with a :signal field
     is_getfield = (func isa GlobalRef &&
                   ((func.mod === Core && func.name === :getfield) ||
                    (func.mod === Base && func.name === :getfield)))
@@ -9080,8 +9622,12 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         field_ref = args[2]
         field_name = field_ref isa QuoteNode ? field_ref.value : field_ref
         if field_name === :signal
-            # Skip - this is getting Signal from CompilableSignal/Setter
-            return bytes
+            # Only skip for CompilableSignal/Setter types (WasmGlobal pattern)
+            target_type = infer_value_type(args[1], ctx)
+            if target_type isa DataType && target_type.name.name in (:CompilableSignal, :CompilableSetter)
+                # Skip - this is getting Signal from CompilableSignal/Setter
+                return bytes
+            end
         end
     end
 
@@ -9171,13 +9717,29 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         # Handle Memory{T}.instance pattern (Julia 1.11+ Vector allocation)
         # This pattern appears as Core.getproperty(Memory{T}, :instance)
         # where Memory{T} is passed directly as a DataType
-        # We compile it to create an empty WasmGC array placeholder
-        # The actual array will be created by the :new expression that uses this
+        # Memory{T}.instance is a singleton empty Memory (length 0)
+        # We compile it to create an empty WasmGC array
         field_sym = field_ref isa QuoteNode ? field_ref.value : field_ref
         if field_sym === :instance && obj_arg isa DataType && obj_arg <: Memory
-            # This is Memory{T}.instance - we return nothing here
-            # The actual array allocation will be done by the phi and :new expressions
-            # For now, return empty bytes - this value gets merged via phi
+            # Memory{T}.instance - create an empty array (length 0)
+            # Extract element type from Memory{T}
+            elem_type = if obj_arg.name.name === :Memory && length(obj_arg.parameters) >= 1
+                obj_arg.parameters[1]
+            elseif obj_arg.name.name === :GenericMemory && length(obj_arg.parameters) >= 2
+                obj_arg.parameters[2]
+            else
+                Int32  # default
+            end
+
+            # Get or create array type for this element type
+            arr_type_idx = get_array_type!(ctx.mod, ctx.type_registry, elem_type)
+
+            # Emit array.new_default with length 0
+            push!(bytes, Opcode.I32_CONST)
+            push!(bytes, 0x00)  # length = 0
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.ARRAY_NEW_DEFAULT)
+            append!(bytes, encode_leb128_unsigned(arr_type_idx))
             return bytes
         end
 
@@ -9346,7 +9908,11 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         end
 
         # Handle struct field access by name
-        if is_struct_type(obj_type) && haskey(ctx.type_registry.structs, obj_type)
+        if is_struct_type(obj_type)
+            # Register the struct type on-demand if not already registered
+            if !haskey(ctx.type_registry.structs, obj_type)
+                register_struct_type!(ctx.mod, ctx.type_registry, obj_type)
+            end
             info = ctx.type_registry.structs[obj_type]
 
             field_sym = if field_ref isa QuoteNode
@@ -9485,10 +10051,15 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         ref_arg = args[1]
         ref_type = infer_value_type(ref_arg, ctx)
 
-        # Extract element type from MemoryRef{T}
+        # Extract element type from MemoryRef{T} or GenericMemoryRef{atomicity, T, addrspace}
         elem_type = Int32  # default
-        if ref_type isa DataType && ref_type.name.name === :MemoryRef
-            elem_type = ref_type.parameters[1]
+        if ref_type isa DataType
+            if ref_type.name.name === :MemoryRef
+                elem_type = ref_type.parameters[1]
+            elseif ref_type.name.name === :GenericMemoryRef
+                # GenericMemoryRef has parameters (atomicity, element_type, addrspace)
+                elem_type = ref_type.parameters[2]
+            end
         end
 
         # Get or create array type for this element type
@@ -9506,15 +10077,21 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
 
     # Special case for memoryrefset! - array element assignment
     # memoryrefset!(ref, value, ordering, boundscheck) -> stores value in array
+    # In Julia, setindex! returns the stored value, so we need to return it too
     if is_func(func, :memoryrefset!) && length(args) >= 2
         ref_arg = args[1]
         value_arg = args[2]
         ref_type = infer_value_type(ref_arg, ctx)
 
-        # Extract element type from MemoryRef{T}
+        # Extract element type from MemoryRef{T} or GenericMemoryRef{atomicity, T, addrspace}
         elem_type = Int32  # default
-        if ref_type isa DataType && ref_type.name.name === :MemoryRef
-            elem_type = ref_type.parameters[1]
+        if ref_type isa DataType
+            if ref_type.name.name === :MemoryRef
+                elem_type = ref_type.parameters[1]
+            elseif ref_type.name.name === :GenericMemoryRef
+                # GenericMemoryRef has parameters (atomicity, element_type, addrspace)
+                elem_type = ref_type.parameters[2]
+            end
         end
 
         # Get or create array type for this element type
@@ -9523,13 +10100,18 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         # Compile ref_arg which will leave [array_ref, i32_index] on stack
         append!(bytes, compile_value(ref_arg, ctx))
 
-        # Compile the value to store
+        # Compile the value to store - we need it twice (for array.set and return)
+        # First compile gets the value on stack for array.set
         append!(bytes, compile_value(value_arg, ctx))
 
-        # array.set
+        # array.set consumes [array_ref, i32_index, value] and returns nothing
         push!(bytes, Opcode.GC_PREFIX)
         push!(bytes, Opcode.ARRAY_SET)
         append!(bytes, encode_leb128_unsigned(array_type_idx))
+
+        # Julia's memoryrefset! returns the stored value, so push it again
+        # This is needed because compile_statement may add LOCAL_SET after this
+        append!(bytes, compile_value(value_arg, ctx))
         return bytes
     end
 
@@ -9697,6 +10279,27 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
             append!(bytes, compile_string_equal(args[1], args[2], ctx))
             if is_func(func, :(!==))
                 # Negate the result for !==
+                push!(bytes, Opcode.I32_EQZ)
+            end
+            return bytes
+        end
+
+        # Special case: comparing ref type with nothing - use ref.is_null
+        arg1_is_nothing = is_nothing_value(args[1], ctx)
+        arg2_is_nothing = is_nothing_value(args[2], ctx)
+
+        if (arg1_is_nothing && is_ref_type_or_union(arg2_type)) ||
+           (arg2_is_nothing && is_ref_type_or_union(arg1_type))
+            # Compile the non-nothing ref argument
+            if arg1_is_nothing
+                append!(bytes, compile_value(args[2], ctx))
+            else
+                append!(bytes, compile_value(args[1], ctx))
+            end
+            # ref.is_null checks if ref is null (returns i32 1 for null, 0 otherwise)
+            push!(bytes, Opcode.REF_IS_NULL)
+            if is_func(func, :(!==))
+                # Negate for !== (we want true when NOT null)
                 push!(bytes, Opcode.I32_EQZ)
             end
             return bytes
@@ -10017,6 +10620,12 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
             push!(bytes, Opcode.F64_EQ)
         elseif arg_type === Float32
             push!(bytes, Opcode.F32_EQ)
+        elseif is_ref_type_or_union(arg_type) || is_ref_type_or_union(infer_value_type(args[2], ctx))
+            # Reference type comparison - use ref.eq for WasmGC
+            # If either arg is literally nothing, the value is already ref.null on stack
+            # The ref.eq instruction handles null refs correctly
+            # ref.eq is a standalone opcode (0xD3), not under GC_PREFIX
+            push!(bytes, Opcode.REF_EQ)
         else
             push!(bytes, is_32bit ? Opcode.I32_EQ : Opcode.I64_EQ)
         end
@@ -10028,6 +10637,11 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
             push!(bytes, Opcode.F64_NE)
         elseif arg_type === Float32
             push!(bytes, Opcode.F32_NE)
+        elseif is_ref_type_or_union(arg_type) || is_ref_type_or_union(infer_value_type(args[2], ctx))
+            # Reference type comparison - use ref.eq then negate
+            # ref.eq is a standalone opcode (0xD3), not under GC_PREFIX
+            push!(bytes, Opcode.REF_EQ)
+            push!(bytes, Opcode.I32_EQZ)  # Negate for !==
         else
             push!(bytes, is_32bit ? Opcode.I32_NE : Opcode.I64_NE)
         end
@@ -10392,14 +11006,14 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         value_type = get_ssa_type(ctx, value_arg)
 
         # Check if this is a tagged union check
+        # NOTE: The value argument is already on the stack from the loop that pushes all args
         if value_type isa Union && needs_tagged_union(value_type) && haskey(ctx.type_registry.unions, value_type)
             # Tagged union: check the tag field
             union_info = ctx.type_registry.unions[value_type]
             expected_tag = get(union_info.tag_map, check_type, Int32(-1))
 
             if expected_tag >= 0
-                # Compile the value (puts tagged union struct on stack)
-                append!(bytes, compile_value(value_arg, ctx))
+                # Value is already on stack (tagged union struct)
                 # Get the tag field (field 0)
                 push!(bytes, Opcode.GC_PREFIX)
                 push!(bytes, Opcode.STRUCT_GET)
@@ -10410,24 +11024,24 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
                 append!(bytes, encode_leb128_signed(Int64(expected_tag)))
                 push!(bytes, Opcode.I32_EQ)
             else
-                # Type not in this union - return false
+                # Type not in this union - drop value and return false
+                push!(bytes, Opcode.DROP)
                 push!(bytes, Opcode.I32_CONST)
                 push!(bytes, 0x00)
             end
         elseif check_type === Nothing
             # isa(x, Nothing) -> ref.is_null
-            # For nullable references, Nothing corresponds to null
-            append!(bytes, compile_value(value_arg, ctx))
+            # Value is already on stack
             push!(bytes, Opcode.REF_IS_NULL)
         elseif check_type !== nothing && isconcretetype(check_type)
             # isa(x, ConcreteType) -> check if reference is non-null
             # For Union{Nothing, T}, checking isa(x, T) is equivalent to !isnull
-            # Use ref.is_null and negate it
-            append!(bytes, compile_value(value_arg, ctx))
+            # Value is already on stack
             push!(bytes, Opcode.REF_IS_NULL)
             push!(bytes, Opcode.I32_EQZ)  # negate: 1->0, 0->1
         else
-            # Unknown type - return false (0)
+            # Unknown type - drop value and return false
+            push!(bytes, Opcode.DROP)
             push!(bytes, Opcode.I32_CONST)
             push!(bytes, 0x00)
         end
@@ -10581,18 +11195,8 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
         end
     end
 
-    # Push arguments (for non-signal calls)
-    for arg in args
-        append!(bytes, compile_value(arg, ctx))
-    end
-
-    arg_type = length(args) > 0 ? infer_value_type(args[1], ctx) : Int64
-    is_32bit = arg_type === Int32 || arg_type === UInt32 || arg_type === Bool || arg_type === Char ||
-               arg_type === Int16 || arg_type === UInt16 || arg_type === Int8 || arg_type === UInt8 ||
-               (isprimitivetype(arg_type) && sizeof(arg_type) <= 4)
-
+    # Get MethodInstance to check parameter types for nothing arguments
     mi_or_ci = expr.args[1]
-    # Handle both MethodInstance (Julia 1.11) and CodeInstance (Julia 1.12+)
     mi = if mi_or_ci isa Core.MethodInstance
         mi_or_ci
     elseif isdefined(Core, :CodeInstance) && mi_or_ci isa Core.CodeInstance
@@ -10600,6 +11204,77 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
     else
         nothing
     end
+
+    # Get parameter types from the method signature if available
+    param_types = nothing
+    if mi isa Core.MethodInstance && mi.def isa Method
+        sig = mi.def.sig
+        if sig isa DataType && sig <: Tuple
+            # sig is Tuple{typeof(func), arg1_type, arg2_type, ...}
+            # We want arg types starting from index 2
+            param_types = sig.parameters[2:end]
+        end
+    end
+
+    # Push arguments (for non-signal calls)
+    for (arg_idx, arg) in enumerate(args)
+        # Check if this is a nothing argument that needs ref.null
+        is_nothing_arg = arg === nothing ||
+                        (arg isa GlobalRef && arg.name === :nothing) ||
+                        (arg isa Core.SSAValue && begin
+                            ssa_stmt = ctx.code_info.code[arg.id]
+                            ssa_stmt isa GlobalRef && ssa_stmt.name === :nothing
+                        end)
+
+        if is_nothing_arg && param_types !== nothing && arg_idx <= length(param_types)
+            # Get the parameter type from the method signature
+            param_type = param_types[arg_idx]
+            # If it's a Union with Nothing, emit ref.null for the non-Nothing type
+            if param_type isa Union
+                # Find the non-Nothing type in the union
+                non_nothing_type = nothing
+                for t in Base.uniontypes(param_type)
+                    if t !== Nothing
+                        non_nothing_type = t
+                        break
+                    end
+                end
+                if non_nothing_type !== nothing
+                    wasm_type = julia_to_wasm_type_concrete(non_nothing_type, ctx)
+                    if wasm_type isa ConcreteRef
+                        push!(bytes, Opcode.REF_NULL)
+                        append!(bytes, encode_leb128_unsigned(wasm_type.type_idx))
+                    else
+                        # Fallback to compile_value
+                        append!(bytes, compile_value(arg, ctx))
+                    end
+                else
+                    append!(bytes, compile_value(arg, ctx))
+                end
+            elseif param_type !== Nothing
+                # Parameter type is not Union but not Nothing - emit ref.null for it
+                wasm_type = julia_to_wasm_type_concrete(param_type, ctx)
+                if wasm_type isa ConcreteRef
+                    push!(bytes, Opcode.REF_NULL)
+                    append!(bytes, encode_leb128_unsigned(wasm_type.type_idx))
+                else
+                    append!(bytes, compile_value(arg, ctx))
+                end
+            else
+                # Parameter type is Nothing itself, no value needed
+                append!(bytes, compile_value(arg, ctx))
+            end
+        else
+            append!(bytes, compile_value(arg, ctx))
+        end
+    end
+
+    arg_type = length(args) > 0 ? infer_value_type(args[1], ctx) : Int64
+    is_32bit = arg_type === Int32 || arg_type === UInt32 || arg_type === Bool || arg_type === Char ||
+               arg_type === Int16 || arg_type === UInt16 || arg_type === Int8 || arg_type === UInt8 ||
+               (isprimitivetype(arg_type) && sizeof(arg_type) <= 4)
+
+    # mi was already extracted above for parameter type checking
     if mi isa Core.MethodInstance
         meth = mi.def
         if meth isa Method

@@ -5270,9 +5270,14 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
     # These must be generated BEFORE the block/loop structure.
     # ============================================================
     if loop_header > 1
-        # Track pre-loop block depth for nested conditionals
-        pre_loop_blocks = Dict{Int, Bool}()  # merge_point → is_open
+        # Track pre-loop blocks and their types:
+        # :if_end - simple if-then, emit END at this line
+        # :if_else - if-then-else, emit ELSE at this line (else branch start)
+        # :if_else_end - if-then-else, emit END at this line (merge point after else)
+        pre_loop_block_type = Dict{Int, Symbol}()  # line → type
         pre_loop_depth = 0
+        # Track which GotoNodes should be skipped (they become implicit in if-else)
+        skip_goto_at = Set{Int}()
 
         for i in 1:(loop_header - 1)
             # Skip dead code
@@ -5280,29 +5285,87 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
                 continue
             end
 
-            # Check if we need to close a pre-loop block at this merge point
-            if haskey(pre_loop_blocks, i) && pre_loop_blocks[i]
-                # Handle pre-loop phi at merge point
-                if code[i] isa Core.PhiNode && haskey(ctx.phi_locals, i)
-                    phi_stmt = code[i]::Core.PhiNode
-                    for (edge_idx, edge) in enumerate(phi_stmt.edges)
-                        edge_stmt = get(code, edge, nothing)
-                        if edge_stmt !== nothing && !(edge_stmt isa Core.GotoIfNot)
-                            val = phi_stmt.values[edge_idx]
+            stmt = code[i]
+
+            # Check if we need to emit ELSE or END at this line
+            if haskey(pre_loop_block_type, i)
+                block_type = pre_loop_block_type[i]
+
+                if block_type == :if_end
+                    # Simple if-then: close the block
+                    # Handle pre-loop phi at merge point (set then-value before END)
+                    if code[i] isa Core.PhiNode && haskey(ctx.phi_locals, i)
+                        phi_stmt = code[i]::Core.PhiNode
+                        for (edge_idx, edge) in enumerate(phi_stmt.edges)
+                            edge_stmt = get(code, edge, nothing)
+                            if edge_stmt !== nothing && !(edge_stmt isa Core.GotoIfNot)
+                                val = phi_stmt.values[edge_idx]
+                                append!(bytes, compile_value(val, ctx))
+                                local_idx = ctx.phi_locals[i]
+                                push!(bytes, Opcode.LOCAL_SET)
+                                append!(bytes, encode_leb128_unsigned(local_idx))
+                                break
+                            end
+                        end
+                    end
+                    push!(bytes, Opcode.END)
+                    delete!(pre_loop_block_type, i)
+                    pre_loop_depth -= 1
+
+                elseif block_type == :if_else
+                    # If-then-else: emit ELSE to start else branch
+                    # First, set phi value from then-branch before leaving it
+                    # Find the phi at the actual merge point
+                    for (mp, mt) in pre_loop_block_type
+                        if mt == :if_else_end && mp > i
+                            if code[mp] isa Core.PhiNode && haskey(ctx.phi_locals, mp)
+                                phi_stmt = code[mp]::Core.PhiNode
+                                # Find the then-edge (comes from before else_start)
+                                for (edge_idx, edge) in enumerate(phi_stmt.edges)
+                                    if edge < i
+                                        val = phi_stmt.values[edge_idx]
+                                        append!(bytes, compile_value(val, ctx))
+                                        local_idx = ctx.phi_locals[mp]
+                                        push!(bytes, Opcode.LOCAL_SET)
+                                        append!(bytes, encode_leb128_unsigned(local_idx))
+                                        break
+                                    end
+                                end
+                            end
+                            break
+                        end
+                    end
+                    push!(bytes, Opcode.ELSE)
+                    delete!(pre_loop_block_type, i)
+                    # Note: depth stays the same (still inside the if-else)
+
+                elseif block_type == :if_else_end
+                    # If-then-else merge point: set else-branch phi value and END
+                    if code[i] isa Core.PhiNode && haskey(ctx.phi_locals, i)
+                        phi_stmt = code[i]::Core.PhiNode
+                        # Find the else-edge: it's the edge with the LARGEST line number
+                        # (else branch comes after then branch)
+                        max_edge_idx = 0
+                        max_edge = 0
+                        for (edge_idx, edge) in enumerate(phi_stmt.edges)
+                            if edge > max_edge
+                                max_edge = edge
+                                max_edge_idx = edge_idx
+                            end
+                        end
+                        if max_edge_idx > 0
+                            val = phi_stmt.values[max_edge_idx]
                             append!(bytes, compile_value(val, ctx))
                             local_idx = ctx.phi_locals[i]
                             push!(bytes, Opcode.LOCAL_SET)
                             append!(bytes, encode_leb128_unsigned(local_idx))
-                            break
                         end
                     end
+                    push!(bytes, Opcode.END)
+                    delete!(pre_loop_block_type, i)
+                    pre_loop_depth -= 1
                 end
-                push!(bytes, Opcode.END)
-                pre_loop_blocks[i] = false
-                pre_loop_depth -= 1
             end
-
-            stmt = code[i]
 
             if stmt isa Core.PhiNode
                 # Pre-loop phi nodes - they should have been initialized
@@ -5318,70 +5381,97 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
                     # It's a pre-loop conditional with fall-through to loop
                     # We need to handle this with a block for the then-branch
 
-                    # Check if there's a pre-loop phi at the target
-                    if target < loop_header && code[target] isa Core.PhiNode && haskey(ctx.phi_locals, target)
-                        phi_stmt = code[target]::Core.PhiNode
-                        for (edge_idx, edge) in enumerate(phi_stmt.edges)
-                            if edge == i
-                                val = phi_stmt.values[edge_idx]
-                                append!(bytes, compile_value(val, ctx))
-                                local_idx = ctx.phi_locals[target]
-                                push!(bytes, Opcode.LOCAL_SET)
-                                append!(bytes, encode_leb128_unsigned(local_idx))
-                                break
-                            end
-                        end
-                    end
-
                     # Open block for the then-branch (fall-through path)
+                    # The block ends at loop_header (when we transition to loop)
                     push!(bytes, Opcode.BLOCK)
                     push!(bytes, 0x40)
-                    pre_loop_blocks[target] = true
+                    # Mark this block for closing - but since target >= loop_header,
+                    # we'll need to close it before entering the loop
+                    pre_loop_block_type[loop_header] = :if_end
                     pre_loop_depth += 1
 
-                    # Branch to target if condition is FALSE (skip then-branch)
+                    # Branch past the block if condition is FALSE (skip then-branch)
                     append!(bytes, compile_value(stmt.cond, ctx))
                     push!(bytes, Opcode.I32_EQZ)
                     push!(bytes, Opcode.BR_IF)
                     push!(bytes, 0x00)
                 elseif target > i && target < loop_header
                     # Inner pre-loop conditional (both branches before loop)
-                    # Pattern: GotoIfNot jumps to target, fall-through is then-branch
+                    # Pattern: GotoIfNot jumps to target (else-branch start), fall-through is then-branch
                     #
-                    # CRITICAL: Compile condition BEFORE the block, because:
-                    # 1. The condition value may be on the stack from previous statement
-                    # 2. BLOCK starts with empty operand stack
-                    # 3. We need the condition INSIDE the block for br_if
+                    # CRITICAL: Need to detect if-then-else-phi pattern:
+                    #   GotoIfNot → then-branch → goto merge → else-branch → goto merge → phi at merge
                     #
-                    # Solution: Use if/else structure instead of block+br_if
+                    # Check if this is if-then-else-phi pattern:
+                    # 1. Look for a goto at target-1 that jumps past target
+                    # 2. If found, that goto's target is the TRUE merge point
 
-                    # Handle pre-loop phi at target (set else-branch value)
-                    if code[target] isa Core.PhiNode && haskey(ctx.phi_locals, target)
-                        phi_stmt = code[target]::Core.PhiNode
-                        for (edge_idx, edge) in enumerate(phi_stmt.edges)
-                            if edge == i
-                                val = phi_stmt.values[edge_idx]
-                                append!(bytes, compile_value(val, ctx))
-                                local_idx = ctx.phi_locals[target]
-                                push!(bytes, Opcode.LOCAL_SET)
-                                append!(bytes, encode_leb128_unsigned(local_idx))
-                                break
+                    then_end_idx = target - 1
+                    then_end_stmt = get(code, then_end_idx, nothing)
+
+                    if then_end_stmt isa Core.GotoNode && then_end_stmt.label > target && then_end_stmt.label < loop_header
+                        # This IS if-then-else-phi pattern
+                        # then_end_stmt.label is the TRUE merge point (where phi is)
+                        merge_point = then_end_stmt.label
+                        else_start = target
+
+                        # Compile condition BEFORE any control structure
+                        append!(bytes, compile_value(stmt.cond, ctx))
+
+                        # Use IF/ELSE structure
+                        push!(bytes, Opcode.IF)
+                        push!(bytes, 0x40)  # void block type
+
+                        # Mark: when we reach else_start, emit ELSE
+                        # Mark: when we reach merge_point, emit END
+                        pre_loop_block_type[else_start] = :if_else
+                        pre_loop_block_type[merge_point] = :if_else_end
+                        pre_loop_depth += 1
+
+                        # Mark gotos at end of then-branch and else-branch to be skipped
+                        # (they become implicit in the if/else structure)
+                        push!(skip_goto_at, then_end_idx)  # goto at end of then-branch
+                        # Find goto at end of else-branch (just before merge_point)
+                        for j in (else_start):(merge_point - 1)
+                            if code[j] isa Core.GotoNode && code[j].label == merge_point
+                                push!(skip_goto_at, j)
                             end
                         end
+                    else
+                        # Simple if-then pattern (no else branch or simple merge)
+                        # Handle pre-loop phi at target (set else-branch value)
+                        if code[target] isa Core.PhiNode && haskey(ctx.phi_locals, target)
+                            phi_stmt = code[target]::Core.PhiNode
+                            for (edge_idx, edge) in enumerate(phi_stmt.edges)
+                                if edge == i
+                                    val = phi_stmt.values[edge_idx]
+                                    append!(bytes, compile_value(val, ctx))
+                                    local_idx = ctx.phi_locals[target]
+                                    push!(bytes, Opcode.LOCAL_SET)
+                                    append!(bytes, encode_leb128_unsigned(local_idx))
+                                    break
+                                end
+                            end
+                        end
+
+                        # Compile condition BEFORE any control structure
+                        append!(bytes, compile_value(stmt.cond, ctx))
+
+                        # Use if-then structure: if condition is TRUE, execute then-branch
+                        push!(bytes, Opcode.IF)
+                        push!(bytes, 0x40)  # void block type
+                        pre_loop_block_type[target] = :if_end
+                        pre_loop_depth += 1
+                        # The then-branch code follows (lines i+1 to target-1)
+                        # When we reach target, we'll emit END
                     end
-
-                    # Compile condition BEFORE any control structure
-                    append!(bytes, compile_value(stmt.cond, ctx))
-
-                    # Use if-then structure: if condition is TRUE, execute then-branch
-                    push!(bytes, Opcode.IF)
-                    push!(bytes, 0x40)  # void block type
-                    pre_loop_blocks[target] = true
-                    pre_loop_depth += 1
-                    # The then-branch code follows (lines i+1 to target-1)
-                    # When we reach target, we'll emit END
                 end
             elseif stmt isa Core.GotoNode
+                # Skip gotos that are implicit in if-else structure
+                if i in skip_goto_at
+                    continue
+                end
+
                 # Unconditional jump in pre-loop code
                 if stmt.label >= loop_header
                     # Jump to loop - becomes fall-through (we're about to enter loop)
@@ -5403,7 +5493,7 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
                         end
                     end
                     # No actual jump needed - will fall through to loop
-                elseif haskey(pre_loop_blocks, stmt.label) && pre_loop_blocks[stmt.label]
+                elseif haskey(pre_loop_block_type, stmt.label)
                     # Jump to a pre-loop merge point
                     if code[stmt.label] isa Core.PhiNode && haskey(ctx.phi_locals, stmt.label)
                         phi_stmt = code[stmt.label]::Core.PhiNode
@@ -5436,10 +5526,11 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
         end
 
         # Close any remaining pre-loop blocks
-        for (merge_point, is_open) in pre_loop_blocks
-            if is_open
-                push!(bytes, Opcode.END)
-            end
+        for (line, block_type) in pre_loop_block_type
+            # This shouldn't happen if control flow is handled correctly,
+            # but emit END for any unclosed blocks
+            push!(bytes, Opcode.END)
+            pre_loop_depth -= 1
         end
     end
 
@@ -5615,6 +5706,11 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
                     push!(bytes, Opcode.BR)
                     push!(bytes, 0x00)  # Branch to inner block
                 end
+            elseif stmt.label > back_edge_idx
+                # Jump past loop end - this is a BREAK statement
+                # Need to branch to the exit block (depth = 1 + current_depth)
+                push!(bytes, Opcode.BR)
+                push!(bytes, UInt8(1 + current_depth))  # Branch to exit block
             end
         elseif stmt isa Core.ReturnNode
             if isdefined(stmt, :val)
@@ -5680,16 +5776,65 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
     push!(bytes, Opcode.END)
 
     # Generate code AFTER the loop (statements that run after loop exits)
+    # This code may contain conditionals (GotoIfNot) that need proper handling
+    # Track blocks as a stack: each entry is a merge point
+    post_loop_block_stack = Int[]
+
     for i in (back_edge_idx + 1):length(code)
         stmt = code[i]
+
+        # Close any open blocks at this merge point
+        while !isempty(post_loop_block_stack) && post_loop_block_stack[end] == i
+            push!(bytes, Opcode.END)
+            pop!(post_loop_block_stack)
+        end
+
         if stmt isa Core.ReturnNode
             if isdefined(stmt, :val)
                 append!(bytes, compile_value(stmt.val, ctx))
             end
             push!(bytes, Opcode.RETURN)
-        elseif !(stmt === nothing)
+        elseif stmt isa Core.GotoIfNot
+            target = stmt.dest
+            # This is a conditional that jumps forward
+            # Use block + br_if pattern
+            push!(bytes, Opcode.BLOCK)
+            push!(bytes, 0x40)  # void block type
+            push!(post_loop_block_stack, target)
+
+            # Branch if condition is FALSE (skip then-branch)
+            append!(bytes, compile_value(stmt.cond, ctx))
+            push!(bytes, Opcode.I32_EQZ)
+            push!(bytes, Opcode.BR_IF)
+            push!(bytes, 0x00)
+        elseif stmt isa Core.GotoNode
+            # Unconditional forward jump - find how many blocks to close
+            # and branch to the right depth
+            depth = 0
+            for j in length(post_loop_block_stack):-1:1
+                if post_loop_block_stack[j] == stmt.label
+                    depth = length(post_loop_block_stack) - j
+                    break
+                end
+            end
+            if depth >= 0 && !isempty(post_loop_block_stack)
+                push!(bytes, Opcode.BR)
+                push!(bytes, UInt8(depth))
+            end
+        elseif stmt isa Core.PhiNode
+            # Skip phi nodes in post-loop - they're typically not used here
+            continue
+        elseif stmt === nothing
+            # Skip nothing statements
+        else
             append!(bytes, compile_statement(stmt, i, ctx))
         end
+    end
+
+    # Close any remaining open blocks
+    while !isempty(post_loop_block_stack)
+        push!(bytes, Opcode.END)
+        pop!(post_loop_block_stack)
     end
 
     return bytes

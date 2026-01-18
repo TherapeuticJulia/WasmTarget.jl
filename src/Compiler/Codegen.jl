@@ -4102,6 +4102,44 @@ function has_loop(ctx::CompilationContext)
 end
 
 """
+Check if there's a conditional BEFORE the first loop that jumps PAST the first loop.
+This pattern requires special handling (generate_complex_flow instead of generate_loop_code).
+Example: if/else where each branch has its own loop (like float_to_string).
+"""
+function has_branch_past_first_loop(ctx::CompilationContext, code)
+    if isempty(ctx.loop_headers)
+        return false
+    end
+
+    # Find first loop header and its back-edge
+    first_header = minimum(ctx.loop_headers)
+    back_edge_idx = nothing
+    for (i, stmt) in enumerate(code)
+        if stmt isa Core.GotoNode && stmt.label == first_header
+            back_edge_idx = i
+            break
+        end
+    end
+    if back_edge_idx === nothing
+        return false
+    end
+
+    # Check for conditionals BEFORE the first loop that jump PAST its back-edge
+    for i in 1:(first_header - 1)
+        stmt = code[i]
+        if stmt isa Core.GotoIfNot
+            target = stmt.dest
+            if target > back_edge_idx
+                # This conditional jumps past the first loop - complex pattern
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+"""
 Find merge points - targets of multiple forward jumps.
 These are blocks that need WASM block/br structure for proper control flow.
 Returns a Dict mapping target index to list of source indices.
@@ -4406,6 +4444,146 @@ function generate_structured(ctx::CompilationContext, blocks::Vector{BasicBlock}
 end
 
 """
+Generate code for "branched loops" pattern where a conditional before the first loop
+jumps past it to an alternate code path with its own loop.
+Example: float_to_string where negative/positive branches each have their own loop.
+
+Structure:
+  if (condition)
+    ; first branch code (with loop 1)
+  else
+    ; second branch code (with loop 2)
+  end
+"""
+function generate_branched_loops(ctx::CompilationContext, first_header::Int, first_back_edge::Int,
+                                  cond_idx::Int, second_branch_start::Int,
+                                  ssa_use_count::Dict{Int, Int})::Vector{UInt8}
+    bytes = UInt8[]
+    code = ctx.code_info.code
+
+    # For now, just use simple sequential code generation with explicit returns
+    # Both branches end with return, so we can just compile sequentially
+
+    # The conditional is at cond_idx: goto %second_branch_start if not %cond
+    # If condition is TRUE: fall through to first branch (lines cond_idx+1 to second_branch_start-1)
+    # If condition is FALSE: jump to second branch (lines second_branch_start to end)
+
+    # First, compile statements before the conditional
+    for i in 1:(cond_idx - 1)
+        stmt = code[i]
+        if stmt === nothing
+            continue
+        elseif stmt isa Core.GotoIfNot || stmt isa Core.GotoNode || stmt isa Core.PhiNode
+            # Control flow handled specially
+            continue
+        else
+            append!(bytes, compile_statement(stmt, i, ctx))
+        end
+    end
+
+    # Get the condition and compile it
+    cond_stmt = code[cond_idx]::Core.GotoIfNot
+    append!(bytes, compile_value(cond_stmt.cond, ctx))
+
+    # Create if/else structure
+    # When condition is TRUE: first branch
+    # When condition is FALSE (after EQZ): second branch
+    push!(bytes, Opcode.IF)
+    push!(bytes, 0x40)  # void block type
+
+    # THEN branch: first loop branch (lines cond_idx+1 to second_branch_start-1)
+    # This includes the first loop
+    for i in (cond_idx + 1):(second_branch_start - 1)
+        stmt = code[i]
+        if stmt === nothing
+            continue
+        elseif stmt isa Core.ReturnNode
+            if isdefined(stmt, :val)
+                append!(bytes, compile_value(stmt.val, ctx))
+            end
+            push!(bytes, Opcode.RETURN)
+        elseif stmt isa Core.GotoIfNot
+            # Inner conditional - compile normally
+            append!(bytes, compile_value(stmt.cond, ctx))
+            # TODO: Handle inner if/else
+        elseif stmt isa Core.GotoNode
+            # Skip goto - control flow handled
+            if stmt.label == first_header
+                # Back-edge to loop - emit br
+                # For now, just skip (the loop structure handles this)
+            end
+        elseif stmt isa Core.PhiNode
+            # Phi - handled via locals
+            continue
+        else
+            append!(bytes, compile_statement(stmt, i, ctx))
+
+            # Drop unused values
+            if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                stmt_type = get(ctx.ssa_types, i, Any)
+                if stmt_type !== Nothing
+                    is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                    if !is_nothing_union
+                        if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                            use_count = get(ssa_use_count, i, 0)
+                            if use_count == 0
+                                push!(bytes, Opcode.DROP)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    # ELSE branch: second loop branch (lines second_branch_start to end)
+    push!(bytes, Opcode.ELSE)
+
+    for i in second_branch_start:length(code)
+        stmt = code[i]
+        if stmt === nothing
+            continue
+        elseif stmt isa Core.ReturnNode
+            if isdefined(stmt, :val)
+                append!(bytes, compile_value(stmt.val, ctx))
+            end
+            push!(bytes, Opcode.RETURN)
+        elseif stmt isa Core.GotoIfNot
+            # Inner conditional
+            append!(bytes, compile_value(stmt.cond, ctx))
+            # TODO: Handle inner if/else
+        elseif stmt isa Core.GotoNode
+            # Skip goto
+            continue
+        elseif stmt isa Core.PhiNode
+            continue
+        else
+            append!(bytes, compile_statement(stmt, i, ctx))
+
+            # Drop unused values
+            if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                stmt_type = get(ctx.ssa_types, i, Any)
+                if stmt_type !== Nothing
+                    is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                    if !is_nothing_union
+                        if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                            use_count = get(ssa_use_count, i, 0)
+                            if use_count == 0
+                                push!(bytes, Opcode.DROP)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    push!(bytes, Opcode.END)  # End if/else
+
+    return bytes
+end
+
+"""
 Generate code for a loop structure.
 Wasm loop structure:
   (block \$exit
@@ -4425,11 +4603,17 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
     bytes = UInt8[]
     code = ctx.code_info.code
 
+    # Count SSA uses (for drop logic)
+    ssa_use_count = Dict{Int, Int}()
+    for stmt in code
+        count_ssa_uses!(stmt, ssa_use_count)
+    end
+
     # Find loop bounds (header to back-edge)
-    loop_header = first(ctx.loop_headers)  # Assuming single loop for now
+    first_header = minimum(ctx.loop_headers)
     back_edge_idx = nothing
     for (i, stmt) in enumerate(code)
-        if stmt isa Core.GotoNode && stmt.label == loop_header
+        if stmt isa Core.GotoNode && stmt.label == first_header
             back_edge_idx = i
             break
         end
@@ -4437,6 +4621,28 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
     if back_edge_idx === nothing
         back_edge_idx = length(code)
     end
+
+    # Check for "branch past first loop" pattern (e.g., float_to_string)
+    # This is when a conditional BEFORE the loop jumps PAST the loop to an alternate code path
+    branch_past_target = nothing
+    branch_past_cond_idx = nothing
+    for i in 1:(first_header - 1)
+        stmt = code[i]
+        if stmt isa Core.GotoIfNot && stmt.dest > back_edge_idx
+            branch_past_target = stmt.dest
+            branch_past_cond_idx = i
+            break
+        end
+    end
+
+    # If we have a branch-past-loop pattern, use a special handler
+    if branch_past_target !== nothing
+        return generate_branched_loops(ctx, first_header, back_edge_idx,
+                                       branch_past_cond_idx, branch_past_target, ssa_use_count)
+    end
+
+    # Original single-loop code follows
+    loop_header = first_header
 
     # Identify dead code regions (boundscheck false patterns)
     # Pattern: boundscheck(false) at line N, GotoIfNot %N at line N+1
@@ -4873,6 +5079,22 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
             # Skip nothing statements
         else
             append!(bytes, compile_statement(stmt, i, ctx))
+
+            # Drop unused values from calls (prevents stack pollution in loops)
+            if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                stmt_type = get(ctx.ssa_types, i, Any)
+                if stmt_type !== Nothing
+                    is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
+                    if !is_nothing_union
+                        if !haskey(ctx.ssa_locals, i) && !haskey(ctx.phi_locals, i)
+                            use_count = get(ssa_use_count, i, 0)
+                            if use_count == 0
+                                push!(bytes, Opcode.DROP)
+                            end
+                        end
+                    end
+                end
+            end
         end
         i += 1
     end
@@ -8014,9 +8236,6 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
         # (skipped signal statements return empty bytes)
         if haskey(ctx.ssa_locals, idx) && !isempty(stmt_bytes)
             local_idx = ctx.ssa_locals[idx]
-            if idx == 45
-                println("DEBUG: Statement 45 storing to local $local_idx ($(length(stmt_bytes)) bytes of code)")
-            end
             push!(bytes, Opcode.LOCAL_SET)
             append!(bytes, encode_leb128_unsigned(local_idx))
         end

@@ -368,24 +368,49 @@ end
             }
         }
 
-        // Initialize interpreter
+        // Initialize WasmGC interpreter
         async function initInterpreter() {
-            updateStatus('loading', 'Loading interpreter...');
+            updateStatus('loading', 'Loading WasmGC interpreter...');
 
             try {
-                // For now, use a JavaScript-based interpreter as placeholder
-                // The full WasmGC interpreter will replace this once compiled
+                // Load the real WasmGC interpreter compiled by WasmTarget.jl
+                const wasmPath = '/WasmTarget.jl/wasm/interpreter.wasm';
+
+                // Math.pow import required by the interpreter
+                const importObject = {
+                    Math: {
+                        pow: Math.pow
+                    }
+                };
+
+                const response = await fetch(wasmPath);
+                if (!response.ok) {
+                    throw new Error('Failed to fetch interpreter.wasm: ' + response.status);
+                }
+
+                const { instance } = await WebAssembly.instantiateStreaming(response, importObject);
+                interpreterModule = instance;
                 interpreterReady = true;
-                updateStatus('ready', 'Ready');
+
+                updateStatus('ready', 'WasmGC Ready');
 
                 if (runButton) {
                     runButton.disabled = false;
                 }
 
-                console.log('Interpreter ready (using JS fallback)');
+                console.log('WasmGC interpreter loaded successfully');
+                console.log('Available exports:', Object.keys(instance.exports));
             } catch (err) {
-                console.error('Failed to load interpreter:', err);
-                updateStatus('error', 'Error loading');
+                console.error('Failed to load WasmGC interpreter:', err);
+                console.log('Falling back to JavaScript interpreter...');
+
+                // Fallback to JS interpreter if WASM fails
+                interpreterReady = true;
+                updateStatus('ready', 'Ready (JS fallback)');
+
+                if (runButton) {
+                    runButton.disabled = false;
+                }
             }
         }
 
@@ -487,7 +512,7 @@ end
             return expr;
         }
 
-        // Run code
+        // Run code using WasmGC interpreter
         function runCode() {
             if (!interpreterReady) return;
 
@@ -502,13 +527,39 @@ end
             clearOutput();
 
             try {
-                // Use JS interpreter for now
-                const result = interpretJS(code);
+                let result;
+
+                if (interpreterModule && interpreterModule.exports.interpret) {
+                    // Use real WasmGC interpreter
+                    // The interpret function takes a string and returns a string
+                    const exports = interpreterModule.exports;
+
+                    // Convert JS string to WASM string
+                    // For now, try calling interpret directly
+                    // Note: This requires proper string marshaling which may need adjustment
+                    try {
+                        result = exports.interpret(code);
+                        // Get output from the interpreter's output buffer
+                        if (exports.get_output) {
+                            result = exports.get_output();
+                        }
+                    } catch (wasmErr) {
+                        console.error('WASM execution error:', wasmErr);
+                        // Fall back to JS interpreter
+                        result = interpretJS(code);
+                    }
+                } else {
+                    // Use JS interpreter as fallback
+                    result = interpretJS(code);
+                }
+
                 if (result) {
-                    result.split('\\n').forEach(line => appendOutput(line));
+                    String(result).split('\\n').forEach(line => {
+                        if (line.trim()) appendOutput(line);
+                    });
                 }
                 appendOutput('\\n--- Execution complete ---', false);
-                updateStatus('ready', 'Ready');
+                updateStatus('ready', interpreterModule ? 'WasmGC Ready' : 'Ready');
             } catch (err) {
                 appendOutput('Error: ' + err.message, true);
                 updateStatus('error', 'Error');

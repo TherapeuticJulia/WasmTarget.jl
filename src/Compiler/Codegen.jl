@@ -248,6 +248,12 @@ Get a concrete Wasm type for a Julia type, using the module and registry.
 This is used before CompilationContext is created.
 """
 function get_concrete_wasm_type(T::Type, mod::WasmModule, registry::TypeRegistry)::WasmValType
+    # Union{} (bottom type) indicates unreachable code - return void/nothing
+    if T === Union{}
+        # Return a sentinel value that will cause UNREACHABLE to be emitted
+        # For now, use i64 as a placeholder (this type won't actually be used)
+        return I64
+    end
     if is_closure_type(T)
         # Closure types are structs with captured variables
         if haskey(registry.structs, T)
@@ -399,7 +405,10 @@ function compile_function(f, arg_types::Tuple, func_name::String)::WasmModule
     end
 
     # Register return type if it's a struct/array/string
-    if is_struct_type(return_type)
+    # Skip Union{} (bottom type) which is a subtype of everything
+    if return_type === Union{}
+        # Bottom type - no registration needed
+    elseif is_struct_type(return_type)
         register_struct_type!(mod, type_registry, return_type)
     elseif return_type <: AbstractArray
         elem_type = eltype(return_type)
@@ -1210,6 +1219,8 @@ is_struct_type(::Any) = false
 Check if type is a closure (subtype of Function with captured fields).
 """
 function is_closure_type(T::Type)::Bool
+    # Union{} is bottom type - not a closure
+    T === Union{} && return false
     # Must be a subtype of Function
     !(T <: Function) && return false
     # Must have fields (captured variables)
@@ -1234,7 +1245,23 @@ function register_closure_type!(mod::WasmModule, registry::TypeRegistry, T::Data
     # Create WasmGC field types (same logic as register_struct_type)
     wasm_fields = FieldType[]
     for ft in field_types
-        if ft <: AbstractVector
+        if ft <: Vector
+            # Vector{T} is represented as a struct with (array_ref, size_tuple)
+            # Use register_vector_type! to get the struct type
+            vec_info = register_vector_type!(mod, registry, ft)
+            wasm_vt = ConcreteRef(vec_info.wasm_type_idx, true)
+        elseif ft <: AbstractVector
+            # Other AbstractVector types - use raw array
+            elem_type = eltype(ft)
+            array_type_idx = get_array_type!(mod, registry, elem_type)
+            wasm_vt = ConcreteRef(array_type_idx, true)
+        elseif ft isa DataType && (ft.name.name === :MemoryRef || ft.name.name === :GenericMemoryRef)
+            # MemoryRef{T} / GenericMemoryRef maps to array type for element T
+            elem_type = ft.name.name === :GenericMemoryRef ? ft.parameters[2] : ft.parameters[1]
+            array_type_idx = get_array_type!(mod, registry, elem_type)
+            wasm_vt = ConcreteRef(array_type_idx, true)
+        elseif ft isa DataType && (ft.name.name === :Memory || ft.name.name === :GenericMemory)
+            # Memory{T} / GenericMemory maps to array type for element T
             elem_type = eltype(ft)
             array_type_idx = get_array_type!(mod, registry, elem_type)
             wasm_vt = ConcreteRef(array_type_idx, true)
@@ -1390,6 +1417,16 @@ function _register_struct_type_impl_with_reserved!(mod::WasmModule, registry::Ty
             end
             array_type_idx = get_array_type!(mod, registry, elem_type)
             wasm_vt = ConcreteRef(array_type_idx, true)
+        elseif ft isa DataType && (ft.name.name === :MemoryRef || ft.name.name === :GenericMemoryRef)
+            # MemoryRef{T} / GenericMemoryRef maps to array type for element T
+            elem_type = ft.name.name === :GenericMemoryRef ? ft.parameters[2] : ft.parameters[1]
+            array_type_idx = get_array_type!(mod, registry, elem_type)
+            wasm_vt = ConcreteRef(array_type_idx, true)
+        elseif ft isa DataType && (ft.name.name === :Memory || ft.name.name === :GenericMemory)
+            # Memory{T} / GenericMemory maps to array type for element T
+            elem_type = eltype(ft)
+            array_type_idx = get_array_type!(mod, registry, elem_type)
+            wasm_vt = ConcreteRef(array_type_idx, true)
         elseif ft === String
             str_type_idx = get_string_array_type!(mod, registry)
             wasm_vt = ConcreteRef(str_type_idx, true)
@@ -1485,6 +1522,17 @@ function _register_struct_type_impl!(mod::WasmModule, registry::TypeRegistry, T:
             array_type_idx = get_string_ref_array_type!(mod, registry)
             wasm_vt = ConcreteRef(array_type_idx, true)  # nullable reference
         elseif ft <: AbstractVector
+            elem_type = eltype(ft)
+            array_type_idx = get_array_type!(mod, registry, elem_type)
+            wasm_vt = ConcreteRef(array_type_idx, true)  # nullable reference
+        elseif ft isa DataType && (ft.name.name === :MemoryRef || ft.name.name === :GenericMemoryRef)
+            # MemoryRef{T} / GenericMemoryRef maps to array type for element T
+            # GenericMemoryRef parameters: (atomicity, element_type, addrspace)
+            elem_type = ft.name.name === :GenericMemoryRef ? ft.parameters[2] : ft.parameters[1]
+            array_type_idx = get_array_type!(mod, registry, elem_type)
+            wasm_vt = ConcreteRef(array_type_idx, true)  # nullable reference
+        elseif ft isa DataType && (ft.name.name === :Memory || ft.name.name === :GenericMemory)
+            # Memory{T} / GenericMemory maps to array type for element T
             elem_type = eltype(ft)
             array_type_idx = get_array_type!(mod, registry, elem_type)
             wasm_vt = ConcreteRef(array_type_idx, true)  # nullable reference
@@ -1612,6 +1660,16 @@ function register_tuple_type!(mod::WasmModule, registry::TypeRegistry, T::Type{<
             ConcreteRef(type_idx, true)
         elseif ft <: AbstractVector
             # Vector field needs concrete array type
+            elem_type = eltype(ft)
+            type_idx = get_array_type!(mod, registry, elem_type)
+            ConcreteRef(type_idx, true)
+        elseif ft isa DataType && (ft.name.name === :MemoryRef || ft.name.name === :GenericMemoryRef)
+            # MemoryRef{T} / GenericMemoryRef maps to array type for element T
+            elem_type = ft.name.name === :GenericMemoryRef ? ft.parameters[2] : ft.parameters[1]
+            type_idx = get_array_type!(mod, registry, elem_type)
+            ConcreteRef(type_idx, true)
+        elseif ft isa DataType && (ft.name.name === :Memory || ft.name.name === :GenericMemory)
+            # Memory{T} / GenericMemory maps to array type for element T
             elem_type = eltype(ft)
             type_idx = get_array_type!(mod, registry, elem_type)
             ConcreteRef(type_idx, true)
@@ -4074,11 +4132,9 @@ function allocate_ssa_locals!(ctx::CompilationContext)
         if !haskey(ctx.ssa_locals, ssa_id)  # Skip phi nodes already added
             ssa_type = get(ctx.ssa_types, ssa_id, Int64)
 
-            # Skip MemoryRef types - they're "virtual" types that represent
-            # two stack values (array_ref, i32_index) and can't be stored in a single local
-            if ssa_type isa DataType && (ssa_type.name.name === :MemoryRef || ssa_type.name.name === :GenericMemoryRef)
-                continue
-            end
+            # MemoryRef types in WasmGC are just array references, so they CAN be stored in a local
+            # (They're NOT two stack values - that's only relevant for linear memory, not WasmGC)
+            # So we don't skip them anymore.
 
             # Skip Nothing type - nothing is compiled as ref.null, not i32
             # Trying to store it in an i32 local causes type errors
@@ -8691,6 +8747,7 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
         found_nested_cond = false
         found_forward_goto = nothing  # Target of unconditional forward GotoNode
         found_phi_pattern = nothing  # For && producing boolean to phi
+        found_base_closure_invoke = false  # Base closure that will emit unreachable
 
         # First, analyze what's in the then range
         for i in then_start:min(then_end, length(code))
@@ -8710,6 +8767,23 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                     found_forward_goto = target_idx
                 end
                 break
+            elseif stmt isa Expr && stmt.head === :invoke
+                # Check if this is a Base closure invoke (which will emit unreachable)
+                mi_or_ci = stmt.args[1]
+                mi = if mi_or_ci isa Core.MethodInstance
+                    mi_or_ci
+                elseif isdefined(Core, :CodeInstance) && mi_or_ci isa Core.CodeInstance
+                    mi_or_ci.def
+                else
+                    nothing
+                end
+                if mi isa Core.MethodInstance && mi.def isa Method
+                    meth = mi.def
+                    name = meth.name
+                    if meth.module === Base && startswith(string(name), "#")
+                        found_base_closure_invoke = true
+                    end
+                end
             end
         end
 
@@ -9057,10 +9131,27 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
             end
         end
 
+        # Check if then-branch ends with unreachable (Union{} typed call/invoke)
+        # This happens with Base closures that we emit UNREACHABLE for
+        then_ends_unreachable = false
+        for i in then_start:min(then_end, length(code))
+            stmt = code[i]
+            if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                stmt_type = get(ctx.ssa_types, i, Any)
+                if stmt_type === Union{}
+                    then_ends_unreachable = true
+                end
+            end
+        end
+
         # if block
         push!(inner_bytes, Opcode.IF)
         if found_forward_goto !== nothing && else_terminates
             # Both branches terminate - use void result type
+            push!(inner_bytes, 0x40)  # void block type
+        elseif then_ends_unreachable || found_base_closure_invoke
+            # Then-branch ends with unreachable - use void block type
+            # The unreachable statement doesn't produce a value, so we can't use typed result
             push!(inner_bytes, 0x40)  # void block type
         else
             append!(inner_bytes, encode_block_type(result_type))
@@ -9117,10 +9208,13 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                 elseif stmt === nothing
                     # Skip nothing statements
                 else
-                    append!(inner_bytes, compile_statement(stmt, i, ctx))
+                    stmt_bytes = compile_statement(stmt, i, ctx)
+                    append!(inner_bytes, stmt_bytes)
 
-                    # Drop unused values
-                    if stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+                    # Drop unused values (but NOT if statement emitted UNREACHABLE)
+                    # Check if the last opcode is UNREACHABLE (0x00) - if so, no value to drop
+                    ends_with_unreachable = !isempty(stmt_bytes) && stmt_bytes[end] == Opcode.UNREACHABLE
+                    if !ends_with_unreachable && stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
                         stmt_type = get(ctx.ssa_types, i, Any)
                         if stmt_type !== Nothing
                             is_nothing_union = stmt_type isa Union && Nothing in Base.uniontypes(stmt_type)
@@ -14280,15 +14374,28 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
                 # 3. Copy elements
                 # 4. Update vector.ref
 
-                # For now, emit a no-op (return the existing MemoryRef unchanged)
-                # This is safe because:
-                # - Block 2 is only entered if capacity exceeded
-                # - We emit ref.null to satisfy the return type
-                # - The code continues to block 4 which sets the element
-                # - If capacity IS exceeded at runtime, this will trap on array.set
-
-                # Emit unreachable since this code path should not be taken
-                # if the array was pre-allocated with enough capacity
+                # For now, emit unreachable since this code path should not be taken
+                # if the array was pre-allocated with enough capacity.
+                #
+                # The closure struct was created by the previous statement (a :new expression)
+                # and is still on the stack. We need to drop it before emitting unreachable
+                # so the WASM validator doesn't complain about leftover values.
+                #
+                # The func_ref (closure object) is expr.args[2], which is an SSAValue
+                # pointing to the :new statement that created the closure struct.
+                # If it's on the stack (no local allocated), drop it.
+                func_ref = expr.args[2]
+                if func_ref isa Core.SSAValue
+                    if !haskey(ctx.ssa_locals, func_ref.id) && !haskey(ctx.phi_locals, func_ref.id)
+                        # Closure is on the stack - drop it before unreachable
+                        bytes = UInt8[]  # Clear any accumulated bytes
+                        push!(bytes, Opcode.DROP)
+                    else
+                        bytes = UInt8[]  # Clear any accumulated bytes
+                    end
+                else
+                    bytes = UInt8[]  # Clear any accumulated bytes
+                end
                 push!(bytes, Opcode.UNREACHABLE)
 
             else

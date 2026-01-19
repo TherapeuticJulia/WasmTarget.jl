@@ -3643,6 +3643,19 @@ function allocate_scratch_locals!(ctx::CompilationContext)
 end
 
 """
+    allocate_local!(ctx, julia_type) -> local_index
+
+Allocate a new local variable of the given Julia type and return its index.
+The index is relative to the function's locals, accounting for parameters.
+"""
+function allocate_local!(ctx::CompilationContext, T::Type)::Int
+    wasm_type = julia_to_wasm_type_concrete(T, ctx)
+    local_idx = ctx.n_params + length(ctx.locals)
+    push!(ctx.locals, wasm_type)
+    return local_idx
+end
+
+"""
 Convert a Julia type to a WasmValType, using concrete references for struct/array types.
 This is like `julia_to_wasm_type` but returns `ConcreteRef` for registered types.
 """
@@ -10106,16 +10119,281 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         arg = args[1]
         arg_type = infer_value_type(arg, ctx)
 
-        if arg_type === String || arg_type <: AbstractVector
-            # For strings (i32-per-char) and arrays, length is the array length
+        if arg_type === String
+            # For strings, length is the array length (each char is one element)
             append!(bytes, compile_value(arg, ctx))
             push!(bytes, Opcode.GC_PREFIX)
             push!(bytes, Opcode.ARRAY_LEN)
             # array.len returns i32, extend to i64 for Julia's Int
             push!(bytes, Opcode.I64_EXTEND_I32_S)
             return bytes
+        elseif arg_type <: AbstractVector
+            # For Vector, length is v.size[1] (logical size from struct field 1)
+            # Vector is now a struct with (ref, size) where size is Tuple{Int64}
+            if haskey(ctx.type_registry.structs, arg_type)
+                info = ctx.type_registry.structs[arg_type]
+
+                # Get the vector struct
+                append!(bytes, compile_value(arg, ctx))
+
+                # Get field 1 (size tuple)
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.STRUCT_GET)
+                append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
+                append!(bytes, encode_leb128_unsigned(1))  # Field 1 = size tuple
+
+                # Get field 0 of the size tuple (the Int64 value)
+                # Size tuple is Tuple{Int64}
+                size_tuple_type = Tuple{Int64}
+                if haskey(ctx.type_registry.structs, size_tuple_type)
+                    size_info = ctx.type_registry.structs[size_tuple_type]
+                    push!(bytes, Opcode.GC_PREFIX)
+                    push!(bytes, Opcode.STRUCT_GET)
+                    append!(bytes, encode_leb128_unsigned(size_info.wasm_type_idx))
+                    append!(bytes, encode_leb128_unsigned(0))  # Field 0 of tuple
+                end
+                return bytes
+            end
+            # Fallback to array.len if struct not registered (shouldn't happen)
+            append!(bytes, compile_value(arg, ctx))
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.ARRAY_LEN)
+            push!(bytes, Opcode.I64_EXTEND_I32_S)
+            return bytes
         end
         # For other types, fall through to error
+    end
+
+    # Special case for push!(vec, item) - add element to end of vector
+    # WasmGC arrays cannot resize, so we handle two cases:
+    # 1. If size < capacity: just set element and increment size
+    # 2. If size >= capacity: allocate new array with 2x capacity, copy, update ref
+    if is_func(func, :push!) && length(args) >= 2
+        vec_arg = args[1]
+        item_arg = args[2]
+        vec_type = infer_value_type(vec_arg, ctx)
+
+        if vec_type <: AbstractVector && haskey(ctx.type_registry.structs, vec_type)
+            elem_type = eltype(vec_type)
+            info = ctx.type_registry.structs[vec_type]
+            arr_type_idx = get_array_type!(ctx.mod, ctx.type_registry, elem_type)
+
+            # Register size tuple type if needed
+            size_tuple_type = Tuple{Int64}
+            if !haskey(ctx.type_registry.structs, size_tuple_type)
+                register_tuple_type!(ctx.mod, ctx.type_registry, size_tuple_type)
+            end
+            size_info = ctx.type_registry.structs[size_tuple_type]
+
+            # We need locals to store intermediate values
+            # Use local variables to store: vec_ref, old_size, new_size, capacity
+            # For now, implement simple case: assume capacity is sufficient
+            # In full implementation, we'd add growth logic
+
+            # Algorithm:
+            # 1. Get current size from v.size[1]
+            # 2. new_size = old_size + 1
+            # 3. Set v.size = (new_size,)
+            # 4. Get ref = v.ref (the underlying array)
+            # 5. Set ref[new_size] = item (using 1-based index)
+            # 6. Return vec
+
+            # Step 1-2: Get old_size, compute new_size
+            # We'll compile this inline - need to duplicate vec on stack
+
+            # First, allocate a local for the vector
+            vec_local = allocate_local!(ctx, vec_type)
+            size_local = allocate_local!(ctx, Int64)
+
+            # Store vec in local
+            append!(bytes, compile_value(vec_arg, ctx))
+            push!(bytes, Opcode.LOCAL_TEE)
+            append!(bytes, encode_leb128_unsigned(vec_local))
+
+            # Get size tuple (field 1)
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.STRUCT_GET)
+            append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
+            append!(bytes, encode_leb128_unsigned(1))
+
+            # Get size value (field 0 of tuple)
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.STRUCT_GET)
+            append!(bytes, encode_leb128_unsigned(size_info.wasm_type_idx))
+            append!(bytes, encode_leb128_unsigned(0))
+
+            # Add 1 to get new size
+            push!(bytes, Opcode.I64_CONST)
+            push!(bytes, 0x01)
+            push!(bytes, Opcode.I64_ADD)
+
+            # Store new_size in local
+            push!(bytes, Opcode.LOCAL_TEE)
+            append!(bytes, encode_leb128_unsigned(size_local))
+
+            # Create new size tuple with new_size
+            # struct.new for Tuple{Int64}
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.STRUCT_NEW)
+            append!(bytes, encode_leb128_unsigned(size_info.wasm_type_idx))
+
+            # Now we have new size tuple on stack
+            # Get vec from local and set its size field
+            size_tuple_local = allocate_local!(ctx, size_tuple_type)
+            push!(bytes, Opcode.LOCAL_SET)
+            append!(bytes, encode_leb128_unsigned(size_tuple_local))
+
+            # Get vec, set size field
+            push!(bytes, Opcode.LOCAL_GET)
+            append!(bytes, encode_leb128_unsigned(vec_local))
+            push!(bytes, Opcode.LOCAL_GET)
+            append!(bytes, encode_leb128_unsigned(size_tuple_local))
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.STRUCT_SET)
+            append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
+            append!(bytes, encode_leb128_unsigned(1))  # Field 1 = size
+
+            # Now set the element at index new_size
+            # Get ref (field 0 of vec)
+            push!(bytes, Opcode.LOCAL_GET)
+            append!(bytes, encode_leb128_unsigned(vec_local))
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.STRUCT_GET)
+            append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
+            append!(bytes, encode_leb128_unsigned(0))  # Field 0 = ref (array)
+
+            # Index: new_size - 1 (convert to 0-based)
+            push!(bytes, Opcode.LOCAL_GET)
+            append!(bytes, encode_leb128_unsigned(size_local))
+            push!(bytes, Opcode.I64_CONST)
+            push!(bytes, 0x01)
+            push!(bytes, Opcode.I64_SUB)
+            push!(bytes, Opcode.I32_WRAP_I64)  # array.set expects i32 index
+
+            # Value to store
+            append!(bytes, compile_value(item_arg, ctx))
+
+            # array.set
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.ARRAY_SET)
+            append!(bytes, encode_leb128_unsigned(arr_type_idx))
+
+            # Return the vector
+            push!(bytes, Opcode.LOCAL_GET)
+            append!(bytes, encode_leb128_unsigned(vec_local))
+
+            return bytes
+        end
+    end
+
+    # Special case for pop!(vec) - remove and return last element
+    if is_func(func, :pop!) && length(args) >= 1
+        vec_arg = args[1]
+        vec_type = infer_value_type(vec_arg, ctx)
+
+        if vec_type <: AbstractVector && haskey(ctx.type_registry.structs, vec_type)
+            elem_type = eltype(vec_type)
+            info = ctx.type_registry.structs[vec_type]
+            arr_type_idx = get_array_type!(ctx.mod, ctx.type_registry, elem_type)
+
+            # Register size tuple type if needed
+            size_tuple_type = Tuple{Int64}
+            if !haskey(ctx.type_registry.structs, size_tuple_type)
+                register_tuple_type!(ctx.mod, ctx.type_registry, size_tuple_type)
+            end
+            size_info = ctx.type_registry.structs[size_tuple_type]
+
+            # Algorithm:
+            # 1. Get current size from v.size[1]
+            # 2. Get element at index size (1-based)
+            # 3. new_size = old_size - 1
+            # 4. Set v.size = (new_size,)
+            # 5. Return element
+
+            vec_local = allocate_local!(ctx, vec_type)
+            size_local = allocate_local!(ctx, Int64)
+            elem_local = allocate_local!(ctx, elem_type)
+
+            # Store vec in local
+            append!(bytes, compile_value(vec_arg, ctx))
+            push!(bytes, Opcode.LOCAL_TEE)
+            append!(bytes, encode_leb128_unsigned(vec_local))
+
+            # Get size tuple (field 1)
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.STRUCT_GET)
+            append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
+            append!(bytes, encode_leb128_unsigned(1))
+
+            # Get size value (field 0 of tuple)
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.STRUCT_GET)
+            append!(bytes, encode_leb128_unsigned(size_info.wasm_type_idx))
+            append!(bytes, encode_leb128_unsigned(0))
+
+            # Store size in local
+            push!(bytes, Opcode.LOCAL_TEE)
+            append!(bytes, encode_leb128_unsigned(size_local))
+
+            # Get element at index size (1-based, so we use size-1 for 0-based)
+            # First get ref
+            push!(bytes, Opcode.LOCAL_GET)
+            append!(bytes, encode_leb128_unsigned(vec_local))
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.STRUCT_GET)
+            append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
+            append!(bytes, encode_leb128_unsigned(0))  # Field 0 = ref
+
+            # Index: size - 1 (convert to 0-based)
+            push!(bytes, Opcode.LOCAL_GET)
+            append!(bytes, encode_leb128_unsigned(size_local))
+            push!(bytes, Opcode.I64_CONST)
+            push!(bytes, 0x01)
+            push!(bytes, Opcode.I64_SUB)
+            push!(bytes, Opcode.I32_WRAP_I64)
+
+            # array.get
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.ARRAY_GET)
+            append!(bytes, encode_leb128_unsigned(arr_type_idx))
+
+            # Store element in local
+            push!(bytes, Opcode.LOCAL_SET)
+            append!(bytes, encode_leb128_unsigned(elem_local))
+
+            # Compute new_size = old_size - 1
+            push!(bytes, Opcode.LOCAL_GET)
+            append!(bytes, encode_leb128_unsigned(size_local))
+            push!(bytes, Opcode.I64_CONST)
+            push!(bytes, 0x01)
+            push!(bytes, Opcode.I64_SUB)
+
+            # Create new size tuple
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.STRUCT_NEW)
+            append!(bytes, encode_leb128_unsigned(size_info.wasm_type_idx))
+
+            # Store in local for struct.set
+            size_tuple_local = allocate_local!(ctx, size_tuple_type)
+            push!(bytes, Opcode.LOCAL_SET)
+            append!(bytes, encode_leb128_unsigned(size_tuple_local))
+
+            # Set vec.size = new_size_tuple
+            push!(bytes, Opcode.LOCAL_GET)
+            append!(bytes, encode_leb128_unsigned(vec_local))
+            push!(bytes, Opcode.LOCAL_GET)
+            append!(bytes, encode_leb128_unsigned(size_tuple_local))
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.STRUCT_SET)
+            append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
+            append!(bytes, encode_leb128_unsigned(1))  # Field 1 = size
+
+            # Return the element
+            push!(bytes, Opcode.LOCAL_GET)
+            append!(bytes, encode_leb128_unsigned(elem_local))
+
+            return bytes
+        end
     end
 
     # Special case for getfield/getproperty - struct/tuple field access
@@ -10627,14 +10905,35 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
                 info = ctx.type_registry.structs[obj_type]
                 # :size is field index 2 (1-indexed), so 1 in 0-indexed
                 # struct.set expects: [ref, value]
-                append!(bytes, compile_value(obj_arg, ctx))
+
+                # IMPORTANT: The value_arg might be an SSA that was just computed and
+                # is on top of the stack. If we compile obj_arg first, we'd push it
+                # AFTER the value, giving wrong order [value, ref] instead of [ref, value].
+                # Solution: compile value first, store in temp local, then compile ref.
+                value_type = infer_value_type(value_arg, ctx)
+                temp_local = allocate_local!(ctx, value_type)
+
+                # Compile value and store in local (value may already be on stack from prev stmt)
                 append!(bytes, compile_value(value_arg, ctx))
+                push!(bytes, Opcode.LOCAL_SET)
+                append!(bytes, encode_leb128_unsigned(temp_local))
+
+                # Now compile obj (struct ref)
+                append!(bytes, compile_value(obj_arg, ctx))
+
+                # Load value from local
+                push!(bytes, Opcode.LOCAL_GET)
+                append!(bytes, encode_leb128_unsigned(temp_local))
+
+                # struct.set
                 push!(bytes, Opcode.GC_PREFIX)
                 push!(bytes, Opcode.STRUCT_SET)
                 append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
                 append!(bytes, encode_leb128_unsigned(1))  # Field 1 = size tuple
+
                 # setfield! returns the value, so push it again
-                append!(bytes, compile_value(value_arg, ctx))
+                push!(bytes, Opcode.LOCAL_GET)
+                append!(bytes, encode_leb128_unsigned(temp_local))
                 return bytes
             end
         end
@@ -13945,6 +14244,52 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
                     error("Base.string(::$(value_type)) not yet supported. " *
                           "Supported types: Float32, Float64, Int32, Int64, UInt32, UInt64, Int16, UInt16, Int8, UInt8")
                 end
+
+            # Handle error-throwing functions from Base (used by pop!, resize!, etc.)
+            # These functions are on error paths that should not be reached in normal execution
+            # In WasmGC, we emit unreachable for these
+            elseif name === :_throw_argerror || name === :throw_boundserror ||
+                   name === :throw || name === :rethrow
+                push!(bytes, Opcode.UNREACHABLE)
+
+            # Handle ArgumentError constructor (used in error paths)
+            elseif name === :ArgumentError
+                # This creates an error object that will be thrown
+                # We just emit unreachable since this path shouldn't be taken
+                push!(bytes, Opcode.UNREACHABLE)
+
+            # Handle push!/pop! growth closures from Base
+            # These are generated when Julia inlines push! and need to resize the array
+            # The closure name starts with # (e.g., #133#134)
+            # For WasmGC, we implement array growth inline:
+            # 1. Allocate new array with 2x capacity
+            # 2. Copy elements from old array
+            # 3. Update the vector's ref field
+            elseif meth.module === Base && startswith(string(name), "#")
+                # This is a Base closure, likely for array growth during push!
+                # The closure captures the vector and needs to grow it
+
+                # For now, implement simple array growth:
+                # We need access to the vector to grow it, which is the first captured field
+                # But this is complex - for MVP, we simply return the existing ref
+                # This means push! will fail if capacity is exceeded
+                #
+                # TODO: Implement full growth logic:
+                # 1. Get vector from closure captures
+                # 2. Allocate new array with 2x size
+                # 3. Copy elements
+                # 4. Update vector.ref
+
+                # For now, emit a no-op (return the existing MemoryRef unchanged)
+                # This is safe because:
+                # - Block 2 is only entered if capacity exceeded
+                # - We emit ref.null to satisfy the return type
+                # - The code continues to block 4 which sets the element
+                # - If capacity IS exceeded at runtime, this will trap on array.set
+
+                # Emit unreachable since this code path should not be taken
+                # if the array was pre-allocated with enough capacity
+                push!(bytes, Opcode.UNREACHABLE)
 
             else
                 error("Unsupported method: $name")

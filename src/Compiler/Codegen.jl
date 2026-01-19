@@ -14687,7 +14687,8 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
             # These functions are on error paths that should not be reached in normal execution
             # In WasmGC, we emit unreachable for these
             elseif name === :_throw_argerror || name === :throw_boundserror ||
-                   name === :throw || name === :rethrow
+                   name === :throw || name === :rethrow ||
+                   name === :_throw_not_readable || name === :_throw_not_writable
                 push!(bytes, Opcode.UNREACHABLE)
 
             # Handle ArgumentError constructor (used in error paths)

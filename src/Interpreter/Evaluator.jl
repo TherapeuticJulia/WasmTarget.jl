@@ -527,28 +527,8 @@ end
     return "<unknown>"
 end
 
-# Note: int_to_string and digit_to_str are now defined in Runtime/StringOps.jl
-# They are exported and available as WasmTarget.int_to_string
-
-"""Convert Float32 to string (simplified)."""
-@noinline function float_to_string(f::Float32)::String
-    # Simple implementation: convert integer part and one decimal place
-    negative = f < Float32(0.0)
-    if negative
-        f = -f
-    end
-
-    int_part = Int32(floor(f))
-    frac_part = Int32(round((f - Float32(int_part)) * Float32(10.0)))
-
-    int_str = int_to_string(int_part)
-    frac_str = int_to_string(frac_part)
-
-    if negative
-        return "-" * int_str * "." * frac_str
-    end
-    return int_str * "." * frac_str
-end
+# Note: int_to_string, digit_to_str, and float_to_string are now defined in Runtime/StringOps.jl
+# They are exported and available as WasmTarget.int_to_string, WasmTarget.float_to_string
 
 # ============================================================================
 # Expression Evaluation

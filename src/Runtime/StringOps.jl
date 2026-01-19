@@ -6,7 +6,7 @@
 
 export str_char, str_setchar!, str_len, str_new, str_copy, str_substr, str_eq, str_hash,
        str_contains, str_find, str_uppercase, str_lowercase, str_trim, str_startswith, str_endswith,
-       digit_to_str, int_to_string
+       digit_to_str, int_to_string, float_to_string
 
 """
     str_char(s::String, i::Int)::Int32
@@ -530,4 +530,58 @@ int_to_string(Int32(0))      # Returns "0"
     end
 
     return result
+end
+
+"""
+    float_to_string(f::Float32)::String
+
+Convert a Float32 to its string representation.
+Handles positive, negative, and zero values.
+Shows one decimal place for simplicity.
+
+This function is designed to work in both Julia and compile to WASM.
+
+# Example
+```julia
+float_to_string(Float32(3.14))   # Returns "3.1"
+float_to_string(Float32(-2.5))   # Returns "-2.5"
+float_to_string(Float32(0.0))    # Returns "0.0"
+```
+"""
+@noinline function float_to_string(f::Float32)::String
+    # Handle negative
+    negative = f < Float32(0.0)
+    if negative
+        f = -f
+    end
+
+    # Get integer part
+    int_part = Int32(floor(f))
+
+    # Get fractional part (one decimal place)
+    frac_part = Int32(round((f - Float32(int_part)) * Float32(10.0)))
+
+    # Handle rounding that causes frac_part to be 10
+    if frac_part >= Int32(10)
+        frac_part = Int32(0)
+        int_part = int_part + Int32(1)
+    end
+
+    int_str = int_to_string(int_part)
+    frac_str = int_to_string(frac_part)
+
+    if negative
+        return "-" * int_str * "." * frac_str
+    end
+    return int_str * "." * frac_str
+end
+
+"""
+    float_to_string(f::Float64)::String
+
+Convert a Float64 to its string representation.
+Converts to Float32 internally for simplicity.
+"""
+@noinline function float_to_string(f::Float64)::String
+    return float_to_string(Float32(f))
 end

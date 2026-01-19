@@ -560,22 +560,30 @@ end
 Check if a GlobalRef is a WasmTarget runtime function and add it if needed.
 """
 function check_and_add_runtime_func!(ref::GlobalRef, seen_funcs::Set, to_add::Vector, to_scan::Vector)
-    # Check if this is a WasmTarget module function
-    if ref.mod !== WasmTarget
+    # Get the actual function first - this handles cases where the function
+    # is imported into another module (e.g., Main.str_eq when using WasmTarget)
+    func = try
+        getfield(ref.mod, ref.name)
+    catch
+        return  # Can't get function
+    end
+
+    # Skip if not a function
+    if !isa(func, Function)
+        return
+    end
+
+    # Check if this function belongs to WasmTarget (by checking its parent module)
+    # This handles both WasmTarget.str_eq and imported str_eq (which becomes Main.str_eq)
+    if parentmodule(func) !== WasmTarget
         return
     end
 
     # Check if this is a known runtime function
-    if ref.name in WASMTARGET_RUNTIME_FUNCTIONS
-        # Get the actual function
-        func = try
-            getfield(ref.mod, ref.name)
-        catch
-            return  # Can't get function
-        end
-
+    func_name = nameof(func)
+    if func_name in WASMTARGET_RUNTIME_FUNCTIONS
         # Determine argument types based on the function name
-        arg_types = infer_runtime_func_arg_types(ref.name)
+        arg_types = infer_runtime_func_arg_types(func_name)
         if arg_types === nothing
             return  # Can't infer types
         end
@@ -588,7 +596,7 @@ function check_and_add_runtime_func!(ref::GlobalRef, seen_funcs::Set, to_add::Ve
 
         # Add to seen and to_add
         push!(seen_funcs, key)
-        name = string(ref.name)
+        name = string(func_name)
         entry = (func, arg_types, name)
         push!(to_add, entry)
         push!(to_scan, entry)  # Also scan this function for its deps

@@ -1408,9 +1408,19 @@ function _register_struct_type_impl_with_reserved!(mod::WasmModule, registry::Ty
     wasm_fields = FieldType[]
     for ft in field_types
         if ft === Vector{String}
-            array_type_idx = get_string_ref_array_type!(mod, registry)
-            wasm_vt = ConcreteRef(array_type_idx, true)
+            # Vector{String} is a struct with (array-of-string-refs, size tuple)
+            info = register_vector_type!(mod, registry, ft)
+            wasm_vt = ConcreteRef(info.wasm_type_idx, true)
+        elseif ft <: AbstractVector && ft isa DataType
+            # Vector{T} is a struct with (ref, size) fields
+            elem_type = eltype(ft)
+            if !haskey(_registering_types, elem_type) && isconcretetype(elem_type) && isstructtype(elem_type)
+                register_struct_type!(mod, registry, elem_type)
+            end
+            info = register_vector_type!(mod, registry, ft)
+            wasm_vt = ConcreteRef(info.wasm_type_idx, true)
         elseif ft <: AbstractVector
+            # Generic AbstractVector - use raw array
             elem_type = eltype(ft)
             if !haskey(_registering_types, elem_type) && isconcretetype(elem_type) && isstructtype(elem_type)
                 register_struct_type!(mod, registry, elem_type)
@@ -1447,7 +1457,16 @@ function _register_struct_type_impl_with_reserved!(mod::WasmModule, registry::Ty
         elseif ft isa Union
             inner_type = get_nullable_inner_type(ft)
             if inner_type !== nothing
-                if inner_type <: AbstractVector
+                if inner_type <: AbstractVector && inner_type isa DataType
+                    # Union{Nothing, Vector{T}} - use Vector struct type
+                    elem_type = eltype(inner_type)
+                    if !haskey(_registering_types, elem_type) && isconcretetype(elem_type) && isstructtype(elem_type)
+                        register_struct_type!(mod, registry, elem_type)
+                    end
+                    info = register_vector_type!(mod, registry, inner_type)
+                    wasm_vt = ConcreteRef(info.wasm_type_idx, true)
+                elseif inner_type <: AbstractVector
+                    # Generic AbstractVector - use raw array
                     elem_type = eltype(inner_type)
                     if !haskey(_registering_types, elem_type) && isconcretetype(elem_type) && isstructtype(elem_type)
                         register_struct_type!(mod, registry, elem_type)
@@ -1517,11 +1536,20 @@ function _register_struct_type_impl!(mod::WasmModule, registry::TypeRegistry, T:
     wasm_fields = FieldType[]
     for ft in field_types
         # For array fields, use concrete reference to registered array type
+        # But for Vector{T}, use the Vector struct type (with ref and size fields)
+        # since Vector in Julia 1.11+ is a struct, not a raw array
         if ft === Vector{String}
-            # Special case: Vector{String} is array of string refs
-            array_type_idx = get_string_ref_array_type!(mod, registry)
-            wasm_vt = ConcreteRef(array_type_idx, true)  # nullable reference
+            # Special case: Vector{String} is a struct with array-of-string-refs + size tuple
+            # Register as Vector struct type
+            info = register_vector_type!(mod, registry, ft)
+            wasm_vt = ConcreteRef(info.wasm_type_idx, true)
+        elseif ft <: AbstractVector && ft isa DataType
+            # Vector{T} is now a struct with (ref, size) fields
+            # Register it as a Vector struct type, not a raw array
+            info = register_vector_type!(mod, registry, ft)
+            wasm_vt = ConcreteRef(info.wasm_type_idx, true)
         elseif ft <: AbstractVector
+            # Generic AbstractVector without concrete type - use raw array
             elem_type = eltype(ft)
             array_type_idx = get_array_type!(mod, registry, elem_type)
             wasm_vt = ConcreteRef(array_type_idx, true)  # nullable reference
@@ -1568,8 +1596,17 @@ function _register_struct_type_impl!(mod::WasmModule, registry::TypeRegistry, T:
             inner_type = get_nullable_inner_type(ft)
             if inner_type !== nothing
                 # Union{Nothing, T} as nullable reference to T
-                if inner_type <: AbstractVector
-                    # Union{Nothing, Vector{...}} - nullable array ref
+                if inner_type <: AbstractVector && inner_type isa DataType
+                    # Union{Nothing, Vector{T}} - use Vector struct type
+                    elem_type = eltype(inner_type)
+                    # For non-recursive types, register the element type first
+                    if !haskey(_registering_types, elem_type) && isconcretetype(elem_type) && isstructtype(elem_type)
+                        register_struct_type!(mod, registry, elem_type)
+                    end
+                    info = register_vector_type!(mod, registry, inner_type)
+                    wasm_vt = ConcreteRef(info.wasm_type_idx, true)  # nullable
+                elseif inner_type <: AbstractVector
+                    # Union{Nothing, generic AbstractVector} - use raw array
                     elem_type = eltype(inner_type)
                     # For non-recursive types, register the element type first
                     if !haskey(_registering_types, elem_type) && isconcretetype(elem_type) && isstructtype(elem_type)

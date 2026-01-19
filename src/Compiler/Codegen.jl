@@ -286,16 +286,15 @@ function get_concrete_wasm_type(T::Type, mod::WasmModule, registry::TypeRegistry
         end
         return StructRef
     elseif T <: AbstractArray  # Handles Vector, Matrix, and higher-dim arrays
-        # 1D arrays (Vector) are stored as plain WasmGC arrays
-        # Multi-dim arrays (Matrix, etc.) are stored as structs with data + size
+        # Both Vector and Matrix are stored as structs with (ref, size) fields
+        # This allows setfield!(v, :size, ...) for push!/resize! operations
         if T <: AbstractVector
-            elem_type = eltype(T)
-            if haskey(registry.arrays, elem_type)
-                type_idx = registry.arrays[elem_type]
-                return ConcreteRef(type_idx, true)
+            if haskey(registry.structs, T)
+                info = registry.structs[T]
+                return ConcreteRef(info.wasm_type_idx, true)
             else
-                type_idx = get_array_type!(mod, registry, elem_type)
-                return ConcreteRef(type_idx, true)
+                info = register_vector_type!(mod, registry, T)
+                return ConcreteRef(info.wasm_type_idx, true)
             end
         else
             # Matrix and higher-dim arrays: register as struct
@@ -869,8 +868,8 @@ function compile_module(functions::Vector)::WasmModule
             elseif is_struct_type(T)
                 register_struct_type!(mod, type_registry, T)
             elseif T <: AbstractVector
-                elem_type = eltype(T)
-                get_array_type!(mod, type_registry, elem_type)
+                # Vector is now a struct with (ref, size) for setfield! support
+                register_vector_type!(mod, type_registry, T)
             elseif T <: AbstractArray
                 # Multi-dimensional arrays (Matrix, etc.) - register as struct
                 register_matrix_type!(mod, type_registry, T)
@@ -885,8 +884,8 @@ function compile_module(functions::Vector)::WasmModule
         elseif is_struct_type(return_type)
             register_struct_type!(mod, type_registry, return_type)
         elseif return_type <: AbstractVector
-            elem_type = eltype(return_type)
-            get_array_type!(mod, type_registry, elem_type)
+            # Vector is now a struct with (ref, size) for setfield! support
+            register_vector_type!(mod, type_registry, return_type)
         elseif return_type <: AbstractArray
             # Multi-dimensional arrays (Matrix, etc.) - register as struct
             register_matrix_type!(mod, type_registry, return_type)
@@ -1684,6 +1683,54 @@ function register_matrix_type!(mod::WasmModule, registry::TypeRegistry, T::Type)
     # Record mapping with field info
     field_names = [:ref, :size]  # Julia field names
     field_types_vec = DataType[Array{elem_type, 1}, size_tuple_type]  # Use Vector for ref field type
+
+    info = StructInfo(T, type_idx, field_names, field_types_vec)
+    registry.structs[T] = info
+
+    return info
+end
+
+"""
+Register a Vector{T} type as a WasmGC struct with mutable size.
+
+Vectors are stored as WasmGC structs with two fields:
+- Field 0: ref (reference to WasmGC array of element type)
+- Field 1: size (mutable Tuple{Int64} tracking logical size)
+
+This matches Julia's internal representation where Vector{T} has :ref and :size fields.
+The size field is mutable to support setfield!(v, :size, (n,)) for push!/resize! operations.
+"""
+function register_vector_type!(mod::WasmModule, registry::TypeRegistry, T::Type)
+    # Already registered?
+    haskey(registry.structs, T) && return registry.structs[T]
+
+    # Get element type
+    elem_type = eltype(T)
+
+    # Create size tuple type (Tuple{Int64} for 1D)
+    size_tuple_type = Tuple{Int64}
+    if !haskey(registry.structs, size_tuple_type)
+        register_tuple_type!(mod, registry, size_tuple_type)
+    end
+    size_struct_info = registry.structs[size_tuple_type]
+
+    # Create/get the data array type
+    data_array_idx = get_array_type!(mod, registry, elem_type)
+
+    # Create WasmGC struct with two fields:
+    # - Field 0: ref (reference to data array)
+    # - Field 1: size (MUTABLE reference to size tuple struct)
+    wasm_fields = [
+        FieldType(ConcreteRef(data_array_idx, true), true),  # data array, mutable
+        FieldType(ConcreteRef(size_struct_info.wasm_type_idx, true), true)  # size, MUTABLE for setfield!
+    ]
+
+    # Add struct type to module
+    type_idx = add_struct_type!(mod, wasm_fields)
+
+    # Record mapping with field info
+    field_names = [:ref, :size]  # Julia field names
+    field_types_vec = DataType[Array{elem_type, 1}, size_tuple_type]
 
     info = StructInfo(T, type_idx, field_names, field_types_vec)
     registry.structs[T] = info
@@ -4129,7 +4176,7 @@ Check if a statement is a passthrough that doesn't emit bytecode but relies on
 a value already being on the stack from an earlier SSA.
 Examples:
 - memoryrefnew(memory) - just passes through the array reference
-- %new(Vector{T}, memref, ...) - just passes through the memref which is the array
+Note: Vector{T} is NO LONGER a passthrough - it's now a struct with (ref, size) fields.
 """
 function is_passthrough_statement(stmt, ctx::CompilationContext)
     if !(stmt isa Expr)
@@ -4147,20 +4194,8 @@ function is_passthrough_statement(stmt, ctx::CompilationContext)
         end
     end
 
-    # Check for Vector %new (passthrough to the underlying array)
-    if stmt.head === :new
-        struct_type_ref = stmt.args[1]
-        struct_type = if struct_type_ref isa GlobalRef
-            try getfield(struct_type_ref.mod, struct_type_ref.name) catch; nothing end
-        elseif struct_type_ref isa DataType
-            struct_type_ref
-        else
-            nothing
-        end
-        if struct_type !== nothing && struct_type <: AbstractVector
-            return true
-        end
-    end
+    # Note: Vector %new is NO LONGER a passthrough
+    # Vector{T} is now a struct with (ref, size) fields for setfield! support
 
     return false
 end
@@ -9376,14 +9411,46 @@ function compile_new(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt
     end
 
     # Special case: Vector{T} construction
-    # In WasmGC, Vector IS just the underlying WasmGC array
-    # The %new(Vector{T}, memref, size_tuple) just needs to return the array
-    # that was created by the foreigncall :jl_alloc_genericmemory
+    # Vector is now a struct with (ref, size) fields to support setfield!(v, :size, ...)
+    # The %new(Vector{T}, memref, size_tuple) creates a struct with both fields
     if struct_type <: AbstractVector && length(field_values) >= 1
         # field_values[1] is the MemoryRef (which is actually our array)
-        # field_values[2] is the size tuple (ignored in WasmGC, array already has length)
-        # Just compile the first value (the array reference) and return it
+        # field_values[2] is the size tuple (Tuple{Int64})
+
+        # Register the vector type if not already done
+        if !haskey(ctx.type_registry.structs, struct_type)
+            register_vector_type!(ctx.mod, ctx.type_registry, struct_type)
+        end
+        vec_info = ctx.type_registry.structs[struct_type]
+
+        # Compile field 0: the array reference (from MemoryRef)
         append!(bytes, compile_value(field_values[1], ctx))
+
+        # Compile field 1: the size tuple
+        if length(field_values) >= 2
+            append!(bytes, compile_value(field_values[2], ctx))
+        else
+            # No size provided - get array length and create tuple
+            # Push array ref again for array.len
+            append!(bytes, compile_value(field_values[1], ctx))
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.ARRAY_LEN)
+            push!(bytes, Opcode.I64_EXTEND_I32_S)
+            # Create Tuple{Int64} struct
+            size_tuple_type = Tuple{Int64}
+            if !haskey(ctx.type_registry.structs, size_tuple_type)
+                register_tuple_type!(ctx.mod, ctx.type_registry, size_tuple_type)
+            end
+            size_info = ctx.type_registry.structs[size_tuple_type]
+            push!(bytes, Opcode.GC_PREFIX)
+            push!(bytes, Opcode.STRUCT_NEW)
+            append!(bytes, encode_leb128_unsigned(size_info.wasm_type_idx))
+        end
+
+        # Create the Vector struct
+        push!(bytes, Opcode.GC_PREFIX)
+        push!(bytes, Opcode.STRUCT_NEW)
+        append!(bytes, encode_leb128_unsigned(vec_info.wasm_type_idx))
         return bytes
     end
 
@@ -10103,6 +10170,7 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         end
 
         # Handle Array field access (:ref and :size) - works for Vector, Matrix, etc.
+        # Both Vector and Matrix are now structs with (ref, size) fields
         if obj_type <: AbstractArray
             field_sym = if field_ref isa QuoteNode
                 field_ref.value
@@ -10111,71 +10179,28 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
             end
 
             if field_sym === :ref
-                # :ref returns the underlying array reference
-                if obj_type <: AbstractVector
-                    # Vector: the array IS the data, just return it
-                    append!(bytes, compile_value(obj_arg, ctx))
-                    return bytes
-                else
-                    # Matrix/higher-dim: struct field 0 is the data array
-                    append!(bytes, compile_value(obj_arg, ctx))
-                    push!(bytes, Opcode.GC_PREFIX)
-                    push!(bytes, Opcode.STRUCT_GET)
-                    # Get the matrix struct type
-                    if haskey(ctx.type_registry.structs, obj_type)
-                        info = ctx.type_registry.structs[obj_type]
-                        append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
-                        append!(bytes, encode_leb128_unsigned(0))  # Field 0 = data array
-                    end
-                    return bytes
+                # :ref returns the underlying array reference (field 0 of struct)
+                append!(bytes, compile_value(obj_arg, ctx))
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.STRUCT_GET)
+                if haskey(ctx.type_registry.structs, obj_type)
+                    info = ctx.type_registry.structs[obj_type]
+                    append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
+                    append!(bytes, encode_leb128_unsigned(0))  # Field 0 = data array
                 end
+                return bytes
             elseif field_sym === :size
-                # :size returns a Tuple containing the dimensions
+                # :size returns a Tuple containing the dimensions (field 1 of struct)
                 # For Vector: Tuple{Int64}, for Matrix: Tuple{Int64, Int64}, etc.
-
-                # Determine the size tuple type based on array dimensionality
-                if obj_type <: AbstractVector
-                    size_tuple_type = Tuple{Int64}
-                elseif obj_type <: AbstractMatrix
-                    size_tuple_type = Tuple{Int64, Int64}
-                else
-                    # General N-dimensional array - extract N from type
-                    N = ndims(obj_type)
-                    size_tuple_type = NTuple{N, Int64}
+                append!(bytes, compile_value(obj_arg, ctx))
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.STRUCT_GET)
+                if haskey(ctx.type_registry.structs, obj_type)
+                    info = ctx.type_registry.structs[obj_type]
+                    append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
+                    append!(bytes, encode_leb128_unsigned(1))  # Field 1 = size tuple
                 end
-
-                # Register the size tuple type if needed
-                if !haskey(ctx.type_registry.structs, size_tuple_type)
-                    register_tuple_type!(ctx.mod, ctx.type_registry, size_tuple_type)
-                end
-
-                # For Vector (1D): array.len -> extend to i64 -> struct.new
-                if obj_type <: AbstractVector
-                    append!(bytes, compile_value(obj_arg, ctx))
-                    push!(bytes, Opcode.GC_PREFIX)
-                    push!(bytes, Opcode.ARRAY_LEN)
-                    push!(bytes, Opcode.I64_EXTEND_I32_S)
-
-                    if haskey(ctx.type_registry.structs, size_tuple_type)
-                        info = ctx.type_registry.structs[size_tuple_type]
-                        push!(bytes, Opcode.GC_PREFIX)
-                        push!(bytes, Opcode.STRUCT_NEW)
-                        append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
-                    end
-                    return bytes
-                else
-                    # Matrix/higher-dim: struct field 1 is the size tuple
-                    append!(bytes, compile_value(obj_arg, ctx))
-                    push!(bytes, Opcode.GC_PREFIX)
-                    push!(bytes, Opcode.STRUCT_GET)
-                    # Get the matrix struct type
-                    if haskey(ctx.type_registry.structs, obj_type)
-                        info = ctx.type_registry.structs[obj_type]
-                        append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
-                        append!(bytes, encode_leb128_unsigned(1))  # Field 1 = size tuple
-                    end
-                    return bytes
-                end
+                return bytes
             end
         end
 
@@ -10591,6 +10616,26 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
                     append!(bytes, compile_value(value_arg, ctx))
                     return bytes
                 end
+            end
+        end
+
+        # Handle Vector/Array field assignment (:size is mutable for push!/resize!)
+        # Vector{T} is now a struct with (ref, size) where size is mutable
+        if obj_type <: AbstractArray
+            field_sym = field_ref isa QuoteNode ? field_ref.value : field_ref
+            if field_sym === :size && haskey(ctx.type_registry.structs, obj_type)
+                info = ctx.type_registry.structs[obj_type]
+                # :size is field index 2 (1-indexed), so 1 in 0-indexed
+                # struct.set expects: [ref, value]
+                append!(bytes, compile_value(obj_arg, ctx))
+                append!(bytes, compile_value(value_arg, ctx))
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.STRUCT_SET)
+                append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
+                append!(bytes, encode_leb128_unsigned(1))  # Field 1 = size tuple
+                # setfield! returns the value, so push it again
+                append!(bytes, compile_value(value_arg, ctx))
+                return bytes
             end
         end
 

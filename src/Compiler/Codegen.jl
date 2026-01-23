@@ -7262,7 +7262,41 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                                 phi_local_type = ctx.locals[local_idx - ctx.n_params + 1]
                                 edge_val_type = get_phi_edge_wasm_type(val)
                                 if edge_val_type !== nothing && !wasm_types_compatible(phi_local_type, edge_val_type)
-                                    break  # Skip incompatible edge
+                                    # Type mismatch: emit type-safe default for the local's declared type.
+                                    if phi_local_type isa ConcreteRef
+                                        push!(block_bytes, Opcode.REF_NULL)
+                                        append!(block_bytes, encode_leb128_unsigned(phi_local_type.type_idx))
+                                    elseif phi_local_type === StructRef
+                                        push!(block_bytes, Opcode.REF_NULL)
+                                        push!(block_bytes, UInt8(StructRef))
+                                    elseif phi_local_type === ArrayRef
+                                        push!(block_bytes, Opcode.REF_NULL)
+                                        push!(block_bytes, UInt8(ArrayRef))
+                                    elseif phi_local_type === ExternRef
+                                        push!(block_bytes, Opcode.REF_NULL)
+                                        push!(block_bytes, UInt8(ExternRef))
+                                    elseif phi_local_type === AnyRef
+                                        push!(block_bytes, Opcode.REF_NULL)
+                                        push!(block_bytes, UInt8(AnyRef))
+                                    elseif phi_local_type === I64
+                                        push!(block_bytes, Opcode.I64_CONST)
+                                        push!(block_bytes, 0x00)
+                                    elseif phi_local_type === I32
+                                        push!(block_bytes, Opcode.I32_CONST)
+                                        push!(block_bytes, 0x00)
+                                    elseif phi_local_type === F64
+                                        push!(block_bytes, Opcode.F64_CONST)
+                                        append!(block_bytes, UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                                    elseif phi_local_type === F32
+                                        push!(block_bytes, Opcode.F32_CONST)
+                                        append!(block_bytes, UInt8[0x00, 0x00, 0x00, 0x00])
+                                    else
+                                        push!(block_bytes, Opcode.I32_CONST)
+                                        push!(block_bytes, 0x00)
+                                    end
+                                    push!(block_bytes, Opcode.LOCAL_SET)
+                                    append!(block_bytes, encode_leb128_unsigned(local_idx))
+                                    break
                                 end
                                 phi_value_bytes = compile_phi_value(val, i)
                                 # Only emit local_set if we actually have a value on the stack
@@ -7778,7 +7812,41 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                                 phi_local_type = ctx.locals[local_idx - ctx.n_params + 1]
                                 edge_val_type = get_phi_edge_wasm_type(val)
                                 if edge_val_type !== nothing && !wasm_types_compatible(phi_local_type, edge_val_type)
-                                    break  # Skip incompatible edge
+                                    # Type mismatch: emit type-safe default for the local's declared type.
+                                    if phi_local_type isa ConcreteRef
+                                        push!(block_bytes, Opcode.REF_NULL)
+                                        append!(block_bytes, encode_leb128_unsigned(phi_local_type.type_idx))
+                                    elseif phi_local_type === StructRef
+                                        push!(block_bytes, Opcode.REF_NULL)
+                                        push!(block_bytes, UInt8(StructRef))
+                                    elseif phi_local_type === ArrayRef
+                                        push!(block_bytes, Opcode.REF_NULL)
+                                        push!(block_bytes, UInt8(ArrayRef))
+                                    elseif phi_local_type === ExternRef
+                                        push!(block_bytes, Opcode.REF_NULL)
+                                        push!(block_bytes, UInt8(ExternRef))
+                                    elseif phi_local_type === AnyRef
+                                        push!(block_bytes, Opcode.REF_NULL)
+                                        push!(block_bytes, UInt8(AnyRef))
+                                    elseif phi_local_type === I64
+                                        push!(block_bytes, Opcode.I64_CONST)
+                                        push!(block_bytes, 0x00)
+                                    elseif phi_local_type === I32
+                                        push!(block_bytes, Opcode.I32_CONST)
+                                        push!(block_bytes, 0x00)
+                                    elseif phi_local_type === F64
+                                        push!(block_bytes, Opcode.F64_CONST)
+                                        append!(block_bytes, UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                                    elseif phi_local_type === F32
+                                        push!(block_bytes, Opcode.F32_CONST)
+                                        append!(block_bytes, UInt8[0x00, 0x00, 0x00, 0x00])
+                                    else
+                                        push!(block_bytes, Opcode.I32_CONST)
+                                        push!(block_bytes, 0x00)
+                                    end
+                                    push!(block_bytes, Opcode.LOCAL_SET)
+                                    append!(block_bytes, encode_leb128_unsigned(local_idx))
+                                    break
                                 end
                                 phi_value_bytes = compile_phi_value(val, i)
                                 if !isempty(phi_value_bytes)

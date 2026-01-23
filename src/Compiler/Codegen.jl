@@ -296,6 +296,18 @@ function get_concrete_wasm_type(T::Type, mod::WasmModule, registry::TypeRegistry
             end
         end
         return StructRef
+    elseif T isa DataType && (T.name.name === :MemoryRef || T.name.name === :GenericMemoryRef)
+        # MemoryRef{T} / GenericMemoryRef maps to array type for element T
+        # IMPORTANT: Check BEFORE AbstractArray since MemoryRef <: AbstractArray
+        elem_type = T.name.name === :GenericMemoryRef ? T.parameters[2] : T.parameters[1]
+        type_idx = get_array_type!(mod, registry, elem_type)
+        return ConcreteRef(type_idx, true)
+    elseif T isa DataType && (T.name.name === :Memory || T.name.name === :GenericMemory)
+        # Memory{T} / GenericMemory maps to array type for element T
+        # IMPORTANT: Check BEFORE AbstractArray since Memory <: AbstractArray
+        elem_type = T.parameters[2]  # Element type is second parameter for GenericMemory
+        type_idx = get_array_type!(mod, registry, elem_type)
+        return ConcreteRef(type_idx, true)
     elseif T <: AbstractArray  # Handles Vector, Matrix, and higher-dim arrays
         # Both Vector and Matrix are stored as structs with (ref, size) fields
         # This allows setfield!(v, :size, ...) for push!/resize! operations
@@ -609,6 +621,15 @@ const SKIP_AUTODISCOVER_METHODS = Set([
 ])
 
 """
+Set of Base method names that SHOULD be auto-discovered and compiled.
+These are methods whose actual Julia implementations we want to compile
+to WasmGC rather than intercepting with workarounds.
+"""
+const AUTODISCOVER_BASE_METHODS = Set{Symbol}([
+    :setindex!, :getindex, :ht_keyindex, :ht_keyindex2_shorthash!, :rehash!,
+])
+
+"""
 Check if a MethodInstance should be auto-discovered and compiled.
 """
 function check_and_add_external_method!(mi::Core.MethodInstance, seen_funcs::Set, to_add::Vector, to_scan::Vector)
@@ -622,8 +643,11 @@ function check_and_add_external_method!(mi::Core.MethodInstance, seen_funcs::Set
     meth_name = meth.name
 
     # Skip core modules - these are handled specially
+    # BUT allow whitelisted Base methods (e.g., Dict operations) to be compiled
     if mod_name in SKIP_AUTODISCOVER_MODULES || mod === Core || mod === Base
-        return
+        if !(mod === Base && meth_name in AUTODISCOVER_BASE_METHODS)
+            return
+        end
     end
 
     # Skip error/throw functions
@@ -3915,6 +3939,20 @@ function julia_to_wasm_type_concrete(T, ctx::CompilationContext)::WasmValType
     # Used for unreachable code paths. Map to I32 as placeholder.
     if T === Union{}
         return I32
+    elseif T === String || T === Symbol
+        # Strings and Symbols are WasmGC arrays of bytes (not structs)
+        type_idx = get_string_array_type!(ctx.mod, ctx.type_registry)
+        return ConcreteRef(type_idx, true)
+    elseif T isa DataType && (T.name.name === :MemoryRef || T.name.name === :GenericMemoryRef)
+        # MemoryRef{T} maps to array type for element T
+        elem_type = T.name.name === :GenericMemoryRef ? T.parameters[2] : T.parameters[1]
+        type_idx = get_array_type!(ctx.mod, ctx.type_registry, elem_type)
+        return ConcreteRef(type_idx, true)
+    elseif T isa DataType && (T.name.name === :Memory || T.name.name === :GenericMemory)
+        # Memory{T} maps to array type for element T
+        elem_type = T.parameters[2]
+        type_idx = get_array_type!(ctx.mod, ctx.type_registry, elem_type)
+        return ConcreteRef(type_idx, true)
     elseif is_struct_type(T)
         # If struct is registered, return a ConcreteRef
         if haskey(ctx.type_registry.structs, T)
@@ -4380,9 +4418,41 @@ function needs_local(ctx::CompilationContext, ssa_id::Int)
         return false  # Never used
     end
 
+    # Follow passthrough chains: if the use is a single-arg memoryrefnew (passthrough),
+    # the value stays on the stack and is actually consumed by the passthrough's consumer.
+    # We need to check intervening statements between definition and ACTUAL consumer.
+    actual_use_idx = use_idx
+    visited = Set{Int}()
+    while actual_use_idx ∉ visited
+        push!(visited, actual_use_idx)
+        use_stmt = code[actual_use_idx]
+        # Check if this is a single-arg memoryrefnew passthrough
+        if use_stmt isa Expr && use_stmt.head === :call
+            func = use_stmt.args[1]
+            is_memrefnew = (func isa GlobalRef &&
+                            (func.mod === Core || func.mod === Base) &&
+                            (func.name === :memoryrefnew || func.name === :memoryref))
+            if is_memrefnew && length(use_stmt.args) == 2  # func + 1 arg = single-arg passthrough
+                # Find where this passthrough result is used
+                next_use = nothing
+                for (j, s) in enumerate(code)
+                    if j != actual_use_idx && references_ssa(s, actual_use_idx)
+                        next_use = j
+                        break
+                    end
+                end
+                if next_use !== nothing
+                    actual_use_idx = next_use
+                    continue
+                end
+            end
+        end
+        break
+    end
+
     # If there are any statements between definition and use that produce values,
     # we need a local because those values will mess up the stack
-    for i in (ssa_id + 1):(use_idx - 1)
+    for i in (ssa_id + 1):(actual_use_idx - 1)
         stmt = code[i]
         if produces_stack_value(stmt)
             return true
@@ -4390,7 +4460,7 @@ function needs_local(ctx::CompilationContext, ssa_id::Int)
     end
 
     # Also need local if there's control flow between definition and use
-    for i in (ssa_id + 1):(use_idx - 1)
+    for i in (ssa_id + 1):(actual_use_idx - 1)
         stmt = code[i]
         if stmt isa Core.GotoIfNot || stmt isa Core.GotoNode
             return true
@@ -4835,11 +4905,24 @@ function statement_produces_wasm_value(stmt::Expr, idx::Int, ctx::CompilationCon
             if mi isa Core.MethodInstance && isdefined(mi, :rettype) && mi.rettype === Nothing
                 return false
             end
+            # If the function is a cross-module call (in our func_registry),
+            # it produces a value because we compiled it with a non-void return type
+            if mi isa Core.MethodInstance && ctx.func_registry !== nothing
+                func_ref = length(stmt.args) >= 2 ? stmt.args[2] : nothing
+                if func_ref isa GlobalRef
+                    called_func = try
+                        getfield(func_ref.mod, func_ref.name)
+                    catch
+                        nothing
+                    end
+                    if called_func !== nothing && haskey(ctx.func_registry.by_ref, called_func)
+                        return true  # Function is compiled in this module, produces a value
+                    end
+                end
+            end
         end
-        # For Any type that's not a known Nothing invoke, check the function registry
-        # to see if we compiled this function with void return
-        # For now, conservatively assume Any might be Nothing
-        return false  # Be safe - don't DROP if type is Any
+        # For Any type that's not a known Nothing invoke, assume no value produced
+        return false
     end
 
     # For other types (concrete types that aren't Nothing), value is produced
@@ -5306,9 +5389,19 @@ function generate_structured(ctx::CompilationContext, blocks::Vector{BasicBlock}
     # Check for try/catch first
     if has_try_catch(code)
         append!(bytes, generate_try_catch(ctx, blocks, code))
-    # Check for loops first
+    # Check for loops: use stackified flow for complex loops with phi nodes,
+    # simple loop code for basic single-loop patterns
     elseif has_loop(ctx)
-        append!(bytes, generate_loop_code(ctx))
+        # Count conditionals and phi nodes to decide routing
+        has_phi = any(stmt isa Core.PhiNode for stmt in code)
+        if has_phi
+            # Loop with phi nodes: the stackified flow handles loops, forward
+            # jumps, and phi merge points all together correctly.
+            # generate_loop_code can't handle phi nodes at loop headers.
+            append!(bytes, generate_complex_flow(ctx, blocks, code))
+        else
+            append!(bytes, generate_loop_code(ctx))
+        end
     elseif length(blocks) == 1
         # Single block - just generate statements
         append!(bytes, generate_block_code(ctx, blocks[1]))
@@ -6358,6 +6451,13 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
         pop!(post_loop_block_stack)
     end
 
+    # If the function has a non-void return type and the code after the loop
+    # doesn't end with a RETURN, add UNREACHABLE to satisfy the validator.
+    # This happens for infinite loops (while true) that only exit via return.
+    if ctx.return_type !== Nothing && (isempty(bytes) || (bytes[end] != Opcode.RETURN && bytes[end] != Opcode.UNREACHABLE))
+        push!(bytes, Opcode.UNREACHABLE)
+    end
+
     return bytes
 end
 
@@ -7158,21 +7258,60 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
         end
     end
 
-    # Sort targets in ASCENDING order (smallest first)
-    # We'll open blocks for all targets (largest first = outermost)
-    # and close them as we reach each target
-    sorted_targets_asc = sort(collect(non_trivial_targets))
-    sorted_targets_desc = reverse(sorted_targets_asc)  # largest first
+    # ========================================================================
+    # Determine which targets are inside loops vs outside
+    # ========================================================================
+    # A target is "inside a loop" if it's between the loop header and the
+    # back-edge source (latch) block. Such targets need their BLOCKs opened
+    # INSIDE the LOOP instruction, not outside it, to maintain valid nesting.
+
+    # Map: loop_header -> latch_block (back-edge source)
+    loop_latches = Dict{Int, Int}()
+    for (src, dst) in back_edges
+        # If multiple back edges to same header, take the latest latch
+        if !haskey(loop_latches, dst) || src > loop_latches[dst]
+            loop_latches[dst] = src
+        end
+    end
+
+    # Determine which targets are inside which loop
+    # target_loop[target] = loop_header if target is inside that loop
+    target_loop = Dict{Int, Int}()
+    for target in non_trivial_targets
+        for (header, latch) in loop_latches
+            if target > header && target <= latch
+                # Target is inside this loop
+                # If nested, pick the innermost loop (largest header)
+                if !haskey(target_loop, target) || header > target_loop[target]
+                    target_loop[target] = header
+                end
+            end
+        end
+    end
+
+    # Split targets into outer (outside all loops) and inner (inside a loop)
+    outer_targets = sort([t for t in non_trivial_targets if !haskey(target_loop, t)]; rev=true)
+    # Group inner targets by their loop header
+    loop_inner_targets = Dict{Int, Vector{Int}}()  # header -> sorted targets (desc)
+    for (target, header) in target_loop
+        if !haskey(loop_inner_targets, header)
+            loop_inner_targets[header] = Int[]
+        end
+        push!(loop_inner_targets[header], target)
+    end
+    for header in keys(loop_inner_targets)
+        sort!(loop_inner_targets[header]; rev=true)
+    end
 
     # Track currently open blocks (as a stack of target block indices)
     # The stack is ordered with outermost at bottom, innermost at top
-    open_blocks = copy(sorted_targets_desc)  # Will close in ascending order
+    open_blocks = copy(outer_targets)  # Only outer targets opened at start
 
     # Also track open loops
     open_loops = Int[]  # Stack of loop header block indices
 
-    # Open all blocks for forward jump targets (outermost first = largest target)
-    for target in sorted_targets_desc
+    # Open blocks for OUTER forward jump targets only (outermost first = largest target)
+    for target in outer_targets
         push!(bytes, Opcode.BLOCK)
         push!(bytes, 0x40)  # void
     end
@@ -7334,6 +7473,17 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
             push!(bytes, Opcode.LOOP)
             push!(bytes, 0x40)  # void
             push!(open_loops, block_idx)
+
+            # Open BLOCKs for forward-jump targets INSIDE this loop
+            if haskey(loop_inner_targets, block_idx)
+                inner_targets = loop_inner_targets[block_idx]
+                for target in inner_targets  # already sorted desc (largest first = outermost)
+                    push!(bytes, Opcode.BLOCK)
+                    push!(bytes, 0x40)  # void
+                end
+                # Push inner targets onto open_blocks (smallest last = innermost at top)
+                append!(open_blocks, inner_targets)
+            end
         end
 
         # Compile the block's statements (not the terminator, we handle it separately)
@@ -7540,6 +7690,15 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
         # Close loop if this is the last block of the loop (back edge source)
         for (src, dst) in back_edges
             if src == block_idx
+                # Close any inner target blocks that are still open for this loop
+                if haskey(loop_inner_targets, dst)
+                    for target in loop_inner_targets[dst]
+                        if target in open_blocks
+                            filter!(t -> t != target, open_blocks)
+                            push!(bytes, Opcode.END)  # End inner target block
+                        end
+                    end
+                end
                 push!(bytes, Opcode.END)  # End of loop
                 # Remove from open_loops
                 filter!(h -> h != dst, open_loops)
@@ -10040,6 +10199,74 @@ function compile_new(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt
         error("Unknown struct type reference: $struct_type_ref")
     end
 
+    # Special case: Dict{K,V} construction
+    # Dict starts with empty Memory arrays (length 0), but our inline setindex!/getindex
+    # use linear scan and need initial capacity. Replace empty arrays with capacity-16 arrays.
+    if struct_type <: AbstractDict
+        K = keytype(struct_type)
+        V = valtype(struct_type)
+
+        if !haskey(ctx.type_registry.structs, struct_type)
+            register_struct_type!(ctx.mod, ctx.type_registry, struct_type)
+        end
+        dict_info = ctx.type_registry.structs[struct_type]
+
+        slots_arr_type = get_array_type!(ctx.mod, ctx.type_registry, UInt8)
+        keys_arr_type = get_array_type!(ctx.mod, ctx.type_registry, K)
+        vals_arr_type = get_array_type!(ctx.mod, ctx.type_registry, V)
+
+        # Initial capacity of 16
+        initial_cap = Int32(16)
+
+        # field 0: slots - array of UInt8, initialized to 0 (empty)
+        push!(bytes, Opcode.I32_CONST)
+        append!(bytes, encode_leb128_signed(initial_cap))
+        push!(bytes, Opcode.GC_PREFIX)
+        push!(bytes, Opcode.ARRAY_NEW_DEFAULT)
+        append!(bytes, encode_leb128_unsigned(slots_arr_type))
+
+        # field 1: keys - array of K, default initialized
+        push!(bytes, Opcode.I32_CONST)
+        append!(bytes, encode_leb128_signed(initial_cap))
+        push!(bytes, Opcode.GC_PREFIX)
+        push!(bytes, Opcode.ARRAY_NEW_DEFAULT)
+        append!(bytes, encode_leb128_unsigned(keys_arr_type))
+
+        # field 2: vals - array of V, default initialized
+        push!(bytes, Opcode.I32_CONST)
+        append!(bytes, encode_leb128_signed(initial_cap))
+        push!(bytes, Opcode.GC_PREFIX)
+        push!(bytes, Opcode.ARRAY_NEW_DEFAULT)
+        append!(bytes, encode_leb128_unsigned(vals_arr_type))
+
+        # field 3: ndel = 0 (i64)
+        push!(bytes, Opcode.I64_CONST)
+        append!(bytes, encode_leb128_signed(Int64(0)))
+
+        # field 4: count = 0 (i64)
+        push!(bytes, Opcode.I64_CONST)
+        append!(bytes, encode_leb128_signed(Int64(0)))
+
+        # field 5: age = 0 (u64, stored as i64)
+        push!(bytes, Opcode.I64_CONST)
+        append!(bytes, encode_leb128_signed(Int64(0)))
+
+        # field 6: idxfloor = 1 (i64)
+        push!(bytes, Opcode.I64_CONST)
+        append!(bytes, encode_leb128_signed(Int64(1)))
+
+        # field 7: maxprobe = 0 (i64)
+        push!(bytes, Opcode.I64_CONST)
+        append!(bytes, encode_leb128_signed(Int64(0)))
+
+        # struct.new
+        push!(bytes, Opcode.GC_PREFIX)
+        push!(bytes, Opcode.STRUCT_NEW)
+        append!(bytes, encode_leb128_unsigned(dict_info.wasm_type_idx))
+
+        return bytes
+    end
+
     # Special case: Vector{T} construction
     # Vector is now a struct with (ref, size) fields to support setfield!(v, :size, ...)
     # The %new(Vector{T}, memref, size_tuple) creates a struct with both fields
@@ -11751,7 +11978,26 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
     end
 
     # Push arguments onto the stack (normal case)
+    # Skip Type arguments (e.g., first arg of sext_int, zext_int, trunc_int, bitcast)
+    # These are compile-time type parameters, not runtime values
     for arg in args
+        # Check if this argument is a type reference
+        is_type_arg = false
+        if arg isa Type
+            # Directly a Type value (Julia already resolved it)
+            is_type_arg = true
+        elseif arg isa GlobalRef
+            try
+                resolved = getfield(arg.mod, arg.name)
+                if resolved isa Type
+                    is_type_arg = true
+                end
+            catch
+            end
+        end
+        if is_type_arg
+            continue
+        end
         append!(bytes, compile_value(arg, ctx))
     end
 
@@ -12879,6 +13125,7 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
                 append!(bytes, encode_leb128_unsigned(ctx.func_idx))
             elseif cross_call_handled
                 # Already handled above
+
             elseif name === :+ || name === :add_int
                 push!(bytes, is_32bit ? Opcode.I32_ADD : Opcode.I64_ADD)
             elseif name === :- || name === :sub_int
@@ -15077,158 +15324,6 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
                    name === :throw || name === :rethrow ||
                    name === :_throw_not_readable || name === :_throw_not_writable
                 push!(bytes, Opcode.UNREACHABLE)
-
-            # ================================================================
-            # Dict operations: setindex! and getindex
-            # Implemented directly in codegen since Dict's Base methods have
-            # complex control flow that the codegen can't handle yet.
-            # Uses linear scan over the keys array (correct for small dicts).
-            # ================================================================
-            elseif name === :setindex! && length(args) >= 3
-                dict_type = infer_value_type(args[1], ctx)
-                if dict_type <: AbstractDict
-                    # setindex!(d, val, key) → store key/val at count position
-                    # Stack has: dict, val, key (all pushed by args loop)
-                    bytes = UInt8[]  # Reset - recompile in correct order
-
-                    # We need locals for dict, val, key
-                    str_type_idx = get_string_array_type!(ctx.mod, ctx.type_registry)
-                    dict_wasm_type = julia_to_wasm_type_concrete(dict_type, ctx)
-                    dict_type_idx = dict_wasm_type isa ConcreteRef ? dict_wasm_type.type_idx : UInt32(0)
-
-                    # Get array type for keys (array of string refs)
-                    keys_arr_type_idx = get_array_type!(ctx.mod, ctx.type_registry, Symbol)
-                    # Get array type for vals (array of i32)
-                    vals_arr_type_idx = get_array_type!(ctx.mod, ctx.type_registry, Int32)
-
-                    # Allocate locals directly with WasmValType
-                    dict_local = ctx.n_params + length(ctx.locals)
-                    push!(ctx.locals, dict_wasm_type)
-                    val_local = ctx.n_params + length(ctx.locals)
-                    push!(ctx.locals, I32)
-                    key_local = ctx.n_params + length(ctx.locals)
-                    push!(ctx.locals, ConcreteRef(str_type_idx, true))
-                    count_local = ctx.n_params + length(ctx.locals)
-                    push!(ctx.locals, I64)
-
-                    # Compile and store dict
-                    append!(bytes, compile_value(args[1], ctx))
-                    push!(bytes, Opcode.LOCAL_TEE)
-                    append!(bytes, encode_leb128_unsigned(dict_local))
-
-                    # Get current count (field 4)
-                    push!(bytes, Opcode.GC_PREFIX)
-                    push!(bytes, Opcode.STRUCT_GET)
-                    append!(bytes, encode_leb128_unsigned(dict_type_idx))
-                    append!(bytes, encode_leb128_unsigned(UInt32(4)))  # count field
-                    push!(bytes, Opcode.LOCAL_SET)
-                    append!(bytes, encode_leb128_unsigned(count_local))
-
-                    # Compile and store val
-                    append!(bytes, compile_value(args[2], ctx))
-                    push!(bytes, Opcode.LOCAL_SET)
-                    append!(bytes, encode_leb128_unsigned(val_local))
-
-                    # Compile and store key
-                    append!(bytes, compile_value(args[3], ctx))
-                    push!(bytes, Opcode.LOCAL_SET)
-                    append!(bytes, encode_leb128_unsigned(key_local))
-
-                    # Get keys array from dict (field 1)
-                    push!(bytes, Opcode.LOCAL_GET)
-                    append!(bytes, encode_leb128_unsigned(dict_local))
-                    push!(bytes, Opcode.GC_PREFIX)
-                    push!(bytes, Opcode.STRUCT_GET)
-                    append!(bytes, encode_leb128_unsigned(dict_type_idx))
-                    append!(bytes, encode_leb128_unsigned(UInt32(1)))  # keys field
-
-                    # Store key at index=count: array.set keys[count] = key
-                    push!(bytes, Opcode.LOCAL_GET)
-                    append!(bytes, encode_leb128_unsigned(count_local))
-                    push!(bytes, Opcode.I32_WRAP_I64)
-                    push!(bytes, Opcode.LOCAL_GET)
-                    append!(bytes, encode_leb128_unsigned(key_local))
-                    push!(bytes, Opcode.GC_PREFIX)
-                    push!(bytes, Opcode.ARRAY_SET)
-                    append!(bytes, encode_leb128_unsigned(keys_arr_type_idx))
-
-                    # Get vals array from dict (field 2)
-                    push!(bytes, Opcode.LOCAL_GET)
-                    append!(bytes, encode_leb128_unsigned(dict_local))
-                    push!(bytes, Opcode.GC_PREFIX)
-                    push!(bytes, Opcode.STRUCT_GET)
-                    append!(bytes, encode_leb128_unsigned(dict_type_idx))
-                    append!(bytes, encode_leb128_unsigned(UInt32(2)))  # vals field
-
-                    # Store val at index=count: array.set vals[count] = val
-                    push!(bytes, Opcode.LOCAL_GET)
-                    append!(bytes, encode_leb128_unsigned(count_local))
-                    push!(bytes, Opcode.I32_WRAP_I64)
-                    push!(bytes, Opcode.LOCAL_GET)
-                    append!(bytes, encode_leb128_unsigned(val_local))
-                    push!(bytes, Opcode.GC_PREFIX)
-                    push!(bytes, Opcode.ARRAY_SET)
-                    append!(bytes, encode_leb128_unsigned(vals_arr_type_idx))
-
-                    # Increment count: dict.count = count + 1
-                    push!(bytes, Opcode.LOCAL_GET)
-                    append!(bytes, encode_leb128_unsigned(dict_local))
-                    push!(bytes, Opcode.LOCAL_GET)
-                    append!(bytes, encode_leb128_unsigned(count_local))
-                    push!(bytes, Opcode.I64_CONST)
-                    append!(bytes, encode_leb128_signed(Int64(1)))
-                    push!(bytes, Opcode.I64_ADD)
-                    push!(bytes, Opcode.GC_PREFIX)
-                    push!(bytes, Opcode.STRUCT_SET)
-                    append!(bytes, encode_leb128_unsigned(dict_type_idx))
-                    append!(bytes, encode_leb128_unsigned(UInt32(4)))  # count field
-
-                    # Return the value (setindex! returns the value in Julia)
-                    push!(bytes, Opcode.LOCAL_GET)
-                    append!(bytes, encode_leb128_unsigned(val_local))
-                else
-                    error("Unsupported method: $name for type $dict_type")
-                end
-
-            elseif name === :getindex && length(args) >= 2
-                dict_type = infer_value_type(args[1], ctx)
-                if dict_type <: AbstractDict
-                    # getindex(d, key) → linear scan for matching key, return val
-                    # For now, use a simple approach: return vals[0]
-                    # (assumes single entry for MVP - will be enhanced later)
-                    bytes = UInt8[]  # Reset
-
-                    str_type_idx = get_string_array_type!(ctx.mod, ctx.type_registry)
-                    dict_wasm_type = julia_to_wasm_type_concrete(dict_type, ctx)
-                    dict_type_idx = dict_wasm_type isa ConcreteRef ? dict_wasm_type.type_idx : UInt32(0)
-                    vals_arr_type_idx = get_array_type!(ctx.mod, ctx.type_registry, Int32)
-
-                    # Compile dict and get vals array (field 2)
-                    append!(bytes, compile_value(args[1], ctx))
-                    push!(bytes, Opcode.GC_PREFIX)
-                    push!(bytes, Opcode.STRUCT_GET)
-                    append!(bytes, encode_leb128_unsigned(dict_type_idx))
-                    append!(bytes, encode_leb128_unsigned(UInt32(2)))  # vals field
-
-                    # Get count-1 as the index (last inserted value)
-                    # For the test case, we insert at 0 and read back
-                    # Use index 0 for MVP (matches the setindex! which stores at count=0 initially)
-                    push!(bytes, Opcode.I32_CONST)
-                    append!(bytes, encode_leb128_signed(Int32(0)))
-
-                    # array.get vals[0]
-                    push!(bytes, Opcode.GC_PREFIX)
-                    push!(bytes, Opcode.ARRAY_GET)
-                    append!(bytes, encode_leb128_unsigned(vals_arr_type_idx))
-                else
-                    error("Unsupported method: $name for type $dict_type")
-                end
-
-            # Handle ht_keyindex (Dict hash table lookup)
-            # Our simplified Dict uses linear scan, so return 1 (first valid index)
-            elseif name === :ht_keyindex
-                push!(bytes, Opcode.I32_CONST)
-                push!(bytes, 0x01)  # Return index 1 (valid slot)
 
             # Handle truncate (IOBuffer resize) — no-op in WasmGC
             # Returns the IOBuffer itself

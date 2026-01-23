@@ -2312,13 +2312,13 @@ function emit_unwrap_union_value(ctx, union_type::Union, target_type::Type)::Vec
     # Cast anyref to the target type
     target_wasm_type = julia_to_wasm_type_concrete(target_type, ctx)
     if target_wasm_type isa ConcreteRef
-        # Cast anyref to concrete type using ref.cast
+        # Cast anyref to concrete type using ref.cast / ref.cast_null
+        # The immediate is a heaptype (just the type index), not a reftype
         push!(bytes, Opcode.GC_PREFIX)
-        push!(bytes, Opcode.REF_CAST)
         if target_wasm_type.nullable
-            push!(bytes, 0x63)  # ref null
+            push!(bytes, Opcode.REF_CAST_NULL)
         else
-            push!(bytes, 0x64)  # ref
+            push!(bytes, Opcode.REF_CAST)
         end
         append!(bytes, encode_leb128_signed(Int64(target_wasm_type.type_idx)))
     end
@@ -4423,31 +4423,113 @@ function allocate_ssa_locals!(ctx::CompilationContext)
                 continue
             end
 
-            # For PiNodes: the local type should match the VALUE's Wasm type,
-            # not the narrowed type. PiNode narrows Julia types but doesn't change
-            # the Wasm representation — it's the same value on the stack.
+            # For PiNodes: the local type must match what compile_value(stmt.val)
+            # will actually push on the stack. If the source value has a local,
+            # that local's type is what will be on the stack (via local.get).
             effective_type = ssa_type
             if stmt isa Core.PiNode
+                narrowed_wasm = julia_to_wasm_type_concrete(ssa_type, ctx)
+                # Check if the source value has a local with a different type
+                src_wasm_type = nothing
                 if stmt.val isa Core.SSAValue
-                    val_type = get(ctx.ssa_types, stmt.val.id, nothing)
-                    if val_type !== nothing
-                        effective_type = val_type
+                    if haskey(ctx.ssa_locals, stmt.val.id)
+                        src_local_idx = ctx.ssa_locals[stmt.val.id]
+                        src_array_idx = src_local_idx - ctx.n_params + 1
+                        if src_array_idx >= 1 && src_array_idx <= length(ctx.locals)
+                            src_wasm_type = ctx.locals[src_array_idx]
+                        end
+                    elseif haskey(ctx.phi_locals, stmt.val.id)
+                        src_local_idx = ctx.phi_locals[stmt.val.id]
+                        src_array_idx = src_local_idx - ctx.n_params + 1
+                        if src_array_idx >= 1 && src_array_idx <= length(ctx.locals)
+                            src_wasm_type = ctx.locals[src_array_idx]
+                        end
                     end
-                elseif stmt.val isa Core.Argument
-                    arg_idx = stmt.val.n
-                    if arg_idx <= length(ctx.code_info.slottypes)
-                        effective_type = ctx.code_info.slottypes[arg_idx]
+                end
+                if src_wasm_type !== nothing && src_wasm_type != narrowed_wasm
+                    # Source local has a different Wasm type than the narrowed type.
+                    # Use the source's actual type for this local so local.get → local.set
+                    # doesn't produce a type mismatch.
+                    # Skip julia_to_wasm_type_concrete for effective_type — we'll set wasm_type directly below.
+                elseif !(narrowed_wasm isa ConcreteRef) && narrowed_wasm !== StructRef && narrowed_wasm !== ArrayRef && narrowed_wasm !== AnyRef
+                    # Numeric PiNode — use the value's type for the local since
+                    # the Wasm representation is the same (i32/i64/f32/f64)
+                    if stmt.val isa Core.SSAValue
+                        val_type = get(ctx.ssa_types, stmt.val.id, nothing)
+                        if val_type !== nothing
+                            effective_type = val_type
+                        end
+                    elseif stmt.val isa Core.Argument
+                        arg_idx = stmt.val.n
+                        if arg_idx <= length(ctx.code_info.slottypes)
+                            effective_type = ctx.code_info.slottypes[arg_idx]
+                        end
                     end
                 end
             end
 
             wasm_type = julia_to_wasm_type_concrete(effective_type, ctx)
 
-            # Debug: print when a ref-typed local is allocated for a PiNode or potential mismatch
-            if wasm_type isa ConcreteRef && wasm_type.type_idx == 70
-                @debug "ALLOC LOCAL ref(70): SSA $ssa_id, stmt=$(typeof(stmt)), ssa_type=$ssa_type, effective_type=$effective_type"
-                if stmt isa Core.PiNode
-                    @debug "  PiNode val=$(stmt.val), val_type=$(stmt.val isa Core.SSAValue ? get(ctx.ssa_types, stmt.val.id, nothing) : nothing)"
+            # For PiNodes where source local has a different concrete ref type,
+            # use the source's actual Wasm type to avoid local.get → local.set mismatches.
+            if stmt isa Core.PiNode && stmt.val isa Core.SSAValue
+                src_local_wasm = nothing
+                if haskey(ctx.ssa_locals, stmt.val.id)
+                    src_li = ctx.ssa_locals[stmt.val.id]
+                    src_ai = src_li - ctx.n_params + 1
+                    if src_ai >= 1 && src_ai <= length(ctx.locals)
+                        src_local_wasm = ctx.locals[src_ai]
+                    end
+                elseif haskey(ctx.phi_locals, stmt.val.id)
+                    src_li = ctx.phi_locals[stmt.val.id]
+                    src_ai = src_li - ctx.n_params + 1
+                    if src_ai >= 1 && src_ai <= length(ctx.locals)
+                        src_local_wasm = ctx.locals[src_ai]
+                    end
+                end
+                if src_local_wasm !== nothing && src_local_wasm != wasm_type
+                    wasm_type = src_local_wasm
+                end
+            end
+
+            # Fix: if this SSA is a getfield/getproperty on a struct field typed as Any,
+            # the Wasm struct.get returns externref. The local MUST be externref to match,
+            # regardless of what Julia's type inference says the narrowed type is.
+            # Similarly for memoryrefget on arrays with Any elements.
+            if stmt isa Expr && stmt.head === :call && length(stmt.args) >= 3
+                sfunc = stmt.args[1]
+                is_gf = (sfunc isa GlobalRef &&
+                         sfunc.name in (:getfield, :getproperty) &&
+                         sfunc.mod in (Core, Base))
+                if is_gf
+                    obj_arg = stmt.args[2]
+                    field_ref = stmt.args[3]
+                    obj_type = infer_value_type(obj_arg, ctx)
+                    if obj_type isa DataType && isstructtype(obj_type) && !isprimitivetype(obj_type)
+                        field_sym = field_ref isa QuoteNode ? field_ref.value : field_ref
+                        if field_sym isa Symbol && hasfield(obj_type, field_sym)
+                            jft = fieldtype(obj_type, field_sym)
+                            if jft === Any
+                                wasm_type = ExternRef
+                            end
+                        end
+                    end
+                end
+                # Also check memoryrefget on Any-element arrays
+                if sfunc isa GlobalRef && sfunc.name === :memoryrefget
+                    ref_arg = stmt.args[2]
+                    ref_type = infer_value_type(ref_arg, ctx)
+                    if ref_type isa DataType
+                        elt = nothing
+                        if ref_type.name.name === :MemoryRef && length(ref_type.parameters) >= 1
+                            elt = ref_type.parameters[1]
+                        elseif ref_type.name.name === :GenericMemoryRef && length(ref_type.parameters) >= 2
+                            elt = ref_type.parameters[2]
+                        end
+                        if elt === Any
+                            wasm_type = ExternRef
+                        end
+                    end
                 end
             end
             local_idx = ctx.n_params + length(ctx.locals)
@@ -4703,6 +4785,51 @@ function analyze_ssa_types!(ctx::CompilationContext)
             # Only skip Any as it provides no useful information
             if T !== Any
                 ctx.ssa_types[i] = T
+            end
+        end
+    end
+
+    # Override: if an SSA is a getfield/getproperty on a struct field typed as Any,
+    # or a memoryrefget on an array with Any elements, force the SSA type to Any.
+    # This ensures the local is allocated as externref (matching what struct.get/array.get
+    # actually produces), preventing type mismatches with local.set.
+    for (i, stmt) in enumerate(ctx.code_info.code)
+        if stmt isa Expr && stmt.head === :call && length(stmt.args) >= 3
+            func = stmt.args[1]
+            # Check getfield/getproperty on Any-typed struct field
+            is_gf = (func isa GlobalRef &&
+                     func.name in (:getfield, :getproperty) &&
+                     func.mod in (Core, Base))
+            if is_gf
+                obj_arg = stmt.args[2]
+                field_ref = stmt.args[3]
+                obj_type = infer_value_type(obj_arg, ctx)
+                # Check the Julia field type directly (no registry lookup needed)
+                if obj_type isa DataType && isstructtype(obj_type) && !isprimitivetype(obj_type)
+                    field_sym = field_ref isa QuoteNode ? field_ref.value : field_ref
+                    if field_sym isa Symbol && hasfield(obj_type, field_sym)
+                        julia_field_type = fieldtype(obj_type, field_sym)
+                        if julia_field_type === Any
+                            ctx.ssa_types[i] = Any  # Force ExternRef local to match struct.get output
+                        end
+                    end
+                end
+            end
+            # Check memoryrefget on Any-element array
+            if func isa GlobalRef && func.name === :memoryrefget
+                ref_arg = stmt.args[2]
+                ref_type = infer_value_type(ref_arg, ctx)
+                elem_type = nothing  # unknown
+                if ref_type isa DataType
+                    if ref_type.name.name === :MemoryRef && length(ref_type.parameters) >= 1
+                        elem_type = ref_type.parameters[1]
+                    elseif ref_type.name.name === :GenericMemoryRef && length(ref_type.parameters) >= 2
+                        elem_type = ref_type.parameters[2]
+                    end
+                end
+                if elem_type === Any
+                    ctx.ssa_types[i] = Any  # Force ExternRef local to match array.get output
+                end
             end
         end
     end
@@ -5569,8 +5696,14 @@ function generate_branched_loops(ctx::CompilationContext, first_header::Int, fir
             continue
         elseif stmt isa Core.ReturnNode
             if isdefined(stmt, :val)
-                append!(bytes, compile_value(stmt.val, ctx))
-                push!(bytes, Opcode.RETURN)
+                val_wasm_type = infer_value_wasm_type(stmt.val, ctx)
+                ret_wasm_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
+                if !return_type_compatible(val_wasm_type, ret_wasm_type)
+                    push!(bytes, Opcode.UNREACHABLE)
+                else
+                    append!(bytes, compile_value(stmt.val, ctx))
+                    push!(bytes, Opcode.RETURN)
+                end
             else
                 # ReturnNode without val is `unreachable` - should be skipped if in dead_regions
                 # but if we reach here, emit WASM unreachable
@@ -5632,9 +5765,17 @@ function generate_branched_loops(ctx::CompilationContext, first_header::Int, fir
             continue
         elseif stmt isa Core.ReturnNode
             if isdefined(stmt, :val)
-                append!(bytes, compile_value(stmt.val, ctx))
+                val_wasm_type = infer_value_wasm_type(stmt.val, ctx)
+                ret_wasm_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
+                if !return_type_compatible(val_wasm_type, ret_wasm_type)
+                    push!(bytes, Opcode.UNREACHABLE)
+                else
+                    append!(bytes, compile_value(stmt.val, ctx))
+                    push!(bytes, Opcode.RETURN)
+                end
+            else
+                push!(bytes, Opcode.RETURN)
             end
-            push!(bytes, Opcode.RETURN)
         elseif stmt isa Core.GotoIfNot
             # Inner conditional - use IF to consume condition
             append!(bytes, compile_value(stmt.cond, ctx))
@@ -5699,6 +5840,22 @@ Used to check compatibility before storing to a phi local.
 """
 function get_phi_edge_wasm_type(val, ctx::CompilationContext)::Union{WasmValType, Nothing}
     if val isa Core.SSAValue
+        # If the SSA has a local allocated, return the local's actual Wasm type.
+        # This is what local.get will actually push on the stack, which may differ
+        # from the Julia-inferred type when PiNodes narrow types.
+        if haskey(ctx.ssa_locals, val.id)
+            local_idx = ctx.ssa_locals[val.id]
+            local_array_idx = local_idx - ctx.n_params + 1
+            if local_array_idx >= 1 && local_array_idx <= length(ctx.locals)
+                return ctx.locals[local_array_idx]
+            end
+        elseif haskey(ctx.phi_locals, val.id)
+            local_idx = ctx.phi_locals[val.id]
+            local_array_idx = local_idx - ctx.n_params + 1
+            if local_array_idx >= 1 && local_array_idx <= length(ctx.locals)
+                return ctx.locals[local_array_idx]
+            end
+        end
         edge_julia_type = get(ctx.ssa_types, val.id, nothing)
         if edge_julia_type !== nothing
             return julia_to_wasm_type_concrete(edge_julia_type, ctx)
@@ -5744,6 +5901,14 @@ function wasm_types_compatible(local_type::WasmValType, value_type::WasmValType)
     if local_type isa ConcreteRef && value_type isa ConcreteRef && local_type.type_idx != value_type.type_idx
         return false
     end
+    # ExternRef is NOT compatible with ConcreteRef/StructRef/ArrayRef/AnyRef
+    # (externref is outside the anyref hierarchy in WasmGC)
+    if local_type === ExternRef && (value_type isa ConcreteRef || value_type === StructRef || value_type === ArrayRef || value_type === AnyRef)
+        return false
+    end
+    if value_type === ExternRef && (local_type isa ConcreteRef || local_type === StructRef || local_type === ArrayRef || local_type === AnyRef)
+        return false
+    end
     return true
 end
 
@@ -5765,6 +5930,59 @@ function emit_phi_local_set!(bytes::Vector{UInt8}, val, phi_ssa_idx::Int, ctx::C
     if edge_val_type !== nothing && !wasm_types_compatible(phi_local_type, edge_val_type)
         # Type mismatch: skip this store (unreachable path for Union types)
         return false
+    end
+
+    # When edge_val_type is nothing (Any/Union SSA type), check the actual local's Wasm type
+    if edge_val_type === nothing && val isa Core.SSAValue
+        val_local_idx = nothing
+        if haskey(ctx.ssa_locals, val.id)
+            val_local_idx = ctx.ssa_locals[val.id]
+        elseif haskey(ctx.phi_locals, val.id)
+            val_local_idx = ctx.phi_locals[val.id]
+        end
+        if val_local_idx !== nothing
+            val_local_array_idx = val_local_idx - ctx.n_params + 1
+            if val_local_array_idx >= 1 && val_local_array_idx <= length(ctx.locals)
+                val_local_type = ctx.locals[val_local_array_idx]
+                if !wasm_types_compatible(phi_local_type, val_local_type)
+                    # Incompatible: emit type-safe default for phi local type
+                    if phi_local_type isa ConcreteRef
+                        push!(bytes, Opcode.REF_NULL)
+                        append!(bytes, encode_leb128_signed(Int64(phi_local_type.type_idx)))
+                    elseif phi_local_type === StructRef
+                        push!(bytes, Opcode.REF_NULL)
+                        push!(bytes, UInt8(StructRef))
+                    elseif phi_local_type === ArrayRef
+                        push!(bytes, Opcode.REF_NULL)
+                        push!(bytes, UInt8(ArrayRef))
+                    elseif phi_local_type === ExternRef
+                        push!(bytes, Opcode.REF_NULL)
+                        push!(bytes, UInt8(ExternRef))
+                    elseif phi_local_type === AnyRef
+                        push!(bytes, Opcode.REF_NULL)
+                        push!(bytes, UInt8(AnyRef))
+                    elseif phi_local_type === I64
+                        push!(bytes, Opcode.I64_CONST)
+                        push!(bytes, 0x00)
+                    elseif phi_local_type === I32
+                        push!(bytes, Opcode.I32_CONST)
+                        push!(bytes, 0x00)
+                    elseif phi_local_type === F64
+                        push!(bytes, Opcode.F64_CONST)
+                        append!(bytes, UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                    elseif phi_local_type === F32
+                        push!(bytes, Opcode.F32_CONST)
+                        append!(bytes, UInt8[0x00, 0x00, 0x00, 0x00])
+                    else
+                        push!(bytes, Opcode.I32_CONST)
+                        push!(bytes, 0x00)
+                    end
+                    push!(bytes, Opcode.LOCAL_SET)
+                    append!(bytes, encode_leb128_unsigned(local_idx))
+                    return true
+                end
+            end
+        end
     end
 
     value_bytes = compile_value(val, ctx)
@@ -6151,9 +6369,17 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
             elseif stmt isa Core.ReturnNode
                 # Early return in pre-loop code
                 if isdefined(stmt, :val)
-                    append!(bytes, compile_value(stmt.val, ctx))
+                    val_wasm_type = infer_value_wasm_type(stmt.val, ctx)
+                    ret_wasm_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
+                    if !return_type_compatible(val_wasm_type, ret_wasm_type)
+                        push!(bytes, Opcode.UNREACHABLE)
+                    else
+                        append!(bytes, compile_value(stmt.val, ctx))
+                        push!(bytes, Opcode.RETURN)
+                    end
+                else
+                    push!(bytes, Opcode.RETURN)
                 end
-                push!(bytes, Opcode.RETURN)
             elseif stmt === nothing
                 # Skip nothing statements
             else
@@ -6368,9 +6594,17 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
             end
         elseif stmt isa Core.ReturnNode
             if isdefined(stmt, :val)
-                append!(bytes, compile_value(stmt.val, ctx))
+                val_wasm_type = infer_value_wasm_type(stmt.val, ctx)
+                ret_wasm_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
+                if !return_type_compatible(val_wasm_type, ret_wasm_type)
+                    push!(bytes, Opcode.UNREACHABLE)
+                else
+                    append!(bytes, compile_value(stmt.val, ctx))
+                    push!(bytes, Opcode.RETURN)
+                end
+            else
+                push!(bytes, Opcode.RETURN)
             end
-            push!(bytes, Opcode.RETURN)
         elseif stmt === nothing
             # Skip nothing statements
         else
@@ -6480,9 +6714,17 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
 
         if stmt isa Core.ReturnNode
             if isdefined(stmt, :val)
-                append!(bytes, compile_value(stmt.val, ctx))
+                val_wasm_type = infer_value_wasm_type(stmt.val, ctx)
+                ret_wasm_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
+                if !return_type_compatible(val_wasm_type, ret_wasm_type)
+                    push!(bytes, Opcode.UNREACHABLE)
+                else
+                    append!(bytes, compile_value(stmt.val, ctx))
+                    push!(bytes, Opcode.RETURN)
+                end
+            else
+                push!(bytes, Opcode.RETURN)
             end
-            push!(bytes, Opcode.RETURN)
         elseif stmt isa Core.GotoIfNot
             target = stmt.dest
             # This is a conditional that jumps forward
@@ -6725,9 +6967,17 @@ function generate_if_then_else(ctx::CompilationContext, blocks::Vector{BasicBloc
             stmt = code[i]
             if stmt isa Core.ReturnNode
                 if isdefined(stmt, :val)
-                    append!(bytes, compile_value(stmt.val, ctx))
+                    val_wasm_type = infer_value_wasm_type(stmt.val, ctx)
+                    ret_wasm_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
+                    if !return_type_compatible(val_wasm_type, ret_wasm_type)
+                        push!(bytes, Opcode.UNREACHABLE)
+                    else
+                        append!(bytes, compile_value(stmt.val, ctx))
+                        push!(bytes, Opcode.RETURN)
+                    end
+                else
+                    push!(bytes, Opcode.RETURN)
                 end
-                push!(bytes, Opcode.RETURN)
             elseif !(stmt === nothing)
                 append!(bytes, compile_statement(stmt, i, ctx))
             end
@@ -7234,9 +7484,17 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
 
             if stmt isa Core.ReturnNode
                 if isdefined(stmt, :val)
-                    append!(block_bytes, compile_value(stmt.val, ctx))
+                    val_wasm_type = infer_value_wasm_type(stmt.val, ctx)
+                    ret_wasm_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
+                    if !return_type_compatible(val_wasm_type, ret_wasm_type)
+                        push!(block_bytes, Opcode.UNREACHABLE)
+                    else
+                        append!(block_bytes, compile_value(stmt.val, ctx))
+                        push!(block_bytes, Opcode.RETURN)
+                    end
+                else
+                    push!(block_bytes, Opcode.RETURN)
                 end
-                push!(block_bytes, Opcode.RETURN)
 
             elseif stmt isa Core.GotoIfNot
                 # GotoIfNot: handled by control flow structure
@@ -7265,7 +7523,7 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                                     # Type mismatch: emit type-safe default for the local's declared type.
                                     if phi_local_type isa ConcreteRef
                                         push!(block_bytes, Opcode.REF_NULL)
-                                        append!(block_bytes, encode_leb128_unsigned(phi_local_type.type_idx))
+                                        append!(block_bytes, encode_leb128_signed(Int64(phi_local_type.type_idx)))
                                     elseif phi_local_type === StructRef
                                         push!(block_bytes, Opcode.REF_NULL)
                                         push!(block_bytes, UInt8(StructRef))
@@ -7517,7 +7775,7 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
         result = UInt8[]
         if wasm_type isa ConcreteRef
             push!(result, Opcode.REF_NULL)
-            append!(result, encode_leb128_unsigned(wasm_type.type_idx))
+            append!(result, encode_leb128_signed(Int64(wasm_type.type_idx)))
         elseif wasm_type === StructRef
             push!(result, Opcode.REF_NULL)
             push!(result, UInt8(StructRef))
@@ -7606,7 +7864,7 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                 local_wasm_type = ctx.locals[local_idx - ctx.n_params + 1]
                 if local_wasm_type isa ConcreteRef
                     push!(result, Opcode.REF_NULL)
-                    append!(result, encode_leb128_unsigned(local_wasm_type.type_idx))
+                    append!(result, encode_leb128_signed(Int64(local_wasm_type.type_idx)))
                 elseif local_wasm_type === ExternRef
                     push!(result, Opcode.REF_NULL)
                     push!(result, UInt8(ExternRef))
@@ -7648,6 +7906,22 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
     # Helper: determine the Wasm type that a phi edge value will produce on the stack
     function get_phi_edge_wasm_type(val)::Union{WasmValType, Nothing}
         if val isa Core.SSAValue
+            # If the SSA has a local allocated, return the local's actual Wasm type.
+            # This is what local.get will actually push on the stack, which may differ
+            # from the Julia-inferred type when PiNodes narrow types.
+            if haskey(ctx.ssa_locals, val.id)
+                local_idx = ctx.ssa_locals[val.id]
+                local_array_idx = local_idx - ctx.n_params + 1
+                if local_array_idx >= 1 && local_array_idx <= length(ctx.locals)
+                    return ctx.locals[local_array_idx]
+                end
+            elseif haskey(ctx.phi_locals, val.id)
+                local_idx = ctx.phi_locals[val.id]
+                local_array_idx = local_idx - ctx.n_params + 1
+                if local_array_idx >= 1 && local_array_idx <= length(ctx.locals)
+                    return ctx.locals[local_array_idx]
+                end
+            end
             edge_julia_type = get(ctx.ssa_types, val.id, nothing)
             if edge_julia_type !== nothing
                 return julia_to_wasm_type_concrete(edge_julia_type, ctx)
@@ -7696,6 +7970,13 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
         if local_type isa ConcreteRef && value_type isa ConcreteRef && local_type.type_idx != value_type.type_idx
             return false
         end
+        # ExternRef is NOT compatible with ConcreteRef/StructRef/ArrayRef/AnyRef
+        if local_type === ExternRef && (value_type isa ConcreteRef || value_type === StructRef || value_type === ArrayRef || value_type === AnyRef)
+            return false
+        end
+        if value_type === ExternRef && (local_type isa ConcreteRef || local_type === StructRef || local_type === ArrayRef || local_type === AnyRef)
+            return false
+        end
         return true
     end
 
@@ -7730,7 +8011,7 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                                     # This happens when Julia Union types have mixed primitive/ref variants.
                                     if phi_local_type isa ConcreteRef
                                         push!(bytes, Opcode.REF_NULL)
-                                        append!(bytes, encode_leb128_unsigned(phi_local_type.type_idx))
+                                        append!(bytes, encode_leb128_signed(Int64(phi_local_type.type_idx)))
                                     elseif phi_local_type === StructRef
                                         push!(bytes, Opcode.REF_NULL)
                                         push!(bytes, UInt8(StructRef))
@@ -7847,9 +8128,17 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
 
             if stmt isa Core.ReturnNode
                 if isdefined(stmt, :val)
-                    append!(block_bytes, compile_value(stmt.val, ctx))
+                    val_wasm_type = infer_value_wasm_type(stmt.val, ctx)
+                    ret_wasm_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
+                    if !return_type_compatible(val_wasm_type, ret_wasm_type)
+                        push!(block_bytes, Opcode.UNREACHABLE)
+                    else
+                        append!(block_bytes, compile_value(stmt.val, ctx))
+                        push!(block_bytes, Opcode.RETURN)
+                    end
+                else
+                    push!(block_bytes, Opcode.RETURN)
                 end
-                push!(block_bytes, Opcode.RETURN)
 
             elseif stmt isa Core.GotoIfNot
                 # GotoIfNot: handled by control flow structure
@@ -7874,7 +8163,7 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                                     # Type mismatch: emit type-safe default for the local's declared type.
                                     if phi_local_type isa ConcreteRef
                                         push!(block_bytes, Opcode.REF_NULL)
-                                        append!(block_bytes, encode_leb128_unsigned(phi_local_type.type_idx))
+                                        append!(block_bytes, encode_leb128_signed(Int64(phi_local_type.type_idx)))
                                     elseif phi_local_type === StructRef
                                         push!(block_bytes, Opcode.REF_NULL)
                                         push!(block_bytes, UInt8(StructRef))
@@ -7962,9 +8251,20 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
 
         elseif term isa Core.ReturnNode
             if isdefined(term, :val)
-                append!(bytes, compile_value(term.val, ctx))
+                # Check if the value's wasm type matches the function's return type
+                val_wasm_type = infer_value_wasm_type(term.val, ctx)
+                ret_wasm_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
+                if !return_type_compatible(val_wasm_type, ret_wasm_type)
+                    # Type mismatch: this is a dead code path (Union type resolution)
+                    # Emit unreachable instead of returning wrong type
+                    push!(bytes, Opcode.UNREACHABLE)
+                else
+                    append!(bytes, compile_value(term.val, ctx))
+                    push!(bytes, Opcode.RETURN)
+                end
+            else
+                push!(bytes, Opcode.RETURN)
             end
-            push!(bytes, Opcode.RETURN)
 
         elseif term isa Core.GotoIfNot
             dest_block = get(stmt_to_block, term.dest, nothing)
@@ -8148,10 +8448,17 @@ function generate_linear_flow(ctx::CompilationContext, blocks::Vector{BasicBlock
             if stmt isa Core.ReturnNode
                 push!(compiled, i)
                 if isdefined(stmt, :val)
-                    append!(range_bytes, compile_value(stmt.val, ctx))
+                    val_wasm_type = infer_value_wasm_type(stmt.val, ctx)
+                    ret_wasm_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
+                    if !return_type_compatible(val_wasm_type, ret_wasm_type)
+                        push!(range_bytes, Opcode.UNREACHABLE)
+                    else
+                        append!(range_bytes, compile_value(stmt.val, ctx))
+                        push!(range_bytes, Opcode.RETURN)
+                    end
+                else
+                    push!(range_bytes, Opcode.RETURN)
                 end
-                # RETURN pops the value from the stack
-                push!(range_bytes, Opcode.RETURN)
                 return range_bytes  # Return immediately
 
             elseif stmt isa Core.GotoIfNot
@@ -10076,7 +10383,7 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                     # Phi value is Julia's nothing - emit ref.null if ref type expected
                     if phi_wasm_type isa ConcreteRef
                         push!(inner_bytes, Opcode.REF_NULL)
-                        append!(inner_bytes, encode_leb128_unsigned(phi_wasm_type.type_idx))
+                        append!(inner_bytes, encode_leb128_signed(Int64(phi_wasm_type.type_idx)))
                     end
                     # For non-ref types, nothing produces no value (shouldn't happen for valid code)
                 elseif then_value !== nothing
@@ -10084,7 +10391,7 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                     if isempty(value_bytes) && phi_wasm_type isa ConcreteRef
                         # Value compiled to nothing but we need a ref type - emit ref.null
                         push!(inner_bytes, Opcode.REF_NULL)
-                        append!(inner_bytes, encode_leb128_unsigned(phi_wasm_type.type_idx))
+                        append!(inner_bytes, encode_leb128_signed(Int64(phi_wasm_type.type_idx)))
                     else
                         append!(inner_bytes, value_bytes)
                     end
@@ -10123,14 +10430,14 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                         # Phi value is Julia's nothing - emit ref.null if ref type expected
                         if phi_wasm_type isa ConcreteRef
                             push!(inner_bytes, Opcode.REF_NULL)
-                            append!(inner_bytes, encode_leb128_unsigned(phi_wasm_type.type_idx))
+                            append!(inner_bytes, encode_leb128_signed(Int64(phi_wasm_type.type_idx)))
                         end
                     elseif else_value !== nothing
                         value_bytes = compile_value(else_value, ctx)
                         if isempty(value_bytes) && phi_wasm_type isa ConcreteRef
                             # Value compiled to nothing but we need a ref type - emit ref.null
                             push!(inner_bytes, Opcode.REF_NULL)
-                            append!(inner_bytes, encode_leb128_unsigned(phi_wasm_type.type_idx))
+                            append!(inner_bytes, encode_leb128_signed(Int64(phi_wasm_type.type_idx)))
                         else
                             append!(inner_bytes, value_bytes)
                         end
@@ -10451,7 +10758,7 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
                     # Type mismatch: emit type-safe default for the local's type
                     if pi_local_type isa ConcreteRef
                         push!(bytes, Opcode.REF_NULL)
-                        append!(bytes, encode_leb128_unsigned(pi_local_type.type_idx))
+                        append!(bytes, encode_leb128_signed(Int64(pi_local_type.type_idx)))
                     elseif pi_local_type === StructRef
                         push!(bytes, Opcode.REF_NULL)
                         push!(bytes, UInt8(StructRef))
@@ -10816,7 +11123,7 @@ function compile_new(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt
                     if haskey(ctx.type_registry.structs, inner_type)
                         inner_info = ctx.type_registry.structs[inner_type]
                         push!(bytes, Opcode.REF_NULL)
-                        append!(bytes, encode_leb128_unsigned(inner_info.wasm_type_idx))
+                        append!(bytes, encode_leb128_signed(Int64(inner_info.wasm_type_idx)))
                     else
                         # Use generic null
                         push!(bytes, Opcode.REF_NULL)
@@ -10827,7 +11134,7 @@ function compile_new(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt
                     elem_type = eltype(inner_type)
                     arr_type_idx = get_array_type!(ctx.mod, ctx.type_registry, elem_type)
                     push!(bytes, Opcode.REF_NULL)
-                    append!(bytes, encode_leb128_unsigned(arr_type_idx))
+                    append!(bytes, encode_leb128_signed(Int64(arr_type_idx)))
                 else
                     # Generic nullable - use structref null
                     push!(bytes, Opcode.REF_NULL)
@@ -11016,6 +11323,70 @@ end
 # ============================================================================
 
 """
+Get the Wasm type that compile_value will push on the stack for a given value.
+Used to detect type mismatches at return sites.
+"""
+function infer_value_wasm_type(val, ctx::CompilationContext)::WasmValType
+    if val isa Core.SSAValue
+        if haskey(ctx.ssa_locals, val.id)
+            local_idx = ctx.ssa_locals[val.id]
+            local_array_idx = local_idx - ctx.n_params + 1
+            if local_array_idx >= 1 && local_array_idx <= length(ctx.locals)
+                return ctx.locals[local_array_idx]
+            end
+        elseif haskey(ctx.phi_locals, val.id)
+            local_idx = ctx.phi_locals[val.id]
+            local_array_idx = local_idx - ctx.n_params + 1
+            if local_array_idx >= 1 && local_array_idx <= length(ctx.locals)
+                return ctx.locals[local_array_idx]
+            end
+        end
+        # Fall back to Julia type inference
+        ssa_type = get(ctx.ssa_types, val.id, Any)
+        return julia_to_wasm_type_concrete(ssa_type, ctx)
+    elseif val isa Core.Argument
+        arg_idx = val.n
+        if arg_idx <= length(ctx.arg_types)
+            return julia_to_wasm_type_concrete(ctx.arg_types[arg_idx], ctx)
+        end
+        return I32
+    else
+        # Literal value
+        if val isa Int64 || val isa UInt64
+            return I64
+        elseif val isa Int32 || val isa UInt32 || val isa Bool
+            return I32
+        elseif val isa Float64
+            return F64
+        elseif val isa Float32
+            return F32
+        else
+            return ExternRef
+        end
+    end
+end
+
+"""
+Check if two wasm types are compatible for return (can be used interchangeably).
+Numeric types (I32/I64/F32/F64) are only compatible with themselves.
+Ref types are compatible with each other for externref purposes.
+"""
+function return_type_compatible(value_type::WasmValType, return_type::WasmValType)::Bool
+    if value_type == return_type
+        return true
+    end
+    # ExternRef is compatible with any ref type (ConcreteRef, StructRef, ArrayRef, AnyRef)
+    if return_type === ExternRef
+        return value_type isa ConcreteRef || value_type === StructRef || value_type === ArrayRef || value_type === AnyRef || value_type === ExternRef
+    end
+    # AnyRef is compatible with concrete refs
+    if return_type === AnyRef
+        return value_type isa ConcreteRef || value_type === StructRef || value_type === ArrayRef
+    end
+    return false
+end
+
+"""
 Compile a value reference (SSA, Argument, or Literal).
 """
 function compile_value(val, ctx::CompilationContext)::Vector{UInt8}
@@ -11056,7 +11427,7 @@ function compile_value(val, ctx::CompilationContext)::Vector{UInt8}
                             wasm_type = julia_to_wasm_type_concrete(underlying_type, ctx)
                             if wasm_type isa ConcreteRef
                                 push!(bytes, Opcode.REF_NULL)
-                                append!(bytes, encode_leb128_unsigned(wasm_type.type_idx))
+                                append!(bytes, encode_leb128_signed(Int64(wasm_type.type_idx)))
                             end
                         end
                     end
@@ -11988,6 +12359,11 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
                 push!(bytes, Opcode.STRUCT_GET)
                 append!(bytes, encode_leb128_unsigned(info.wasm_type_idx))
                 append!(bytes, encode_leb128_unsigned(field_idx - 1))
+
+                # Note: if the field is typed as Any (externref in Wasm), struct.get returns
+                # externref. The local for this SSA is also typed as externref (fixed in
+                # analyze_ssa_types! which overrides the SSA type for Any-field access).
+                # No cast is needed here — usage sites that need concrete ref will cast.
                 return bytes
             end
         end
@@ -12132,6 +12508,9 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         push!(bytes, Opcode.GC_PREFIX)
         push!(bytes, Opcode.ARRAY_GET)
         append!(bytes, encode_leb128_unsigned(array_type_idx))
+
+        # Note: if elem_type is Any, array.get returns externref and the SSA local
+        # is also typed as externref (fixed in analyze_ssa_types!). No cast needed here.
         return bytes
     end
 
@@ -13294,29 +13673,15 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         append!(bytes, compile_value(args[2], ctx))
         push!(bytes, Opcode.I64_SUB)
 
-    # Base.pointerref - read from pointer (used in string comparisons)
-    # For WasmGC strings, we use the str_char intrinsic instead
-    # But if we hit this code path, we're in trouble - strings should use our intrinsics
+    # Base.pointerref - read from pointer
+    # WasmGC has no linear memory — pointer ops are invalid. Trap at runtime.
     elseif func isa GlobalRef && func.name === :pointerref
-        # pointerref(ptr, i, aligned) -> value at ptr
-        # For now, just load the value using i64.load
-        # The pointer is an i64, index is typically Int32, aligned is Bool
-        # Result type depends on the pointer type (UInt8 for strings)
-        append!(bytes, compile_value(args[1], ctx))  # ptr
-        # Load byte (i32.load8_u)
-        push!(bytes, 0x2D)  # i32.load8_u
-        push!(bytes, 0x00)  # align=0
-        push!(bytes, 0x00)  # offset=0
+        push!(bytes, Opcode.UNREACHABLE)
 
     # Base.pointerset - write to pointer
+    # WasmGC has no linear memory — pointer ops are invalid. Trap at runtime.
     elseif func isa GlobalRef && func.name === :pointerset
-        # pointerset(ptr, val, i, aligned) -> Nothing
-        # For now, store byte using i32.store8
-        append!(bytes, compile_value(args[1], ctx))  # ptr
-        append!(bytes, compile_value(args[2], ctx))  # value
-        push!(bytes, 0x3A)  # i32.store8
-        push!(bytes, 0x00)  # align=0
-        push!(bytes, 0x00)  # offset=0
+        push!(bytes, Opcode.UNREACHABLE)
 
     # Cross-function call via GlobalRef (dynamic dispatch when Julia can't specialize)
     elseif func isa GlobalRef && ctx.func_registry !== nothing
@@ -13541,7 +13906,7 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
             # Emit the appropriate null/zero value based on the wasm type
             if wasm_type isa ConcreteRef
                 push!(bytes, Opcode.REF_NULL)
-                append!(bytes, encode_leb128_unsigned(wasm_type.type_idx))
+                append!(bytes, encode_leb128_signed(Int64(wasm_type.type_idx)))
             elseif wasm_type === ExternRef
                 push!(bytes, Opcode.REF_NULL)
                 push!(bytes, UInt8(ExternRef))

@@ -3822,4 +3822,35 @@ end
 
     end
 
+    # ========================================================================
+    # Phase 28: Expr Tree-Walker Evaluator (PURE-012)
+    # Tests for the ExprNode-based evaluator that compiles to WasmGC
+    # ========================================================================
+    @testset "Phase 28: Expr Tree-Walker Evaluator" begin
+
+        @testset "Host-side eval_expr correctness" begin
+            # Arithmetic
+            @test eval_expr(:(1 + 2)) == 3
+            @test eval_expr(:(10 - 3)) == 7
+            @test eval_expr(:(4 * 5)) == 20
+            @test eval_expr(:(2 + 3 * 4)) == 14  # (2 + (3*4)) = 14
+
+            # Variable assignment and reference
+            @test eval_expr(:(x = 5; x + 1)) == 6
+            @test eval_expr(:(a = 10; b = 20; a + b)) == 30
+
+            # Conditionals
+            @test eval_expr(:(if true 1 else 2 end)) == 1
+            @test eval_expr(:(if false 1 else 2 end)) == 2
+            @test eval_expr(:(x = 0; if x 42 else 99 end)) == 99
+        end
+
+        @testset "eval_node compiles to WasmGC" begin
+            wasm_bytes = WasmTarget.compile(eval_node, (Vector{ExprNode}, Int32, EvalEnv))
+            @test length(wasm_bytes) > 0
+            @test validate_wasm(wasm_bytes)
+        end
+
+    end
+
 end

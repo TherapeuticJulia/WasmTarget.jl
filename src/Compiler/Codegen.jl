@@ -7633,9 +7633,42 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                                 edge_val_type = get_phi_edge_wasm_type(val)
 
                                 if edge_val_type !== nothing && !wasm_types_compatible(phi_local_type, edge_val_type)
-                                    # Type mismatch: edge value type is incompatible with phi local.
-                                    # Skip this store — the value can't be stored in this local.
+                                    # Type mismatch: emit type-safe default for the local's declared type.
                                     # This happens when Julia Union types have mixed primitive/ref variants.
+                                    if phi_local_type isa ConcreteRef
+                                        push!(bytes, Opcode.REF_NULL)
+                                        append!(bytes, encode_leb128_unsigned(phi_local_type.type_idx))
+                                    elseif phi_local_type === StructRef
+                                        push!(bytes, Opcode.REF_NULL)
+                                        push!(bytes, UInt8(StructRef))
+                                    elseif phi_local_type === ArrayRef
+                                        push!(bytes, Opcode.REF_NULL)
+                                        push!(bytes, UInt8(ArrayRef))
+                                    elseif phi_local_type === ExternRef
+                                        push!(bytes, Opcode.REF_NULL)
+                                        push!(bytes, UInt8(ExternRef))
+                                    elseif phi_local_type === AnyRef
+                                        push!(bytes, Opcode.REF_NULL)
+                                        push!(bytes, UInt8(AnyRef))
+                                    elseif phi_local_type === I64
+                                        push!(bytes, Opcode.I64_CONST)
+                                        push!(bytes, 0x00)
+                                    elseif phi_local_type === I32
+                                        push!(bytes, Opcode.I32_CONST)
+                                        push!(bytes, 0x00)
+                                    elseif phi_local_type === F64
+                                        push!(bytes, Opcode.F64_CONST)
+                                        append!(bytes, UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                                    elseif phi_local_type === F32
+                                        push!(bytes, Opcode.F32_CONST)
+                                        append!(bytes, UInt8[0x00, 0x00, 0x00, 0x00])
+                                    else
+                                        push!(bytes, Opcode.I32_CONST)
+                                        push!(bytes, 0x00)
+                                    end
+                                    push!(bytes, Opcode.LOCAL_SET)
+                                    append!(bytes, encode_leb128_unsigned(local_idx))
+                                    phi_count += 1
                                     found_edge = true
                                     break
                                 end

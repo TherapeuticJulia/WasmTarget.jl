@@ -5761,7 +5761,8 @@ function generate_branched_loops(ctx::CompilationContext, first_header::Int, fir
                     append!(bytes, compile_value(stmt.val, ctx))
                     # If function returns externref but value is concrete ref, convert
                     func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
-                    if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64
+                    if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64 && val_wasm_type !== ExternRef && val_wasm_type !== ExternRef
+                        push!(bytes, Opcode.GC_PREFIX)
                         push!(bytes, Opcode.EXTERN_CONVERT_ANY)
                     end
                     push!(bytes, Opcode.RETURN)
@@ -5835,7 +5836,8 @@ function generate_branched_loops(ctx::CompilationContext, first_header::Int, fir
                     append!(bytes, compile_value(stmt.val, ctx))
                     # If function returns externref but value is concrete ref, convert
                     func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
-                    if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64
+                    if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64 && val_wasm_type !== ExternRef
+                        push!(bytes, Opcode.GC_PREFIX)
                         push!(bytes, Opcode.EXTERN_CONVERT_ANY)
                     end
                     push!(bytes, Opcode.RETURN)
@@ -6557,7 +6559,8 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
                         append!(bytes, compile_value(stmt.val, ctx))
                         # If function returns externref but value is concrete ref, convert
                         func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
-                        if func_ret_wasm === ExternRef
+                        if func_ret_wasm === ExternRef && val_wasm_type !== ExternRef
+                            push!(bytes, Opcode.GC_PREFIX)
                             push!(bytes, Opcode.EXTERN_CONVERT_ANY)
                         end
                         push!(bytes, Opcode.RETURN)
@@ -6787,7 +6790,8 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
                     append!(bytes, compile_value(stmt.val, ctx))
                     # If function returns externref but value is concrete ref, convert
                     func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
-                    if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64
+                    if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64 && val_wasm_type !== ExternRef
+                        push!(bytes, Opcode.GC_PREFIX)
                         push!(bytes, Opcode.EXTERN_CONVERT_ANY)
                     end
                     push!(bytes, Opcode.RETURN)
@@ -6912,7 +6916,8 @@ function generate_loop_code(ctx::CompilationContext)::Vector{UInt8}
                     append!(bytes, compile_value(stmt.val, ctx))
                     # If function returns externref but value is concrete ref, convert
                     func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
-                    if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64
+                    if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64 && val_wasm_type !== ExternRef
+                        push!(bytes, Opcode.GC_PREFIX)
                         push!(bytes, Opcode.EXTERN_CONVERT_ANY)
                     end
                     push!(bytes, Opcode.RETURN)
@@ -7170,7 +7175,8 @@ function generate_if_then_else(ctx::CompilationContext, blocks::Vector{BasicBloc
                         append!(bytes, compile_value(stmt.val, ctx))
                         # If function returns externref but value is concrete ref, convert
                         func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
-                        if func_ret_wasm === ExternRef
+                        if func_ret_wasm === ExternRef && val_wasm_type !== ExternRef
+                            push!(bytes, Opcode.GC_PREFIX)
                             push!(bytes, Opcode.EXTERN_CONVERT_ANY)
                         end
                         push!(bytes, Opcode.RETURN)
@@ -7234,6 +7240,15 @@ function generate_if_then_else(ctx::CompilationContext, blocks::Vector{BasicBloc
                 if stmt isa Core.ReturnNode
                     if isdefined(stmt, :val)
                         append!(bytes, compile_value(stmt.val, ctx))
+                        # If function returns externref but value is concrete ref, convert
+                        func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
+                        if func_ret_wasm === ExternRef
+                            val_wasm = get_phi_edge_wasm_type(stmt.val, ctx)
+                            if val_wasm !== I32 && val_wasm !== I64 && val_wasm !== F32 && val_wasm !== F64 && val_wasm !== ExternRef
+                                push!(bytes, Opcode.GC_PREFIX)
+                                push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                            end
+                        end
                     end
                     push!(bytes, Opcode.RETURN)
                 elseif stmt === nothing
@@ -7696,7 +7711,8 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                         append!(block_bytes, compile_value(stmt.val, ctx))
                         # If function returns externref but value is concrete ref, convert
                         func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
-                        if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64
+                        if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64 && val_wasm_type !== ExternRef
+                            push!(block_bytes, Opcode.GC_PREFIX)
                             push!(block_bytes, Opcode.EXTERN_CONVERT_ANY)
                         end
                         push!(block_bytes, Opcode.RETURN)
@@ -8419,7 +8435,8 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                         append!(block_bytes, compile_value(stmt.val, ctx))
                         # If function returns externref but value is concrete ref, convert
                         func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
-                        if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64
+                        if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64 && val_wasm_type !== ExternRef
+                            push!(block_bytes, Opcode.GC_PREFIX)
                             push!(block_bytes, Opcode.EXTERN_CONVERT_ANY)
                         end
                         push!(block_bytes, Opcode.RETURN)
@@ -8594,6 +8611,12 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                     push!(bytes, Opcode.UNREACHABLE)
                 else
                     append!(bytes, compile_value(term.val, ctx))
+                    # If function returns externref but value is concrete ref, convert
+                    func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
+                    if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64 && val_wasm_type !== ExternRef
+                        push!(bytes, Opcode.GC_PREFIX)
+                        push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                    end
                     push!(bytes, Opcode.RETURN)
                 end
             else
@@ -8790,7 +8813,8 @@ function generate_linear_flow(ctx::CompilationContext, blocks::Vector{BasicBlock
                         append!(range_bytes, compile_value(stmt.val, ctx))
                         # If function returns externref but value is concrete ref, convert
                         func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
-                        if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64
+                        if func_ret_wasm === ExternRef && val_wasm_type !== I32 && val_wasm_type !== I64 && val_wasm_type !== F32 && val_wasm_type !== F64 && val_wasm_type !== ExternRef
+                            push!(range_bytes, Opcode.GC_PREFIX)
                             push!(range_bytes, Opcode.EXTERN_CONVERT_ANY)
                         end
                         push!(range_bytes, Opcode.RETURN)
@@ -10300,7 +10324,8 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                     func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
                     val_wasm = get_phi_edge_wasm_type(stmt.val, ctx)
                     is_numeric_val = val_wasm === I32 || val_wasm === I64 || val_wasm === F32 || val_wasm === F64
-                    if func_ret_wasm === ExternRef && !is_numeric_val
+                    if func_ret_wasm === ExternRef && !is_numeric_val && val_wasm !== ExternRef
+                        push!(bytes, Opcode.GC_PREFIX)
                         push!(bytes, Opcode.EXTERN_CONVERT_ANY)
                     end
                 end
@@ -10728,7 +10753,8 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                                     func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
                                     val_wasm = get_phi_edge_wasm_type(stmt.val, ctx)
                                     is_numeric_val = val_wasm === I32 || val_wasm === I64 || val_wasm === F32 || val_wasm === F64
-                                    if func_ret_wasm === ExternRef && !is_numeric_val
+                                    if func_ret_wasm === ExternRef && !is_numeric_val && val_wasm !== ExternRef
+                                        push!(inner_bytes, Opcode.GC_PREFIX)
                                         push!(inner_bytes, Opcode.EXTERN_CONVERT_ANY)
                                     end
                                 end
@@ -10934,7 +10960,8 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                         func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
                         val_wasm = isdefined(stmt, :val) ? get_phi_edge_wasm_type(stmt.val, ctx) : nothing
                         is_numeric_val = val_wasm === I32 || val_wasm === I64 || val_wasm === F32 || val_wasm === F64
-                        if func_ret_wasm === ExternRef && !is_numeric_val
+                        if func_ret_wasm === ExternRef && !is_numeric_val && val_wasm !== ExternRef
+                            push!(inner_bytes, Opcode.GC_PREFIX)
                             push!(inner_bytes, Opcode.EXTERN_CONVERT_ANY)
                         end
                         push!(inner_bytes, Opcode.RETURN)
@@ -11148,7 +11175,8 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
                 # Check if value is numeric (can't convert numeric to externref)
                 val_wasm = get_phi_edge_wasm_type(stmt.val, ctx)
                 is_numeric_val = val_wasm === I32 || val_wasm === I64 || val_wasm === F32 || val_wasm === F64
-                if !is_numeric_val
+                if !is_numeric_val && val_wasm !== ExternRef
+                    push!(bytes, Opcode.GC_PREFIX)
                     push!(bytes, Opcode.EXTERN_CONVERT_ANY)
                 end
             end
@@ -13088,10 +13116,46 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
     if is_func(func, :ifelse) && length(args) == 3
         # Wasm select expects: [val_if_true, val_if_false, cond] (cond on top)
         # Julia ifelse(cond, true_val, false_val)
-        # So push: true_val, false_val, cond
-        append!(bytes, compile_value(args[2], ctx))  # true_val
-        append!(bytes, compile_value(args[3], ctx))  # false_val
-        append!(bytes, compile_value(args[1], ctx))  # cond
+        # Compile each value separately to check for empty results
+        true_bytes = compile_value(args[2], ctx)   # true_val
+        false_bytes = compile_value(args[3], ctx)  # false_val
+        cond_bytes = compile_value(args[1], ctx)   # cond
+
+        # If any compile_value returned empty, select would have insufficient operands.
+        # Fall back to emitting just the true value (or a type-safe default).
+        if isempty(true_bytes) || isempty(false_bytes) || isempty(cond_bytes)
+            if !isempty(true_bytes)
+                append!(bytes, true_bytes)
+            elseif !isempty(false_bytes)
+                append!(bytes, false_bytes)
+            else
+                # All empty — emit type-safe default for the value type
+                val_type = infer_value_type(args[2], ctx)
+                wasm_type = julia_to_wasm_type_concrete(val_type, ctx)
+                if wasm_type isa ConcreteRef
+                    push!(bytes, Opcode.REF_NULL)
+                    append!(bytes, encode_leb128_signed(Int64(wasm_type.type_idx)))
+                elseif wasm_type === ExternRef
+                    push!(bytes, Opcode.REF_NULL)
+                    push!(bytes, UInt8(ExternRef))
+                elseif wasm_type === I64
+                    push!(bytes, Opcode.I64_CONST)
+                    push!(bytes, 0x00)
+                elseif wasm_type === F64
+                    push!(bytes, Opcode.F64_CONST)
+                    append!(bytes, UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                else
+                    push!(bytes, Opcode.I32_CONST)
+                    push!(bytes, 0x00)
+                end
+            end
+            return bytes
+        end
+
+        # All three values are non-empty, emit proper select
+        append!(bytes, true_bytes)
+        append!(bytes, false_bytes)
+        append!(bytes, cond_bytes)
 
         # Determine the type of the values for select
         val_type = infer_value_type(args[2], ctx)

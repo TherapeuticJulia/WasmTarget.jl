@@ -9258,11 +9258,35 @@ function compile_ternary_for_phi(ctx::CompilationContext, code, cond_idx::Int, c
 
     # Then branch - push value
     if then_value !== nothing
-        append!(bytes, compile_value(then_value, ctx))
+        value_bytes = compile_value(then_value, ctx)
+        append!(bytes, value_bytes)
+        # Ensure value matches block type
+        if wasm_type === I32 && !isempty(value_bytes) && value_bytes[1] == Opcode.I64_CONST
+            push!(bytes, Opcode.I32_WRAP_I64)
+        elseif wasm_type === I64 && !isempty(value_bytes) && value_bytes[1] == Opcode.I32_CONST
+            push!(bytes, Opcode.I64_EXTEND_I32_S)
+        end
     else
-        # Fallback
-        push!(bytes, Opcode.I64_CONST)
-        push!(bytes, 0x00)
+        # Fallback: emit type-safe default matching the block type
+        if wasm_type === I32
+            push!(bytes, Opcode.I32_CONST)
+            push!(bytes, 0x00)
+        elseif wasm_type === F64
+            push!(bytes, Opcode.F64_CONST)
+            append!(bytes, UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        elseif wasm_type === F32
+            push!(bytes, Opcode.F32_CONST)
+            append!(bytes, UInt8[0x00, 0x00, 0x00, 0x00])
+        elseif wasm_type isa ConcreteRef
+            push!(bytes, Opcode.REF_NULL)
+            append!(bytes, encode_leb128_signed(Int64(wasm_type.type_idx)))
+        elseif wasm_type === StructRef || wasm_type === ArrayRef || wasm_type === ExternRef || wasm_type === AnyRef
+            push!(bytes, Opcode.REF_NULL)
+            push!(bytes, UInt8(wasm_type))
+        else
+            push!(bytes, Opcode.I64_CONST)
+            push!(bytes, 0x00)
+        end
     end
 
     # Else branch
@@ -9270,10 +9294,35 @@ function compile_ternary_for_phi(ctx::CompilationContext, code, cond_idx::Int, c
 
     # Else branch - push value
     if else_value !== nothing
-        append!(bytes, compile_value(else_value, ctx))
+        value_bytes = compile_value(else_value, ctx)
+        append!(bytes, value_bytes)
+        # Ensure value matches block type
+        if wasm_type === I32 && !isempty(value_bytes) && value_bytes[1] == Opcode.I64_CONST
+            push!(bytes, Opcode.I32_WRAP_I64)
+        elseif wasm_type === I64 && !isempty(value_bytes) && value_bytes[1] == Opcode.I32_CONST
+            push!(bytes, Opcode.I64_EXTEND_I32_S)
+        end
     else
-        push!(bytes, Opcode.I64_CONST)
-        push!(bytes, 0x00)
+        # Fallback: emit type-safe default matching the block type
+        if wasm_type === I32
+            push!(bytes, Opcode.I32_CONST)
+            push!(bytes, 0x00)
+        elseif wasm_type === F64
+            push!(bytes, Opcode.F64_CONST)
+            append!(bytes, UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        elseif wasm_type === F32
+            push!(bytes, Opcode.F32_CONST)
+            append!(bytes, UInt8[0x00, 0x00, 0x00, 0x00])
+        elseif wasm_type isa ConcreteRef
+            push!(bytes, Opcode.REF_NULL)
+            append!(bytes, encode_leb128_signed(Int64(wasm_type.type_idx)))
+        elseif wasm_type === StructRef || wasm_type === ArrayRef || wasm_type === ExternRef || wasm_type === AnyRef
+            push!(bytes, Opcode.REF_NULL)
+            push!(bytes, UInt8(wasm_type))
+        else
+            push!(bytes, Opcode.I64_CONST)
+            push!(bytes, 0x00)
+        end
     end
 
     push!(bytes, Opcode.END)

@@ -1648,6 +1648,10 @@ function _register_struct_type_impl_with_reserved!(mod::WasmModule, registry::Ty
                     end
                     array_type_idx = get_array_type!(mod, registry, elem_type)
                     wasm_vt = ConcreteRef(array_type_idx, true)
+                elseif inner_type === String || inner_type === Symbol
+                    # Union{Nothing, String/Symbol} — nullable string array ref
+                    str_type_idx = get_string_array_type!(mod, registry)
+                    wasm_vt = ConcreteRef(str_type_idx, true)
                 elseif isconcretetype(inner_type) && isstructtype(inner_type)
                     if haskey(_registering_types, inner_type)
                         r_idx = _registering_types[inner_type]
@@ -1797,6 +1801,10 @@ function _register_struct_type_impl!(mod::WasmModule, registry::TypeRegistry, T:
                     # get_array_type! handles self-referential types
                     array_type_idx = get_array_type!(mod, registry, elem_type)
                     wasm_vt = ConcreteRef(array_type_idx, true)  # nullable
+                elseif inner_type === String || inner_type === Symbol
+                    # Union{Nothing, String/Symbol} — nullable string array ref
+                    str_type_idx = get_string_array_type!(mod, registry)
+                    wasm_vt = ConcreteRef(str_type_idx, true)
                 elseif isconcretetype(inner_type) && isstructtype(inner_type)
                     # Union{Nothing, SomeStruct} - nullable struct ref
                     if haskey(_registering_types, inner_type)
@@ -11662,7 +11670,12 @@ function compile_new(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt
 
             if should_emit_null
                 # Nothing value (literal or SSA with Nothing type) - emit ref.null
-                if inner_type !== nothing && isconcretetype(inner_type) && isstructtype(inner_type)
+                if inner_type !== nothing && (inner_type === String || inner_type === Symbol)
+                    # Nullable string/symbol — use string array type
+                    str_type_idx = get_string_array_type!(ctx.mod, ctx.type_registry)
+                    push!(bytes, Opcode.REF_NULL)
+                    append!(bytes, encode_leb128_signed(Int64(str_type_idx)))
+                elseif inner_type !== nothing && isconcretetype(inner_type) && isstructtype(inner_type)
                     # Nullable struct ref - emit null reference
                     if haskey(ctx.type_registry.structs, inner_type)
                         inner_info = ctx.type_registry.structs[inner_type]
@@ -11685,8 +11698,60 @@ function compile_new(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt
                     push!(bytes, UInt8(StructRef))
                 end
             else
-                # Non-null value - just compile normally
-                append!(bytes, compile_value(val, ctx))
+                # Non-null value - compile with type safety check
+                val_bytes = compile_value(val, ctx)
+                # Safety: if compile_value produced a numeric local.get but the field
+                # expects a ref type (Union{Nothing, String} field = ref null array),
+                # emit ref.null of the correct type instead.
+                is_numeric_for_ref = false
+                if inner_type !== nothing && length(val_bytes) >= 2 && val_bytes[1] == 0x20
+                    src_idx = 0; shift = 0; leb_end = 0
+                    for bi in 2:length(val_bytes)
+                        b = val_bytes[bi]
+                        src_idx |= (Int(b & 0x7f) << shift)
+                        shift += 7
+                        if (b & 0x80) == 0
+                            leb_end = bi
+                            break
+                        end
+                    end
+                    if leb_end == length(val_bytes)  # Pure local.get
+                        src_type = nothing
+                        arr_idx_check = src_idx - ctx.n_params + 1
+                        if arr_idx_check >= 1 && arr_idx_check <= length(ctx.locals)
+                            src_type = ctx.locals[arr_idx_check]
+                        elseif src_idx < ctx.n_params
+                            param_idx = src_idx + 1
+                            if param_idx >= 1 && param_idx <= length(ctx.arg_types)
+                                src_type = get_concrete_wasm_type(ctx.arg_types[param_idx], ctx.mod, ctx.type_registry)
+                            end
+                        end
+                        if src_type !== nothing && (src_type === I32 || src_type === I64 || src_type === F32 || src_type === F64)
+                            # Numeric local used for ref-typed Union field — emit ref.null
+                            if inner_type === String || inner_type === Symbol
+                                str_type_idx = get_string_array_type!(ctx.mod, ctx.type_registry)
+                                push!(bytes, Opcode.REF_NULL)
+                                append!(bytes, encode_leb128_signed(Int64(str_type_idx)))
+                            elseif inner_type <: AbstractVector
+                                elem_type = eltype(inner_type)
+                                arr_type_idx = get_array_type!(ctx.mod, ctx.type_registry, elem_type)
+                                push!(bytes, Opcode.REF_NULL)
+                                append!(bytes, encode_leb128_signed(Int64(arr_type_idx)))
+                            elseif haskey(ctx.type_registry.structs, inner_type)
+                                inner_info = ctx.type_registry.structs[inner_type]
+                                push!(bytes, Opcode.REF_NULL)
+                                append!(bytes, encode_leb128_signed(Int64(inner_info.wasm_type_idx)))
+                            else
+                                push!(bytes, Opcode.REF_NULL)
+                                push!(bytes, UInt8(StructRef))
+                            end
+                            is_numeric_for_ref = true
+                        end
+                    end
+                end
+                if !is_numeric_for_ref
+                    append!(bytes, val_bytes)
+                end
             end
         elseif field_type === Any
             # Any field maps to externref in WasmGC
@@ -11750,27 +11815,35 @@ function compile_new(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt
                     shift += 7
                     (b & 0x80) == 0 && break
                 end
+                # Determine source type: either from ctx.locals (SSA) or from params
+                src_type = nothing
                 arr_idx = src_idx - ctx.n_params + 1
                 if arr_idx >= 1 && arr_idx <= length(ctx.locals)
                     src_type = ctx.locals[arr_idx]
-                    if src_type === I64 || src_type === I32
-                        # Source local is numeric but field expects ref — emit ref.null
-                        # Use the ACTUAL field type from the struct definition
-                        if actual_field_wasm isa ConcreteRef
-                            push!(bytes, Opcode.REF_NULL)
-                            append!(bytes, encode_leb128_signed(Int64(actual_field_wasm.type_idx)))
-                        elseif actual_field_wasm === ArrayRef
-                            push!(bytes, Opcode.REF_NULL)
-                            push!(bytes, UInt8(ArrayRef))
-                        elseif actual_field_wasm === ExternRef
-                            push!(bytes, Opcode.REF_NULL)
-                            push!(bytes, UInt8(ExternRef))
-                        else
-                            push!(bytes, Opcode.REF_NULL)
-                            push!(bytes, UInt8(StructRef))
-                        end
-                        field_bytes = UInt8[]  # Don't append original
+                elseif src_idx < ctx.n_params
+                    # Function parameter — get type from arg_types
+                    param_idx = src_idx + 1  # 0-based to 1-based
+                    if param_idx >= 1 && param_idx <= length(ctx.arg_types)
+                        src_type = get_concrete_wasm_type(ctx.arg_types[param_idx], ctx.mod, ctx.type_registry)
                     end
+                end
+                if src_type !== nothing && (src_type === I64 || src_type === I32 || src_type === F32 || src_type === F64)
+                    # Source local is numeric but field expects ref — emit ref.null
+                    # Use the ACTUAL field type from the struct definition
+                    if actual_field_wasm isa ConcreteRef
+                        push!(bytes, Opcode.REF_NULL)
+                        append!(bytes, encode_leb128_signed(Int64(actual_field_wasm.type_idx)))
+                    elseif actual_field_wasm === ArrayRef
+                        push!(bytes, Opcode.REF_NULL)
+                        push!(bytes, UInt8(ArrayRef))
+                    elseif actual_field_wasm === ExternRef
+                        push!(bytes, Opcode.REF_NULL)
+                        push!(bytes, UInt8(ExternRef))
+                    else
+                        push!(bytes, Opcode.REF_NULL)
+                        push!(bytes, UInt8(StructRef))
+                    end
+                    field_bytes = UInt8[]  # Don't append original
                 end
             end
             append!(bytes, field_bytes)

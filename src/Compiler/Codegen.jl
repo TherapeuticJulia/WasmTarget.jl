@@ -11220,6 +11220,44 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
                     end
                 end
 
+                # Check if stmt_bytes ENDS with a local.get of incompatible type
+                # (handles non-pure cases like memoryrefset! which returns value after array_set)
+                if !needs_type_safe_default && length(stmt_bytes) >= 2
+                    # Find the last local_get at the end of stmt_bytes
+                    local end_lg_pos = 0
+                    # Scan backward for 0x20 (LOCAL_GET) that could be the trailing value
+                    for si in length(stmt_bytes):-1:max(1, length(stmt_bytes) - 5)
+                        if stmt_bytes[si] == 0x20 && si < length(stmt_bytes)
+                            # Try to decode LEB128 after it
+                            local tlg_idx = 0
+                            local tlg_shift = 0
+                            local tlg_end = 0
+                            for bi in (si + 1):length(stmt_bytes)
+                                b = stmt_bytes[bi]
+                                tlg_idx |= (Int(b & 0x7f) << tlg_shift)
+                                tlg_shift += 7
+                                if (b & 0x80) == 0
+                                    tlg_end = bi
+                                    break
+                                end
+                            end
+                            if tlg_end == length(stmt_bytes)
+                                # This local.get is at the very end of stmt_bytes
+                                tlg_arr_idx = tlg_idx - ctx.n_params + 1
+                                if tlg_arr_idx >= 1 && tlg_arr_idx <= length(ctx.locals)
+                                    tlg_type = ctx.locals[tlg_arr_idx]
+                                    if !wasm_types_compatible(local_wasm_type, tlg_type)
+                                        # Trailing local.get of incompatible type — truncate and emit default
+                                        resize!(stmt_bytes, si - 1)
+                                        needs_type_safe_default = true
+                                    end
+                                end
+                            end
+                            break
+                        end
+                    end
+                end
+
                 # Check if stmt_bytes ends with struct_get whose result type is incompatible
                 # with the target local. struct_get = [0xFB, 0x02, type_leb, field_leb]
                 if !needs_type_safe_default && length(stmt_bytes) >= 4 && local_wasm_type isa ConcreteRef
@@ -12775,7 +12813,43 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
             push!(bytes, Opcode.I32_WRAP_I64)  # array.set expects i32 index
 
             # Value to store
-            append!(bytes, compile_value(item_arg, ctx))
+            local item_bytes = compile_value(item_arg, ctx)
+            # If array element type is externref (elem_type is Any), convert ref→externref
+            if elem_type === Any
+                # Check if value is a numeric type — emit ref.null extern instead
+                local is_numeric_item = false
+                if length(item_bytes) >= 2 && item_bytes[1] == Opcode.LOCAL_GET
+                    local src_idx_i = 0
+                    local shift_i = 0
+                    local pos_i = 2
+                    while pos_i <= length(item_bytes)
+                        b = item_bytes[pos_i]
+                        src_idx_i |= (Int(b & 0x7f) << shift_i)
+                        shift_i += 7
+                        pos_i += 1
+                        (b & 0x80) == 0 && break
+                    end
+                    if pos_i - 1 == length(item_bytes) && src_idx_i < length(ctx.locals)
+                        src_type_i = ctx.locals[src_idx_i + 1]
+                        if src_type_i === I64 || src_type_i === I32 || src_type_i === F64 || src_type_i === F32
+                            is_numeric_item = true
+                        end
+                    end
+                elseif length(item_bytes) >= 1 && (item_bytes[1] == Opcode.I32_CONST || item_bytes[1] == Opcode.I64_CONST || item_bytes[1] == Opcode.F32_CONST || item_bytes[1] == Opcode.F64_CONST)
+                    is_numeric_item = true
+                end
+                if is_numeric_item
+                    push!(bytes, Opcode.REF_NULL)
+                    push!(bytes, UInt8(ExternRef))
+                else
+                    append!(bytes, item_bytes)
+                    # extern.convert_any: (ref null X) → externref
+                    push!(bytes, Opcode.GC_PREFIX)
+                    push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                end
+            else
+                append!(bytes, item_bytes)
+            end
 
             # array.set
             push!(bytes, Opcode.GC_PREFIX)
@@ -13289,7 +13363,41 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
 
         # Compile the value to store - we need it twice (for array.set and return)
         # First compile gets the value on stack for array.set
-        append!(bytes, compile_value(value_arg, ctx))
+        local mset_val_bytes = compile_value(value_arg, ctx)
+        # If array element type is externref (elem_type is Any), convert ref→externref
+        if elem_type === Any
+            local is_numeric_mset = false
+            if length(mset_val_bytes) >= 2 && mset_val_bytes[1] == Opcode.LOCAL_GET
+                local src_idx_m = 0
+                local shift_m = 0
+                local pos_m = 2
+                while pos_m <= length(mset_val_bytes)
+                    b = mset_val_bytes[pos_m]
+                    src_idx_m |= (Int(b & 0x7f) << shift_m)
+                    shift_m += 7
+                    pos_m += 1
+                    (b & 0x80) == 0 && break
+                end
+                if pos_m - 1 == length(mset_val_bytes) && src_idx_m < length(ctx.locals)
+                    src_type_m = ctx.locals[src_idx_m + 1]
+                    if src_type_m === I64 || src_type_m === I32 || src_type_m === F64 || src_type_m === F32
+                        is_numeric_mset = true
+                    end
+                end
+            elseif length(mset_val_bytes) >= 1 && (mset_val_bytes[1] == Opcode.I32_CONST || mset_val_bytes[1] == Opcode.I64_CONST || mset_val_bytes[1] == Opcode.F32_CONST || mset_val_bytes[1] == Opcode.F64_CONST)
+                is_numeric_mset = true
+            end
+            if is_numeric_mset
+                push!(bytes, Opcode.REF_NULL)
+                push!(bytes, UInt8(ExternRef))
+            else
+                append!(bytes, mset_val_bytes)
+                push!(bytes, Opcode.GC_PREFIX)
+                push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+            end
+        else
+            append!(bytes, mset_val_bytes)
+        end
 
         # array.set consumes [array_ref, i32_index, value] and returns nothing
         push!(bytes, Opcode.GC_PREFIX)
@@ -13298,6 +13406,8 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
 
         # Julia's memoryrefset! returns the stored value, so push it again
         # This is needed because compile_statement may add LOCAL_SET after this
+        # Return the original value (not externref-converted) — compile_statement
+        # safety check handles any type mismatch with the target SSA local
         append!(bytes, compile_value(value_arg, ctx))
         return bytes
     end
@@ -13523,11 +13633,44 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
         if (arg1_is_nothing && is_ref_type_or_union(arg2_type)) ||
            (arg2_is_nothing && is_ref_type_or_union(arg1_type))
             # Compile the non-nothing ref argument
+            local val_bytes = UInt8[]
             if arg1_is_nothing
-                append!(bytes, compile_value(args[2], ctx))
+                val_bytes = compile_value(args[2], ctx)
             else
-                append!(bytes, compile_value(args[1], ctx))
+                val_bytes = compile_value(args[1], ctx)
             end
+            # Check if compile_value produced a numeric type (i32/i64/f32/f64)
+            # Numeric values can never be null, so short-circuit
+            local is_numeric_val = false
+            if length(val_bytes) >= 2 && val_bytes[1] == Opcode.LOCAL_GET
+                # Decode local index and check its Wasm type
+                local src_idx = 0
+                local shift = 0
+                local pos = 2
+                while pos <= length(val_bytes)
+                    b = val_bytes[pos]
+                    src_idx |= (Int(b & 0x7f) << shift)
+                    shift += 7
+                    pos += 1
+                    (b & 0x80) == 0 && break
+                end
+                if pos - 1 == length(val_bytes) && src_idx < length(ctx.locals)
+                    src_type = ctx.locals[src_idx + 1]
+                    if src_type === I64 || src_type === I32 || src_type === F64 || src_type === F32
+                        is_numeric_val = true
+                    end
+                end
+            elseif length(val_bytes) >= 1 && (val_bytes[1] == Opcode.I32_CONST || val_bytes[1] == Opcode.I64_CONST || val_bytes[1] == Opcode.F32_CONST || val_bytes[1] == Opcode.F64_CONST)
+                is_numeric_val = true
+            end
+            if is_numeric_val
+                # Numeric value can never be nothing
+                # === nothing → false (0), !== nothing → true (1)
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, is_func(func, :(!==)) ? 0x01 : 0x00)
+                return bytes
+            end
+            append!(bytes, val_bytes)
             # ref.is_null checks if ref is null (returns i32 1 for null, 0 otherwise)
             push!(bytes, Opcode.REF_IS_NULL)
             if is_func(func, :(!==))
@@ -14351,14 +14494,42 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
             end
         elseif check_type === Nothing
             # isa(x, Nothing) -> ref.is_null
-            # Value is already on stack
-            push!(bytes, Opcode.REF_IS_NULL)
+            # Value is already on stack — check if it's actually a ref type
+            local isa_val_wasm = nothing
+            if value_arg isa Core.SSAValue
+                local isa_local_idx = get(ctx.ssa_locals, value_arg.id, nothing)
+                if isa_local_idx !== nothing && isa_local_idx < length(ctx.locals)
+                    isa_val_wasm = ctx.locals[isa_local_idx + 1]
+                end
+            end
+            if isa_val_wasm !== nothing && (isa_val_wasm === I64 || isa_val_wasm === I32 || isa_val_wasm === F64 || isa_val_wasm === F32)
+                # Numeric value on stack — can never be Nothing. Drop + push false.
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x00)
+            else
+                push!(bytes, Opcode.REF_IS_NULL)
+            end
         elseif check_type !== nothing && isconcretetype(check_type)
             # isa(x, ConcreteType) -> check if reference is non-null
             # For Union{Nothing, T}, checking isa(x, T) is equivalent to !isnull
-            # Value is already on stack
-            push!(bytes, Opcode.REF_IS_NULL)
-            push!(bytes, Opcode.I32_EQZ)  # negate: 1->0, 0->1
+            # Value is already on stack — check if it's actually a ref type
+            local isa2_val_wasm = nothing
+            if value_arg isa Core.SSAValue
+                local isa2_local_idx = get(ctx.ssa_locals, value_arg.id, nothing)
+                if isa2_local_idx !== nothing && isa2_local_idx < length(ctx.locals)
+                    isa2_val_wasm = ctx.locals[isa2_local_idx + 1]
+                end
+            end
+            if isa2_val_wasm !== nothing && (isa2_val_wasm === I64 || isa2_val_wasm === I32 || isa2_val_wasm === F64 || isa2_val_wasm === F32)
+                # Numeric value on stack — can never be Nothing, so isa(x, T) is true. Drop + push true.
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)
+            else
+                push!(bytes, Opcode.REF_IS_NULL)
+                push!(bytes, Opcode.I32_EQZ)  # negate: 1->0, 0->1
+            end
         else
             # Unknown type - drop value and return false
             push!(bytes, Opcode.DROP)

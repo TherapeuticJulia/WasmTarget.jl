@@ -5970,6 +5970,11 @@ function wasm_types_compatible(local_type::WasmValType, value_type::WasmValType)
     if local_type isa ConcreteRef && value_type isa ConcreteRef && local_type.type_idx != value_type.type_idx
         return false
     end
+    # Abstract ref (StructRef/ArrayRef) is NOT directly compatible with ConcreteRef
+    # (requires ref.cast to downcast from abstract to concrete)
+    if local_type isa ConcreteRef && (value_type === StructRef || value_type === ArrayRef)
+        return false
+    end
     # ExternRef is NOT compatible with ConcreteRef/StructRef/ArrayRef/AnyRef
     # (externref is outside the anyref hierarchy in WasmGC)
     if local_type === ExternRef && (value_type isa ConcreteRef || value_type === StructRef || value_type === ArrayRef || value_type === AnyRef)
@@ -8226,6 +8231,11 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
         end
         # Different concrete refs are not directly compatible
         if local_type isa ConcreteRef && value_type isa ConcreteRef && local_type.type_idx != value_type.type_idx
+            return false
+        end
+        # Abstract ref (StructRef/ArrayRef) is NOT directly compatible with ConcreteRef
+        # (requires ref.cast to downcast from abstract to concrete)
+        if local_type isa ConcreteRef && (value_type === StructRef || value_type === ArrayRef)
             return false
         end
         # ExternRef is NOT compatible with ConcreteRef/StructRef/ArrayRef/AnyRef
@@ -11476,7 +11486,13 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
                     if is_pure_local_get && src_array_idx >= 1 && src_array_idx <= length(ctx.locals)
                         src_wasm_type = ctx.locals[src_array_idx]
                         if !wasm_types_compatible(local_wasm_type, src_wasm_type)
-                            needs_type_safe_default = true
+                            # Check if this is abstract ref → concrete ref (can be cast, not replaced)
+                            if (src_wasm_type === StructRef || src_wasm_type === ArrayRef) && local_wasm_type isa ConcreteRef
+                                # Abstract ref can be downcast to concrete ref with ref.cast
+                                needs_ref_cast_local = local_wasm_type
+                            else
+                                needs_type_safe_default = true
+                            end
                         end
                     end
                 elseif (stmt_bytes[1] == Opcode.I32_CONST || stmt_bytes[1] == Opcode.I64_CONST ||
@@ -14615,14 +14631,186 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
             push!(bytes, Opcode.F64_EQ)
         elseif arg_type === Float32
             push!(bytes, Opcode.F32_EQ)
-        elseif is_ref_type_or_union(arg_type) || is_ref_type_or_union(infer_value_type(args[2], ctx))
-            # Reference type comparison - use ref.eq for WasmGC
-            # If either arg is literally nothing, the value is already ref.null on stack
-            # The ref.eq instruction handles null refs correctly
-            # ref.eq is a standalone opcode (0xD3), not under GC_PREFIX
-            push!(bytes, Opcode.REF_EQ)
         else
-            push!(bytes, is_32bit ? Opcode.I32_EQ : Opcode.I64_EQ)
+            local arg2_type = length(args) >= 2 ? infer_value_type(args[2], ctx) : Int64
+            local arg1_is_ref = is_ref_type_or_union(arg_type) && arg_type !== Nothing
+            local arg2_is_ref = is_ref_type_or_union(arg2_type) && arg2_type !== Nothing
+
+            # Quick check: if one arg is ref-typed and other is Nothing (compiles to i32),
+            # they can't be equal via ref.eq OR i32/i64 eq. Drop both and return false.
+            if (arg1_is_ref && arg2_type === Nothing) || (arg2_is_ref && arg_type === Nothing)
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x00)
+                return bytes
+            end
+
+            # Special case: both args are Nothing-typed. Need to check actual Wasm representation
+            # because Nothing can compile to either ref.null OR i32.const depending on context.
+            if arg_type === Nothing && arg2_type === Nothing
+                # Re-compile to check Wasm types
+                local arg1_bytes_chk = compile_value(args[1], ctx)
+                local arg2_bytes_chk = compile_value(args[2], ctx)
+                local a1_is_ref = length(arg1_bytes_chk) >= 1 && (arg1_bytes_chk[1] == Opcode.REF_NULL ||
+                    (arg1_bytes_chk[1] == Opcode.LOCAL_GET && length(arg1_bytes_chk) >= 2))
+                local a2_is_ref = length(arg2_bytes_chk) >= 1 && (arg2_bytes_chk[1] == Opcode.REF_NULL ||
+                    (arg2_bytes_chk[1] == Opcode.LOCAL_GET && length(arg2_bytes_chk) >= 2))
+                # Check local types for LOCAL_GET
+                if arg1_bytes_chk[1] == Opcode.LOCAL_GET && length(arg1_bytes_chk) >= 2
+                    local idx1 = 0
+                    local sh1 = 0
+                    local p1 = 2
+                    while p1 <= length(arg1_bytes_chk)
+                        b = arg1_bytes_chk[p1]
+                        idx1 |= (Int(b & 0x7f) << sh1)
+                        sh1 += 7
+                        p1 += 1
+                        (b & 0x80) == 0 && break
+                    end
+                    local off1 = idx1 - ctx.n_params
+                    if off1 >= 0 && off1 < length(ctx.locals)
+                        local lt1 = ctx.locals[off1 + 1]
+                        a1_is_ref = lt1 isa ConcreteRef || lt1 === StructRef || lt1 === ArrayRef || lt1 === ExternRef || lt1 === AnyRef
+                    else
+                        a1_is_ref = false
+                    end
+                end
+                if arg2_bytes_chk[1] == Opcode.LOCAL_GET && length(arg2_bytes_chk) >= 2
+                    local idx2 = 0
+                    local sh2 = 0
+                    local p2 = 2
+                    while p2 <= length(arg2_bytes_chk)
+                        b = arg2_bytes_chk[p2]
+                        idx2 |= (Int(b & 0x7f) << sh2)
+                        sh2 += 7
+                        p2 += 1
+                        (b & 0x80) == 0 && break
+                    end
+                    local off2 = idx2 - ctx.n_params
+                    if off2 >= 0 && off2 < length(ctx.locals)
+                        local lt2 = ctx.locals[off2 + 1]
+                        a2_is_ref = lt2 isa ConcreteRef || lt2 === StructRef || lt2 === ArrayRef || lt2 === ExternRef || lt2 === AnyRef
+                    else
+                        a2_is_ref = false
+                    end
+                end
+                # If Wasm types mismatch (one ref, one not), drop both and return false
+                if a1_is_ref != a2_is_ref
+                    push!(bytes, Opcode.DROP)
+                    push!(bytes, Opcode.DROP)
+                    push!(bytes, Opcode.I32_CONST)
+                    push!(bytes, 0x00)
+                    return bytes
+                elseif a1_is_ref && a2_is_ref
+                    # Both refs - use ref.eq
+                    push!(bytes, Opcode.REF_EQ)
+                    return bytes
+                end
+                # Both numeric - fall through to normal handling
+            end
+
+            # Check if args were actually compiled as refs (Nothing can compile to ref.null OR i32.const 0)
+            # The bytes already have [arg1_bytes..., arg2_bytes...]
+            # Check last pushed arg (arg2) - if it starts with REF_NULL (0xD0), it's a ref
+            # Also check for local.get of ref-typed local
+            local arg1_wasm_is_ref = arg1_is_ref
+            local arg2_wasm_is_ref = arg2_is_ref
+            # Check Wasm representation for any potentially mixed comparison
+            # (when one arg is ref-typed or Nothing, verify actual Wasm types)
+            if arg_type === Nothing || arg2_type === Nothing || arg1_is_ref || arg2_is_ref
+                # Re-compile args to check their Wasm representation
+                # arg1 first, arg2 second on stack
+                # For Nothing-typed args, check actual Wasm representation
+                # (Nothing can compile to ref.null OR i32.const 0 depending on context)
+                # Check arg1's Wasm type when:
+                # - arg_type === Nothing (need to verify if it's actually ref.null or i32)
+                # - arg2_type === Nothing (need to know if arg1 is ref to do proper comparison)
+                if length(args) >= 1 && (arg_type === Nothing || arg2_type === Nothing)
+                    local arg1_bytes = compile_value(args[1], ctx)
+                    if length(arg1_bytes) >= 1
+                        if arg1_bytes[1] == Opcode.REF_NULL
+                            arg1_wasm_is_ref = true
+                        elseif arg1_bytes[1] == Opcode.LOCAL_GET && length(arg1_bytes) >= 2
+                            local local_idx_1 = 0
+                            local shift_1 = 0
+                            local pos_1 = 2
+                            while pos_1 <= length(arg1_bytes)
+                                b = arg1_bytes[pos_1]
+                                local_idx_1 |= (Int(b & 0x7f) << shift_1)
+                                shift_1 += 7
+                                pos_1 += 1
+                                (b & 0x80) == 0 && break
+                            end
+                            # ctx.locals doesn't include params, so adjust index
+                            local local_offset_1 = local_idx_1 - ctx.n_params
+                            if local_offset_1 >= 0 && local_offset_1 < length(ctx.locals)
+                                local ltype_1 = ctx.locals[local_offset_1 + 1]
+                                arg1_wasm_is_ref = ltype_1 isa ConcreteRef || ltype_1 === StructRef ||
+                                                   ltype_1 === ArrayRef || ltype_1 === ExternRef || ltype_1 === AnyRef
+                            end
+                        end
+                    end
+                end
+                # Check arg2's Wasm type when:
+                # - arg2_type === Nothing (need to verify if it's actually ref.null or i32)
+                # - arg_type === Nothing (need to know if arg2 is ref to do proper comparison)
+                if length(args) >= 2 && (arg2_type === Nothing || arg_type === Nothing)
+                    local arg2_bytes = compile_value(args[2], ctx)
+                    if length(arg2_bytes) >= 1
+                        if arg2_bytes[1] == Opcode.REF_NULL
+                            arg2_wasm_is_ref = true
+                        elseif arg2_bytes[1] == Opcode.LOCAL_GET && length(arg2_bytes) >= 2
+                            local local_idx_2 = 0
+                            local shift_2 = 0
+                            local pos_2 = 2
+                            while pos_2 <= length(arg2_bytes)
+                                b = arg2_bytes[pos_2]
+                                local_idx_2 |= (Int(b & 0x7f) << shift_2)
+                                shift_2 += 7
+                                pos_2 += 1
+                                (b & 0x80) == 0 && break
+                            end
+                            # ctx.locals doesn't include params, so adjust index
+                            local local_offset_2 = local_idx_2 - ctx.n_params
+                            if local_offset_2 >= 0 && local_offset_2 < length(ctx.locals)
+                                local ltype_2 = ctx.locals[local_offset_2 + 1]
+                                arg2_wasm_is_ref = ltype_2 isa ConcreteRef || ltype_2 === StructRef ||
+                                                   ltype_2 === ArrayRef || ltype_2 === ExternRef || ltype_2 === AnyRef
+                            end
+                        end
+                    end
+                end
+            end
+            # BOTH args must be ref types to use ref.eq
+            if arg1_wasm_is_ref && arg2_wasm_is_ref
+                # ref.eq is a standalone opcode (0xD3), not under GC_PREFIX
+                push!(bytes, Opcode.REF_EQ)
+            elseif arg1_wasm_is_ref && !arg2_wasm_is_ref
+                # Comparing ref with non-ref: type mismatch, drop both and push false
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x00)
+            elseif !arg1_wasm_is_ref && arg2_wasm_is_ref
+                # Comparing non-ref with ref: type mismatch, drop both and push false
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x00)
+            elseif !is_32bit && arg2_type === Nothing
+                # arg1 is 64-bit, arg2 is Nothing (i32). Extend i32 to i64 before comparing.
+                push!(bytes, Opcode.I64_EXTEND_I32_S)
+                push!(bytes, Opcode.I64_EQ)
+            elseif is_32bit && arg_type === Nothing && !is_ref_type_or_union(arg2_type)
+                # arg1 is Nothing (i32), arg2 is 64-bit - mismatched types
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x00)
+            else
+                push!(bytes, is_32bit ? Opcode.I32_EQ : Opcode.I64_EQ)
+            end
         end
 
     elseif is_func(func, :(!==))
@@ -14632,13 +14820,171 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
             push!(bytes, Opcode.F64_NE)
         elseif arg_type === Float32
             push!(bytes, Opcode.F32_NE)
-        elseif is_ref_type_or_union(arg_type) || is_ref_type_or_union(infer_value_type(args[2], ctx))
-            # Reference type comparison - use ref.eq then negate
-            # ref.eq is a standalone opcode (0xD3), not under GC_PREFIX
-            push!(bytes, Opcode.REF_EQ)
-            push!(bytes, Opcode.I32_EQZ)  # Negate for !==
         else
-            push!(bytes, is_32bit ? Opcode.I32_NE : Opcode.I64_NE)
+            local arg2_type_ne = length(args) >= 2 ? infer_value_type(args[2], ctx) : Int64
+            local arg1_is_ref_ne = is_ref_type_or_union(arg_type) && arg_type !== Nothing
+            local arg2_is_ref_ne = is_ref_type_or_union(arg2_type_ne) && arg2_type_ne !== Nothing
+
+            # Quick check: if one arg is ref-typed and other is Nothing (compiles to i32),
+            # they can't be equal, so !== is always true. Drop both and return true.
+            if (arg1_is_ref_ne && arg2_type_ne === Nothing) || (arg2_is_ref_ne && arg_type === Nothing)
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)
+                return bytes
+            end
+
+            # Special case: both args are Nothing-typed. Need to check actual Wasm representation.
+            if arg_type === Nothing && arg2_type_ne === Nothing
+                local arg1_bytes_ne_chk = compile_value(args[1], ctx)
+                local arg2_bytes_ne_chk = compile_value(args[2], ctx)
+                local a1_ref_ne = length(arg1_bytes_ne_chk) >= 1 && (arg1_bytes_ne_chk[1] == Opcode.REF_NULL ||
+                    (arg1_bytes_ne_chk[1] == Opcode.LOCAL_GET && length(arg1_bytes_ne_chk) >= 2))
+                local a2_ref_ne = length(arg2_bytes_ne_chk) >= 1 && (arg2_bytes_ne_chk[1] == Opcode.REF_NULL ||
+                    (arg2_bytes_ne_chk[1] == Opcode.LOCAL_GET && length(arg2_bytes_ne_chk) >= 2))
+                if arg1_bytes_ne_chk[1] == Opcode.LOCAL_GET && length(arg1_bytes_ne_chk) >= 2
+                    local idx1_ne = 0
+                    local sh1_ne = 0
+                    local p1_ne = 2
+                    while p1_ne <= length(arg1_bytes_ne_chk)
+                        b = arg1_bytes_ne_chk[p1_ne]
+                        idx1_ne |= (Int(b & 0x7f) << sh1_ne)
+                        sh1_ne += 7
+                        p1_ne += 1
+                        (b & 0x80) == 0 && break
+                    end
+                    local off1_ne = idx1_ne - ctx.n_params
+                    if off1_ne >= 0 && off1_ne < length(ctx.locals)
+                        local lt1_ne = ctx.locals[off1_ne + 1]
+                        a1_ref_ne = lt1_ne isa ConcreteRef || lt1_ne === StructRef || lt1_ne === ArrayRef || lt1_ne === ExternRef || lt1_ne === AnyRef
+                    else
+                        a1_ref_ne = false
+                    end
+                end
+                if arg2_bytes_ne_chk[1] == Opcode.LOCAL_GET && length(arg2_bytes_ne_chk) >= 2
+                    local idx2_ne = 0
+                    local sh2_ne = 0
+                    local p2_ne = 2
+                    while p2_ne <= length(arg2_bytes_ne_chk)
+                        b = arg2_bytes_ne_chk[p2_ne]
+                        idx2_ne |= (Int(b & 0x7f) << sh2_ne)
+                        sh2_ne += 7
+                        p2_ne += 1
+                        (b & 0x80) == 0 && break
+                    end
+                    local off2_ne = idx2_ne - ctx.n_params
+                    if off2_ne >= 0 && off2_ne < length(ctx.locals)
+                        local lt2_ne = ctx.locals[off2_ne + 1]
+                        a2_ref_ne = lt2_ne isa ConcreteRef || lt2_ne === StructRef || lt2_ne === ArrayRef || lt2_ne === ExternRef || lt2_ne === AnyRef
+                    else
+                        a2_ref_ne = false
+                    end
+                end
+                # If Wasm types mismatch (one ref, one not), drop both and return true (not equal)
+                if a1_ref_ne != a2_ref_ne
+                    push!(bytes, Opcode.DROP)
+                    push!(bytes, Opcode.DROP)
+                    push!(bytes, Opcode.I32_CONST)
+                    push!(bytes, 0x01)
+                    return bytes
+                elseif a1_ref_ne && a2_ref_ne
+                    # Both refs - use ref.eq then negate
+                    push!(bytes, Opcode.REF_EQ)
+                    push!(bytes, Opcode.I32_EQZ)
+                    return bytes
+                end
+                # Both numeric - fall through to normal handling
+            end
+
+            # Check actual Wasm representation for Nothing-typed args
+            local arg1_wasm_is_ref_ne = arg1_is_ref_ne
+            local arg2_wasm_is_ref_ne = arg2_is_ref_ne
+            # Check Wasm representation for any potentially mixed comparison
+            if arg_type === Nothing || arg2_type_ne === Nothing || arg1_is_ref_ne || arg2_is_ref_ne
+                # For Nothing-typed args, check actual Wasm representation
+                if length(args) >= 1 && arg_type === Nothing
+                    local arg1_bytes = compile_value(args[1], ctx)
+                    if length(arg1_bytes) >= 1
+                        if arg1_bytes[1] == Opcode.REF_NULL
+                            arg1_wasm_is_ref_ne = true
+                        elseif arg1_bytes[1] == Opcode.LOCAL_GET && length(arg1_bytes) >= 2
+                            local local_idx_ne1 = 0
+                            local shift_ne1 = 0
+                            local pos_ne1 = 2
+                            while pos_ne1 <= length(arg1_bytes)
+                                b = arg1_bytes[pos_ne1]
+                                local_idx_ne1 |= (Int(b & 0x7f) << shift_ne1)
+                                shift_ne1 += 7
+                                pos_ne1 += 1
+                                (b & 0x80) == 0 && break
+                            end
+                            # ctx.locals doesn't include params, so adjust index
+                            local local_offset_ne1 = local_idx_ne1 - ctx.n_params
+                            if local_offset_ne1 >= 0 && local_offset_ne1 < length(ctx.locals)
+                                local ltype_ne1 = ctx.locals[local_offset_ne1 + 1]
+                                arg1_wasm_is_ref_ne = ltype_ne1 isa ConcreteRef || ltype_ne1 === StructRef ||
+                                                      ltype_ne1 === ArrayRef || ltype_ne1 === ExternRef || ltype_ne1 === AnyRef
+                            end
+                        end
+                    end
+                end
+                if length(args) >= 2 && arg2_type_ne === Nothing
+                    local arg2_bytes = compile_value(args[2], ctx)
+                    if length(arg2_bytes) >= 1
+                        if arg2_bytes[1] == Opcode.REF_NULL
+                            arg2_wasm_is_ref_ne = true
+                        elseif arg2_bytes[1] == Opcode.LOCAL_GET && length(arg2_bytes) >= 2
+                            local local_idx_ne2 = 0
+                            local shift_ne2 = 0
+                            local pos_ne2 = 2
+                            while pos_ne2 <= length(arg2_bytes)
+                                b = arg2_bytes[pos_ne2]
+                                local_idx_ne2 |= (Int(b & 0x7f) << shift_ne2)
+                                shift_ne2 += 7
+                                pos_ne2 += 1
+                                (b & 0x80) == 0 && break
+                            end
+                            # ctx.locals doesn't include params, so adjust index
+                            local local_offset_ne2 = local_idx_ne2 - ctx.n_params
+                            if local_offset_ne2 >= 0 && local_offset_ne2 < length(ctx.locals)
+                                local ltype_ne2 = ctx.locals[local_offset_ne2 + 1]
+                                arg2_wasm_is_ref_ne = ltype_ne2 isa ConcreteRef || ltype_ne2 === StructRef ||
+                                                      ltype_ne2 === ArrayRef || ltype_ne2 === ExternRef || ltype_ne2 === AnyRef
+                            end
+                        end
+                    end
+                end
+            end
+            # BOTH args must be ref types to use ref.eq
+            if arg1_wasm_is_ref_ne && arg2_wasm_is_ref_ne
+                push!(bytes, Opcode.REF_EQ)
+                push!(bytes, Opcode.I32_EQZ)  # Negate for !==
+            elseif arg1_wasm_is_ref_ne && !arg2_wasm_is_ref_ne
+                # Comparing ref with non-ref: type mismatch, always not-equal
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)
+            elseif !arg1_wasm_is_ref_ne && arg2_wasm_is_ref_ne
+                # Comparing non-ref with ref: type mismatch, always not-equal
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)
+            elseif !is_32bit && arg2_type_ne === Nothing
+                # arg1 is 64-bit, arg2 is Nothing (i32). Extend i32 to i64 before comparing.
+                push!(bytes, Opcode.I64_EXTEND_I32_S)
+                push!(bytes, Opcode.I64_NE)
+            elseif is_32bit && arg_type === Nothing && !is_ref_type_or_union(arg2_type_ne)
+                # arg1 is Nothing (i32), arg2 is 64-bit - mismatched types, always not-equal
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.DROP)
+                push!(bytes, Opcode.I32_CONST)
+                push!(bytes, 0x01)
+            else
+                push!(bytes, is_32bit ? Opcode.I32_NE : Opcode.I64_NE)
+            end
         end
 
     # Bitwise operations

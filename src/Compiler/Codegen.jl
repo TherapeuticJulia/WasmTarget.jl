@@ -11592,6 +11592,10 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
                                 field_result_type = mod_type.fields[sg_field_idx + 1].valtype
                                 if field_result_type isa ConcreteRef && !wasm_types_compatible(local_wasm_type, field_result_type)
                                     needs_type_safe_default = true
+                                elseif (field_result_type === I32 || field_result_type === I64 ||
+                                        field_result_type === F32 || field_result_type === F64)
+                                    # struct_get produces a numeric value but target local is ref-typed
+                                    needs_type_safe_default = true
                                 elseif (field_result_type === StructRef || field_result_type === ArrayRef) && local_wasm_type isa ConcreteRef
                                     # struct_get produces abstract ref (structref/arrayref) due to forward-reference
                                     # in struct registration, but the target local expects a concrete ref type.

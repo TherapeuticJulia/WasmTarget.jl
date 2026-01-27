@@ -11898,6 +11898,18 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
                                 needs_type_safe_default = true
                             end
                         end
+                    elseif is_pure_local_get && src_local_idx < ctx.n_params
+                        # Source is a function parameter - get its Wasm type from arg_types
+                        param_julia_type = ctx.arg_types[src_local_idx + 1]  # Julia is 1-indexed
+                        src_wasm_type = get_concrete_wasm_type(param_julia_type, ctx.mod, ctx.type_registry)
+                        if src_wasm_type !== nothing && !wasm_types_compatible(local_wasm_type, src_wasm_type)
+                            # Check if this is abstract ref → concrete ref (can be cast, not replaced)
+                            if (src_wasm_type === StructRef || src_wasm_type === ArrayRef) && local_wasm_type isa ConcreteRef
+                                needs_ref_cast_local = local_wasm_type
+                            else
+                                needs_type_safe_default = true
+                            end
+                        end
                     end
                 elseif (stmt_bytes[1] == Opcode.I32_CONST || stmt_bytes[1] == Opcode.I64_CONST ||
                         stmt_bytes[1] == Opcode.F32_CONST || stmt_bytes[1] == Opcode.F64_CONST)

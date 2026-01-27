@@ -6071,10 +6071,12 @@ function get_phi_edge_wasm_type(val, ctx::CompilationContext)::Union{WasmValType
             return julia_to_wasm_type_concrete(edge_julia_type, ctx)
         end
     elseif val isa Core.Argument
-        arg_idx = val.n
-        if arg_idx <= length(ctx.code_info.slottypes)
-            edge_julia_type = ctx.code_info.slottypes[arg_idx]
-            return julia_to_wasm_type_concrete(edge_julia_type, ctx)
+        # PURE-036ab: Use the ACTUAL Wasm parameter type from arg_types, not the Julia slottype.
+        # Julia IR uses _1 for function type (not in arg_types), _2 for first arg (arg_types[1]), etc.
+        # So arg_types index = val.n - 1 for non-closures.
+        arg_types_idx = val.n - 1  # _2 → arg_types[1], _3 → arg_types[2], etc.
+        if arg_types_idx >= 1 && arg_types_idx <= length(ctx.arg_types)
+            return get_concrete_wasm_type(ctx.arg_types[arg_types_idx], ctx.mod, ctx.type_registry)
         end
     elseif val isa Int64 || val isa UInt64 || val isa Int
         return I64
@@ -8340,10 +8342,12 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                 return julia_to_wasm_type_concrete(edge_julia_type, ctx)
             end
         elseif val isa Core.Argument
-            arg_idx = val.n
-            if arg_idx <= length(ctx.code_info.slottypes)
-                edge_julia_type = ctx.code_info.slottypes[arg_idx]
-                return julia_to_wasm_type_concrete(edge_julia_type, ctx)
+            # PURE-036ab: Use the ACTUAL Wasm parameter type from arg_types, not the Julia slottype.
+            # Julia IR uses _1 for function type (not in arg_types), _2 for first arg (arg_types[1]), etc.
+            # So arg_types index = val.n - 1 for non-closures.
+            arg_types_idx = val.n - 1  # _2 → arg_types[1], _3 → arg_types[2], etc.
+            if arg_types_idx >= 1 && arg_types_idx <= length(ctx.arg_types)
+                return get_concrete_wasm_type(ctx.arg_types[arg_types_idx], ctx.mod, ctx.type_registry)
             end
         elseif val isa Int64 || val isa UInt64 || val isa Int
             return I64
@@ -10806,11 +10810,71 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                     for (edge_idx, edge) in enumerate(phi_node.edges)
                         if edge == goto_idx
                             val = phi_node.values[edge_idx]
-                            append!(inner_bytes, compile_value(val, ctx))
+                            val_bytes = compile_value(val, ctx)
                             if haskey(ctx.phi_locals, phi_idx)
                                 local_idx = ctx.phi_locals[phi_idx]
+                                phi_local_array_idx = local_idx - ctx.n_params + 1
+                                phi_local_type = phi_local_array_idx >= 1 && phi_local_array_idx <= length(ctx.locals) ? ctx.locals[phi_local_array_idx] : nothing
+                                # PURE-036ab: Check if val_bytes is local.get of a param with incompatible type
+                                type_mismatch_handled = false
+                                if phi_local_type !== nothing && length(val_bytes) >= 2 && val_bytes[1] == 0x20  # LOCAL_GET
+                                    got_local_idx = 0
+                                    shift = 0
+                                    for bi in 2:length(val_bytes)
+                                        b = val_bytes[bi]
+                                        got_local_idx |= (Int(b & 0x7f) << shift)
+                                        shift += 7
+                                        if (b & 0x80) == 0
+                                            break
+                                        end
+                                    end
+                                    if got_local_idx < ctx.n_params
+                                        param_julia_type = ctx.arg_types[got_local_idx + 1]
+                                        actual_val_type = get_concrete_wasm_type(param_julia_type, ctx.mod, ctx.type_registry)
+                                        if !wasm_types_compatible(phi_local_type, actual_val_type)
+                                            # Emit type-safe default instead
+                                            if phi_local_type isa ConcreteRef
+                                                push!(inner_bytes, Opcode.REF_NULL)
+                                                append!(inner_bytes, encode_leb128_signed(Int64(phi_local_type.type_idx)))
+                                            elseif phi_local_type === ExternRef
+                                                push!(inner_bytes, Opcode.REF_NULL)
+                                                push!(inner_bytes, UInt8(ExternRef))
+                                            elseif phi_local_type === StructRef
+                                                push!(inner_bytes, Opcode.REF_NULL)
+                                                push!(inner_bytes, UInt8(StructRef))
+                                            elseif phi_local_type === ArrayRef
+                                                push!(inner_bytes, Opcode.REF_NULL)
+                                                push!(inner_bytes, UInt8(ArrayRef))
+                                            elseif phi_local_type === AnyRef
+                                                push!(inner_bytes, Opcode.REF_NULL)
+                                                push!(inner_bytes, UInt8(AnyRef))
+                                            elseif phi_local_type === I64
+                                                push!(inner_bytes, Opcode.I64_CONST)
+                                                push!(inner_bytes, 0x00)
+                                            elseif phi_local_type === I32
+                                                push!(inner_bytes, Opcode.I32_CONST)
+                                                push!(inner_bytes, 0x00)
+                                            elseif phi_local_type === F64
+                                                push!(inner_bytes, Opcode.F64_CONST)
+                                                append!(inner_bytes, UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                                            elseif phi_local_type === F32
+                                                push!(inner_bytes, Opcode.F32_CONST)
+                                                append!(inner_bytes, UInt8[0x00, 0x00, 0x00, 0x00])
+                                            else
+                                                push!(inner_bytes, Opcode.I32_CONST)
+                                                push!(inner_bytes, 0x00)
+                                            end
+                                            type_mismatch_handled = true
+                                        end
+                                    end
+                                end
+                                if !type_mismatch_handled
+                                    append!(inner_bytes, val_bytes)
+                                end
                                 push!(inner_bytes, Opcode.LOCAL_SET)
                                 append!(inner_bytes, encode_leb128_unsigned(local_idx))
+                            else
+                                append!(inner_bytes, val_bytes)
                             end
                             break
                         end
@@ -10823,11 +10887,71 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                             for (edge_idx, edge) in enumerate(other_stmt.edges)
                                 if edge == goto_idx
                                     val = other_stmt.values[edge_idx]
-                                    append!(inner_bytes, compile_value(val, ctx))
+                                    val_bytes = compile_value(val, ctx)
                                     if haskey(ctx.phi_locals, other_phi_idx)
                                         local_idx = ctx.phi_locals[other_phi_idx]
+                                        phi_local_array_idx = local_idx - ctx.n_params + 1
+                                        phi_local_type = phi_local_array_idx >= 1 && phi_local_array_idx <= length(ctx.locals) ? ctx.locals[phi_local_array_idx] : nothing
+                                        # PURE-036ab: Check if val_bytes is local.get of a param with incompatible type
+                                        type_mismatch_handled = false
+                                        if phi_local_type !== nothing && length(val_bytes) >= 2 && val_bytes[1] == 0x20  # LOCAL_GET
+                                            got_local_idx = 0
+                                            shift = 0
+                                            for bi in 2:length(val_bytes)
+                                                b = val_bytes[bi]
+                                                got_local_idx |= (Int(b & 0x7f) << shift)
+                                                shift += 7
+                                                if (b & 0x80) == 0
+                                                    break
+                                                end
+                                            end
+                                            if got_local_idx < ctx.n_params
+                                                param_julia_type = ctx.arg_types[got_local_idx + 1]
+                                                actual_val_type = get_concrete_wasm_type(param_julia_type, ctx.mod, ctx.type_registry)
+                                                if !wasm_types_compatible(phi_local_type, actual_val_type)
+                                                    # Emit type-safe default instead
+                                                    if phi_local_type isa ConcreteRef
+                                                        push!(inner_bytes, Opcode.REF_NULL)
+                                                        append!(inner_bytes, encode_leb128_signed(Int64(phi_local_type.type_idx)))
+                                                    elseif phi_local_type === ExternRef
+                                                        push!(inner_bytes, Opcode.REF_NULL)
+                                                        push!(inner_bytes, UInt8(ExternRef))
+                                                    elseif phi_local_type === StructRef
+                                                        push!(inner_bytes, Opcode.REF_NULL)
+                                                        push!(inner_bytes, UInt8(StructRef))
+                                                    elseif phi_local_type === ArrayRef
+                                                        push!(inner_bytes, Opcode.REF_NULL)
+                                                        push!(inner_bytes, UInt8(ArrayRef))
+                                                    elseif phi_local_type === AnyRef
+                                                        push!(inner_bytes, Opcode.REF_NULL)
+                                                        push!(inner_bytes, UInt8(AnyRef))
+                                                    elseif phi_local_type === I64
+                                                        push!(inner_bytes, Opcode.I64_CONST)
+                                                        push!(inner_bytes, 0x00)
+                                                    elseif phi_local_type === I32
+                                                        push!(inner_bytes, Opcode.I32_CONST)
+                                                        push!(inner_bytes, 0x00)
+                                                    elseif phi_local_type === F64
+                                                        push!(inner_bytes, Opcode.F64_CONST)
+                                                        append!(inner_bytes, UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                                                    elseif phi_local_type === F32
+                                                        push!(inner_bytes, Opcode.F32_CONST)
+                                                        append!(inner_bytes, UInt8[0x00, 0x00, 0x00, 0x00])
+                                                    else
+                                                        push!(inner_bytes, Opcode.I32_CONST)
+                                                        push!(inner_bytes, 0x00)
+                                                    end
+                                                    type_mismatch_handled = true
+                                                end
+                                            end
+                                        end
+                                        if !type_mismatch_handled
+                                            append!(inner_bytes, val_bytes)
+                                        end
                                         push!(inner_bytes, Opcode.LOCAL_SET)
                                         append!(inner_bytes, encode_leb128_unsigned(local_idx))
+                                    else
+                                        append!(inner_bytes, val_bytes)
                                     end
                                     break
                                 end
@@ -10865,11 +10989,71 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                         for (edge_idx, edge) in enumerate(phi_node.edges)
                             if edge == last_stmt_idx
                                 val = phi_node.values[edge_idx]
-                                append!(inner_bytes, compile_value(val, ctx))
+                                val_bytes = compile_value(val, ctx)
                                 if haskey(ctx.phi_locals, phi_idx)
                                     local_idx = ctx.phi_locals[phi_idx]
+                                    phi_local_array_idx = local_idx - ctx.n_params + 1
+                                    phi_local_type = phi_local_array_idx >= 1 && phi_local_array_idx <= length(ctx.locals) ? ctx.locals[phi_local_array_idx] : nothing
+                                    # PURE-036ab: Check if val_bytes is local.get of a param with incompatible type
+                                    type_mismatch_handled = false
+                                    if phi_local_type !== nothing && length(val_bytes) >= 2 && val_bytes[1] == 0x20  # LOCAL_GET
+                                        got_local_idx = 0
+                                        shift = 0
+                                        for bi in 2:length(val_bytes)
+                                            b = val_bytes[bi]
+                                            got_local_idx |= (Int(b & 0x7f) << shift)
+                                            shift += 7
+                                            if (b & 0x80) == 0
+                                                break
+                                            end
+                                        end
+                                        if got_local_idx < ctx.n_params
+                                            param_julia_type = ctx.arg_types[got_local_idx + 1]
+                                            actual_val_type = get_concrete_wasm_type(param_julia_type, ctx.mod, ctx.type_registry)
+                                            if !wasm_types_compatible(phi_local_type, actual_val_type)
+                                                # Emit type-safe default instead
+                                                if phi_local_type isa ConcreteRef
+                                                    push!(inner_bytes, Opcode.REF_NULL)
+                                                    append!(inner_bytes, encode_leb128_signed(Int64(phi_local_type.type_idx)))
+                                                elseif phi_local_type === ExternRef
+                                                    push!(inner_bytes, Opcode.REF_NULL)
+                                                    push!(inner_bytes, UInt8(ExternRef))
+                                                elseif phi_local_type === StructRef
+                                                    push!(inner_bytes, Opcode.REF_NULL)
+                                                    push!(inner_bytes, UInt8(StructRef))
+                                                elseif phi_local_type === ArrayRef
+                                                    push!(inner_bytes, Opcode.REF_NULL)
+                                                    push!(inner_bytes, UInt8(ArrayRef))
+                                                elseif phi_local_type === AnyRef
+                                                    push!(inner_bytes, Opcode.REF_NULL)
+                                                    push!(inner_bytes, UInt8(AnyRef))
+                                                elseif phi_local_type === I64
+                                                    push!(inner_bytes, Opcode.I64_CONST)
+                                                    push!(inner_bytes, 0x00)
+                                                elseif phi_local_type === I32
+                                                    push!(inner_bytes, Opcode.I32_CONST)
+                                                    push!(inner_bytes, 0x00)
+                                                elseif phi_local_type === F64
+                                                    push!(inner_bytes, Opcode.F64_CONST)
+                                                    append!(inner_bytes, UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                                                elseif phi_local_type === F32
+                                                    push!(inner_bytes, Opcode.F32_CONST)
+                                                    append!(inner_bytes, UInt8[0x00, 0x00, 0x00, 0x00])
+                                                else
+                                                    push!(inner_bytes, Opcode.I32_CONST)
+                                                    push!(inner_bytes, 0x00)
+                                                end
+                                                type_mismatch_handled = true
+                                            end
+                                        end
+                                    end
+                                    if !type_mismatch_handled
+                                        append!(inner_bytes, val_bytes)
+                                    end
                                     push!(inner_bytes, Opcode.LOCAL_SET)
                                     append!(inner_bytes, encode_leb128_unsigned(local_idx))
+                                else
+                                    append!(inner_bytes, val_bytes)
                                 end
                                 break
                             end
@@ -10882,11 +11066,71 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
                                 for (edge_idx, edge) in enumerate(other_stmt.edges)
                                     if edge == last_stmt_idx
                                         val = other_stmt.values[edge_idx]
-                                        append!(inner_bytes, compile_value(val, ctx))
+                                        val_bytes = compile_value(val, ctx)
                                         if haskey(ctx.phi_locals, other_phi_idx)
                                             local_idx = ctx.phi_locals[other_phi_idx]
+                                            phi_local_array_idx = local_idx - ctx.n_params + 1
+                                            phi_local_type = phi_local_array_idx >= 1 && phi_local_array_idx <= length(ctx.locals) ? ctx.locals[phi_local_array_idx] : nothing
+                                            # PURE-036ab: Check if val_bytes is local.get of a param with incompatible type
+                                            type_mismatch_handled = false
+                                            if phi_local_type !== nothing && length(val_bytes) >= 2 && val_bytes[1] == 0x20  # LOCAL_GET
+                                                got_local_idx = 0
+                                                shift = 0
+                                                for bi in 2:length(val_bytes)
+                                                    b = val_bytes[bi]
+                                                    got_local_idx |= (Int(b & 0x7f) << shift)
+                                                    shift += 7
+                                                    if (b & 0x80) == 0
+                                                        break
+                                                    end
+                                                end
+                                                if got_local_idx < ctx.n_params
+                                                    param_julia_type = ctx.arg_types[got_local_idx + 1]
+                                                    actual_val_type = get_concrete_wasm_type(param_julia_type, ctx.mod, ctx.type_registry)
+                                                    if !wasm_types_compatible(phi_local_type, actual_val_type)
+                                                        # Emit type-safe default instead
+                                                        if phi_local_type isa ConcreteRef
+                                                            push!(inner_bytes, Opcode.REF_NULL)
+                                                            append!(inner_bytes, encode_leb128_signed(Int64(phi_local_type.type_idx)))
+                                                        elseif phi_local_type === ExternRef
+                                                            push!(inner_bytes, Opcode.REF_NULL)
+                                                            push!(inner_bytes, UInt8(ExternRef))
+                                                        elseif phi_local_type === StructRef
+                                                            push!(inner_bytes, Opcode.REF_NULL)
+                                                            push!(inner_bytes, UInt8(StructRef))
+                                                        elseif phi_local_type === ArrayRef
+                                                            push!(inner_bytes, Opcode.REF_NULL)
+                                                            push!(inner_bytes, UInt8(ArrayRef))
+                                                        elseif phi_local_type === AnyRef
+                                                            push!(inner_bytes, Opcode.REF_NULL)
+                                                            push!(inner_bytes, UInt8(AnyRef))
+                                                        elseif phi_local_type === I64
+                                                            push!(inner_bytes, Opcode.I64_CONST)
+                                                            push!(inner_bytes, 0x00)
+                                                        elseif phi_local_type === I32
+                                                            push!(inner_bytes, Opcode.I32_CONST)
+                                                            push!(inner_bytes, 0x00)
+                                                        elseif phi_local_type === F64
+                                                            push!(inner_bytes, Opcode.F64_CONST)
+                                                            append!(inner_bytes, UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                                                        elseif phi_local_type === F32
+                                                            push!(inner_bytes, Opcode.F32_CONST)
+                                                            append!(inner_bytes, UInt8[0x00, 0x00, 0x00, 0x00])
+                                                        else
+                                                            push!(inner_bytes, Opcode.I32_CONST)
+                                                            push!(inner_bytes, 0x00)
+                                                        end
+                                                        type_mismatch_handled = true
+                                                    end
+                                                end
+                                            end
+                                            if !type_mismatch_handled
+                                                append!(inner_bytes, val_bytes)
+                                            end
                                             push!(inner_bytes, Opcode.LOCAL_SET)
                                             append!(inner_bytes, encode_leb128_unsigned(local_idx))
+                                        else
+                                            append!(inner_bytes, val_bytes)
                                         end
                                         break
                                     end

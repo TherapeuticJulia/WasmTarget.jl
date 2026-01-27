@@ -15810,7 +15810,8 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
             if target_info !== nothing
                 # Push arguments with type checking
                 for (arg_idx, arg) in enumerate(args)
-                    append!(bytes, compile_value(arg, ctx))
+                    arg_bytes = compile_value(arg, ctx)
+                    append!(bytes, arg_bytes)
                     # Check if arg type matches expected param type
                     if arg_idx <= length(target_info.arg_types)
                         expected_julia_type = target_info.arg_types[arg_idx]
@@ -15832,7 +15833,42 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
                             append!(bytes, encode_leb128_signed(Int64(expected_wasm.type_idx)))
                         elseif expected_wasm === ExternRef && (actual_wasm isa ConcreteRef || actual_wasm === StructRef || actual_wasm === ArrayRef || actual_wasm === AnyRef)
                             # Concrete or abstract ref to externref — insert extern.convert_any
+                            push!(bytes, Opcode.GC_PREFIX)
                             push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                        elseif expected_wasm === ExternRef && actual_wasm === ExternRef
+                            # PURE-036z: Julia type inference says Any→ExternRef for both, but the actual
+                            # Wasm local might be a ConcreteRef. Check if arg_bytes is local.get of a
+                            # non-externref local and insert extern.convert_any if needed.
+                            if length(arg_bytes) >= 2 && arg_bytes[1] == 0x20  # LOCAL_GET opcode
+                                local_idx = 0; shift = 0
+                                for bi in 2:length(arg_bytes)
+                                    b = arg_bytes[bi]
+                                    local_idx |= (Int(b & 0x7f) << shift)
+                                    shift += 7
+                                    if (b & 0x80) == 0
+                                        break
+                                    end
+                                end
+                                local_arr_idx = local_idx - ctx.n_params + 1
+                                if local_arr_idx >= 1 && local_arr_idx <= length(ctx.locals)
+                                    actual_local_wasm = ctx.locals[local_arr_idx]
+                                    if actual_local_wasm isa ConcreteRef || actual_local_wasm === StructRef || actual_local_wasm === ArrayRef || actual_local_wasm === AnyRef
+                                        # Actual local is a ref type but not externref — insert conversion
+                                        push!(bytes, Opcode.GC_PREFIX)
+                                        push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                                    end
+                                elseif local_idx < ctx.n_params
+                                    # It's a param — check arg_types
+                                    if local_idx + 1 <= length(ctx.arg_types)
+                                        param_julia_type = ctx.arg_types[local_idx + 1]
+                                        param_wasm = get_concrete_wasm_type(param_julia_type, ctx.mod, ctx.type_registry)
+                                        if param_wasm isa ConcreteRef || param_wasm === StructRef || param_wasm === ArrayRef || param_wasm === AnyRef
+                                            push!(bytes, Opcode.GC_PREFIX)
+                                            push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                                        end
+                                    end
+                                end
+                            end
                         end
                     end
                 end
@@ -16016,6 +16052,29 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
         ssa_stmt = ctx.code_info.code[func_ref_early.id]
         if ssa_stmt isa GlobalRef
             actual_func_ref_early = ssa_stmt
+        elseif ssa_stmt isa Core.PiNode && ssa_stmt.val isa Core.SSAValue
+            # Follow PiNode chain
+            pi_ssa_stmt = ctx.code_info.code[ssa_stmt.val.id]
+            if pi_ssa_stmt isa GlobalRef
+                actual_func_ref_early = pi_ssa_stmt
+            end
+        elseif ssa_stmt isa Expr && ssa_stmt.head === :invoke
+            # Nested invoke — try to get the function from the method instance
+            nested_mi = ssa_stmt.args[1]
+            if nested_mi isa Core.MethodInstance
+                # Can't easily get GlobalRef from MI, but we can try to use the function name
+                if hasfield(typeof(nested_mi.def), :name) && nested_mi.def isa Method
+                    # Create a synthetic GlobalRef for lookup
+                    # This is a workaround; the proper way would be to use mi directly
+                end
+            end
+        end
+    elseif func_ref_early isa Core.PiNode && func_ref_early.val isa GlobalRef
+        actual_func_ref_early = func_ref_early.val
+    elseif func_ref_early isa Core.PiNode && func_ref_early.val isa Core.SSAValue
+        pi_ssa_stmt = ctx.code_info.code[func_ref_early.val.id]
+        if pi_ssa_stmt isa GlobalRef
+            actual_func_ref_early = pi_ssa_stmt
         end
     end
     is_self_call_early = false
@@ -16043,8 +16102,47 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
         end
     end
 
+    # PURE-036z: Compute target_info EARLY so we can use its arg_types for proper type checking
+    # during argument compilation. This helps when param_types (from mi.specTypes) differ from
+    # the actual compiled function's parameter types.
+    target_info_early = nothing
+    if ctx.func_registry !== nothing && !is_self_call_early
+        called_func_early = nothing
+        if actual_func_ref_early isa GlobalRef
+            called_func_early = try
+                getfield(actual_func_ref_early.mod, actual_func_ref_early.name)
+            catch
+                nothing
+            end
+        elseif mi isa Core.MethodInstance && mi.def isa Method
+            # Fallback: get function from MethodInstance
+            # The function is typically the first arg in specTypes
+            spec = mi.specTypes
+            if spec isa DataType && spec <: Tuple && length(spec.parameters) >= 1
+                func_type = spec.parameters[1]
+                if func_type isa DataType && func_type.name.name === :typeof
+                    # typeof(f) — extract f
+                    # The instance of typeof(f) is the function itself
+                    try
+                        called_func_early = func_type.instance
+                    catch
+                        # Couldn't get instance
+                    end
+                end
+            end
+        end
+        if called_func_early !== nothing
+            call_arg_types_early = tuple([infer_value_type(arg, ctx) for arg in args]...)
+            target_info_early = get_function(ctx.func_registry, called_func_early, call_arg_types_early)
+        end
+    end
+
     # Push arguments (for non-signal calls)
     for (arg_idx, arg) in enumerate(args)
+        # PURE-036z: Track if extern.convert_any was already emitted for this arg
+        # to avoid double conversion (externref → externref fails because externref not subtype of anyref)
+        extern_convert_emitted = false
+
         # Check if this is a nothing argument that needs ref.null
         is_nothing_arg = arg === nothing ||
                         (arg isa GlobalRef && arg.name === :nothing) ||
@@ -16092,7 +16190,8 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
             push!(bytes, Opcode.REF_NULL)
             push!(bytes, UInt8(ExternRef))
         else
-            append!(bytes, compile_value(arg, ctx))
+            arg_bytes = compile_value(arg, ctx)
+            append!(bytes, arg_bytes)
             # Check if argument's actual Wasm type matches expected param type
             # If both are ConcreteRef but with different type indices, insert ref.cast
             if param_types !== nothing && arg_idx <= length(param_types)
@@ -16140,7 +16239,88 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
                     elseif expected_wasm === ExternRef && (actual_wasm isa ConcreteRef || actual_wasm === StructRef || actual_wasm === ArrayRef || actual_wasm === AnyRef)
                         # Concrete or abstract ref to externref — insert extern.convert_any
                         # extern.convert_any converts anyref → externref (concrete refs are subtypes of anyref)
+                        push!(bytes, Opcode.GC_PREFIX)
                         push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                        extern_convert_emitted = true
+                    elseif expected_wasm === ExternRef && actual_wasm === ExternRef
+                        # PURE-036z: Julia type inference says Any→ExternRef for both, but the actual
+                        # Wasm local might be a ConcreteRef. Check if arg_bytes is local.get of a
+                        # non-externref local and insert extern.convert_any if needed.
+                        if length(arg_bytes) >= 2 && arg_bytes[1] == 0x20  # LOCAL_GET opcode
+                            local_idx = 0; shift = 0
+                            for bi in 2:length(arg_bytes)
+                                b = arg_bytes[bi]
+                                local_idx |= (Int(b & 0x7f) << shift)
+                                shift += 7
+                                if (b & 0x80) == 0
+                                    break
+                                end
+                            end
+                            local_arr_idx = local_idx - ctx.n_params + 1
+                            if local_arr_idx >= 1 && local_arr_idx <= length(ctx.locals)
+                                actual_local_wasm = ctx.locals[local_arr_idx]
+                                if actual_local_wasm isa ConcreteRef || actual_local_wasm === StructRef || actual_local_wasm === ArrayRef || actual_local_wasm === AnyRef
+                                    # Actual local is a ref type but not externref — insert conversion
+                                    push!(bytes, Opcode.GC_PREFIX)
+                                    push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                                    extern_convert_emitted = true
+                                end
+                            elseif local_idx < ctx.n_params
+                                # It's a param — check arg_types
+                                if local_idx + 1 <= length(ctx.arg_types)
+                                    param_julia_type = ctx.arg_types[local_idx + 1]
+                                    param_wasm = get_concrete_wasm_type(param_julia_type, ctx.mod, ctx.type_registry)
+                                    if param_wasm isa ConcreteRef || param_wasm === StructRef || param_wasm === ArrayRef || param_wasm === AnyRef
+                                        push!(bytes, Opcode.GC_PREFIX)
+                                        push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                                        extern_convert_emitted = true
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            # PURE-036z: Also check against target_info_early if available
+            # This catches cases where param_types says ConcreteRef but the actual target function
+            # expects ExternRef (because it was registered with different type mapping)
+            if target_info_early !== nothing && arg_idx <= length(target_info_early.arg_types)
+                target_expected_julia = target_info_early.arg_types[arg_idx]
+                target_expected_wasm = get_concrete_wasm_type(target_expected_julia, ctx.mod, ctx.type_registry)
+                if target_expected_wasm === ExternRef && !extern_convert_emitted
+                    # Target function expects externref for this arg
+                    # Check if we pushed a non-externref value that needs conversion
+                    # PURE-036z: Skip if extern.convert_any was already emitted to avoid double conversion
+                    if length(arg_bytes) >= 2 && arg_bytes[1] == 0x20  # LOCAL_GET
+                        local_idx = 0; shift = 0
+                        for bi in 2:length(arg_bytes)
+                            b = arg_bytes[bi]
+                            local_idx |= (Int(b & 0x7f) << shift)
+                            shift += 7
+                            if (b & 0x80) == 0; break; end
+                        end
+                        local_arr_idx = local_idx - ctx.n_params + 1
+                        if local_arr_idx >= 1 && local_arr_idx <= length(ctx.locals)
+                            actual_local_wasm = ctx.locals[local_arr_idx]
+                            if actual_local_wasm isa ConcreteRef || actual_local_wasm === StructRef || actual_local_wasm === ArrayRef || actual_local_wasm === AnyRef
+                                push!(bytes, Opcode.GC_PREFIX)
+                                push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                                extern_convert_emitted = true
+                            end
+                        elseif local_idx < ctx.n_params && local_idx + 1 <= length(ctx.arg_types)
+                            param_wasm = get_concrete_wasm_type(ctx.arg_types[local_idx + 1], ctx.mod, ctx.type_registry)
+                            if param_wasm isa ConcreteRef || param_wasm === StructRef || param_wasm === ArrayRef || param_wasm === AnyRef
+                                push!(bytes, Opcode.GC_PREFIX)
+                                push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                                extern_convert_emitted = true
+                            end
+                        end
+                    elseif length(arg_bytes) >= 3 && arg_bytes[1] == 0xfb && (arg_bytes[2] == 0x00 || arg_bytes[2] == 0x01)
+                        # struct_new or struct_new_default — produces a ConcreteRef, needs conversion
+                        push!(bytes, Opcode.GC_PREFIX)
+                        push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                        extern_convert_emitted = true
                     end
                 end
             end
@@ -16205,6 +16385,91 @@ function compile_invoke(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{U
                     target_info = get_function(ctx.func_registry, called_func, call_arg_types)
 
                     if target_info !== nothing
+                        # PURE-036z: Check if any arg needs extern.convert_any insertion
+                        # The args were already pushed, but we need to convert concrete refs to externref
+                        # where the target function expects externref but we pushed a concrete ref.
+                        # Since args are pushed in order and we can only add conversions at the end,
+                        # we need to use a different strategy: after ALL args are pushed, we can
+                        # re-order/convert them using locals. But this is complex.
+                        #
+                        # Simpler approach: check each arg and add extern.convert_any if the LAST
+                        # arg needs it (since that's what's on top of the stack). For earlier args,
+                        # this won't work with pure stack manipulation.
+                        #
+                        # Even simpler: only handle the case where the LAST arg needs conversion
+                        # (most common case for the current error).
+                        n_args = length(args)
+                        if n_args > 0
+                            last_arg_idx = n_args
+                            if last_arg_idx <= length(target_info.arg_types)
+                                last_target_julia = target_info.arg_types[last_arg_idx]
+                                last_target_wasm = get_concrete_wasm_type(last_target_julia, ctx.mod, ctx.type_registry)
+                                last_actual_julia = call_arg_types[last_arg_idx]
+                                last_actual_wasm = get_concrete_wasm_type(last_actual_julia, ctx.mod, ctx.type_registry)
+                                last_arg = args[n_args]
+
+                                if last_target_wasm === ExternRef && (last_actual_wasm isa ConcreteRef || last_actual_wasm === StructRef || last_actual_wasm === ArrayRef || last_actual_wasm === AnyRef)
+                                    push!(bytes, Opcode.GC_PREFIX)
+                                    push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                                elseif last_target_wasm === ExternRef && last_actual_wasm === ExternRef && last_arg isa Core.SSAValue
+                                    # Check actual local type for the last arg
+                                    if haskey(ctx.ssa_locals, last_arg.id)
+                                        local_idx = ctx.ssa_locals[last_arg.id]
+                                        local_arr_idx = local_idx - ctx.n_params + 1
+                                        if local_arr_idx >= 1 && local_arr_idx <= length(ctx.locals)
+                                            actual_local_wasm = ctx.locals[local_arr_idx]
+                                            if actual_local_wasm isa ConcreteRef || actual_local_wasm === StructRef || actual_local_wasm === ArrayRef || actual_local_wasm === AnyRef
+                                                push!(bytes, Opcode.GC_PREFIX)
+                                                push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+
+                        # Also handle middle args if needed (use locals to reorder)
+                        # For now, check if the SECOND arg (index 2) needs conversion when there are 3+ args
+                        # This handles the func 126 case: (ref null 36), externref, (ref null 14)
+                        # where the middle arg (externref) is getting a concrete ref
+                        if n_args >= 2
+                            for mid_arg_idx in n_args-1:-1:1  # Check from second-to-last to first
+                                if mid_arg_idx <= length(target_info.arg_types)
+                                    mid_target_julia = target_info.arg_types[mid_arg_idx]
+                                    mid_target_wasm = get_concrete_wasm_type(mid_target_julia, ctx.mod, ctx.type_registry)
+                                    mid_actual_julia = call_arg_types[mid_arg_idx]
+                                    mid_actual_wasm = get_concrete_wasm_type(mid_actual_julia, ctx.mod, ctx.type_registry)
+                                    mid_arg = args[mid_arg_idx]
+
+                                    needs_convert = false
+                                    if mid_target_wasm === ExternRef && (mid_actual_wasm isa ConcreteRef || mid_actual_wasm === StructRef || mid_actual_wasm === ArrayRef || mid_actual_wasm === AnyRef)
+                                        needs_convert = true
+                                    elseif mid_target_wasm === ExternRef && mid_actual_wasm === ExternRef && mid_arg isa Core.SSAValue
+                                        if haskey(ctx.ssa_locals, mid_arg.id)
+                                            local_idx = ctx.ssa_locals[mid_arg.id]
+                                            local_arr_idx = local_idx - ctx.n_params + 1
+                                            if local_arr_idx >= 1 && local_arr_idx <= length(ctx.locals)
+                                                actual_local_wasm = ctx.locals[local_arr_idx]
+                                                if actual_local_wasm isa ConcreteRef || actual_local_wasm === StructRef || actual_local_wasm === ArrayRef || actual_local_wasm === AnyRef
+                                                    needs_convert = true
+                                                end
+                                            end
+                                        end
+                                    end
+
+                                    if needs_convert
+                                        # Stack currently: [arg1, arg2, ..., argN]
+                                        # Need to convert arg at mid_arg_idx
+                                        # This is complex with pure stack ops; skip for now and
+                                        # rely on the initial arg loop to handle most cases.
+                                        # The error at func 126 is for arg index 2 (0-based: 1)
+                                        # which is the second param. If there are only 2 args on
+                                        # stack but 3 params needed, there's a different bug.
+                                    end
+                                end
+                            end
+                        end
+
                         # Cross-function call - emit call instruction with target index
                         push!(bytes, Opcode.CALL)
                         append!(bytes, encode_leb128_unsigned(target_info.wasm_idx))

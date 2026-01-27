@@ -6276,9 +6276,15 @@ function emit_phi_local_set!(bytes::Vector{UInt8}, val, phi_ssa_idx::Int, ctx::C
             end
         end
         got_local_array_idx = got_local_idx - ctx.n_params + 1
+        actual_val_type = nothing
         if got_local_array_idx >= 1 && got_local_array_idx <= length(ctx.locals)
             actual_val_type = ctx.locals[got_local_array_idx]
-            if !wasm_types_compatible(phi_local_type, actual_val_type)
+        elseif got_local_idx < ctx.n_params
+            # It's a parameter - get Wasm type from arg_types
+            param_julia_type = ctx.arg_types[got_local_idx + 1]  # Julia is 1-indexed
+            actual_val_type = get_concrete_wasm_type(param_julia_type, ctx.mod, ctx.type_registry)
+        end
+        if actual_val_type !== nothing && !wasm_types_compatible(phi_local_type, actual_val_type)
                 # Incompatible actual type: emit type-safe default
                 if phi_local_type isa ConcreteRef
                     push!(bytes, Opcode.REF_NULL)
@@ -6314,7 +6320,6 @@ function emit_phi_local_set!(bytes::Vector{UInt8}, val, phi_ssa_idx::Int, ctx::C
                 push!(bytes, Opcode.LOCAL_SET)
                 append!(bytes, encode_leb128_unsigned(local_idx))
                 return true
-            end
         end
     end
 
@@ -7959,6 +7964,10 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                                         got_local_array_idx = got_local_idx - ctx.n_params + 1
                                         if got_local_array_idx >= 1 && got_local_array_idx <= length(ctx.locals)
                                             actual_val_type = ctx.locals[got_local_array_idx]
+                                        elseif got_local_idx < ctx.n_params
+                                            # It's a parameter - get Wasm type from arg_types
+                                            param_julia_type = ctx.arg_types[got_local_idx + 1]  # Julia is 1-indexed
+                                            actual_val_type = get_concrete_wasm_type(param_julia_type, ctx.mod, ctx.type_registry)
                                         end
                                     end
 
@@ -8494,6 +8503,10 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                                         got_local_array_idx = got_local_idx - ctx.n_params + 1
                                         if got_local_array_idx >= 1 && got_local_array_idx <= length(ctx.locals)
                                             actual_val_type = ctx.locals[got_local_array_idx]
+                                        elseif got_local_idx < ctx.n_params
+                                            # It's a parameter - get Wasm type from arg_types
+                                            param_julia_type = ctx.arg_types[got_local_idx + 1]  # Julia is 1-indexed
+                                            actual_val_type = get_concrete_wasm_type(param_julia_type, ctx.mod, ctx.type_registry)
                                         end
                                     end
 
@@ -8685,6 +8698,10 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                                         got_local_array_idx = got_local_idx - ctx.n_params + 1
                                         if got_local_array_idx >= 1 && got_local_array_idx <= length(ctx.locals)
                                             actual_val_type = ctx.locals[got_local_array_idx]
+                                        elseif got_local_idx < ctx.n_params
+                                            # It's a parameter - get Wasm type from arg_types
+                                            param_julia_type = ctx.arg_types[got_local_idx + 1]  # Julia is 1-indexed
+                                            actual_val_type = get_concrete_wasm_type(param_julia_type, ctx.mod, ctx.type_registry)
                                         end
                                     end
 
@@ -11277,15 +11294,17 @@ function generate_nested_conditionals(ctx::CompilationContext, blocks, code, con
     # The gen_conditional function uses typed blocks when there's a phi merge
     # or when branches don't use explicit RETURN
     #
-    # If return_blocks >= 2 AND the result_type is not void (0x40),
-    # the IF produced a value and we don't emit anything
-    if result_type isa ConcreteRef || result_type === I32 || result_type === I64 ||
+    # IMPORTANT: Check return_blocks FIRST. If all code paths return inside
+    # the conditionals (return_blocks >= 2), control after the IF is unreachable
+    # regardless of the function's result_type. This happens when gen_conditional
+    # uses void IF blocks (0x40) because both branches terminate with RETURN.
+    if return_blocks >= 2
+        # All code paths return inside the conditionals, so this point is unreachable
+        push!(bytes, Opcode.UNREACHABLE)
+    elseif result_type isa ConcreteRef || result_type === I32 || result_type === I64 ||
        result_type === F32 || result_type === F64
         # Typed result - IF produces value, fall through with value on stack
         # No RETURN or UNREACHABLE needed
-    elseif return_blocks >= 2
-        # Multiple return blocks with void result - branches return inside
-        push!(bytes, Opcode.UNREACHABLE)
     else
         push!(bytes, Opcode.RETURN)
     end

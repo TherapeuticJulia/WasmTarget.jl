@@ -4175,6 +4175,35 @@ function analyze_control_flow!(ctx::CompilationContext)
             # set_phi_locals_for_edge! and the inline phi handler,
             # which emit type-safe defaults for incompatible edges.
 
+            # PURE-036u: If this phi is used directly in a ReturnNode, and the function's
+            # Wasm return type is numeric but the phi was allocated as ref, override
+            # the phi local's type to match the function's return type.
+            # This handles cases like Union{Int64, SomeStruct} phi where Julia type
+            # inference produces a tagged union (ref), but the function actually returns i64.
+            func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
+            is_func_ret_numeric = func_ret_wasm === I32 || func_ret_wasm === I64 ||
+                                  func_ret_wasm === F32 || func_ret_wasm === F64
+            is_phi_ref = phi_wasm_type isa ConcreteRef || phi_wasm_type === StructRef ||
+                         phi_wasm_type === ArrayRef || phi_wasm_type === AnyRef ||
+                         phi_wasm_type === ExternRef
+
+            if is_func_ret_numeric && is_phi_ref
+                # Check if this phi is used in a ReturnNode
+                phi_used_in_return = false
+                for other_stmt in code
+                    if other_stmt isa Core.ReturnNode && isdefined(other_stmt, :val)
+                        if other_stmt.val isa Core.SSAValue && other_stmt.val.id == i
+                            phi_used_in_return = true
+                            break
+                        end
+                    end
+                end
+                if phi_used_in_return
+                    # Override phi type to match function return type
+                    phi_wasm_type = func_ret_wasm
+                end
+            end
+
             local_idx = ctx.n_params + length(ctx.locals)
             push!(ctx.locals, phi_wasm_type)
             ctx.phi_locals[i] = local_idx

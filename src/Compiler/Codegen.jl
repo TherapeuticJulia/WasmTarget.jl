@@ -19684,7 +19684,7 @@ end
 
 """
 Check if a value is known to be boolean (0 or 1).
-This is true for comparison results.
+This is true for comparison results, Bool literals, and phi nodes with Bool type.
 """
 function is_boolean_value(val, ctx::CompilationContext)::Bool
     if val isa Core.SSAValue
@@ -19692,6 +19692,10 @@ function is_boolean_value(val, ctx::CompilationContext)::Bool
         stmt = ctx.code_info.code[val.id]
         if stmt isa Expr && stmt.head === :call
             return is_comparison(stmt.args[1])
+        end
+        # Check if SSA has Bool inferred type (e.g., phi node results)
+        if infer_value_type(val, ctx) === Bool
+            return true
         end
     elseif val isa Bool
         return true

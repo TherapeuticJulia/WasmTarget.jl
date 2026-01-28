@@ -328,10 +328,17 @@ function julia_to_wasm_type(::Type{T})::WasmValType where T
     elseif T <: Function
         # Abstract Function types (non-closure) map to externref
         return ExternRef
-    elseif T <: Type
+    elseif T <: Type && !(T isa UnionAll)
         # Type{X} is a singleton type (the only value is X itself)
         # Represent as i32 constant tag — used for dispatch, not actual data
+        # NOTE: DataType (the struct) is handled above at line 321 (isconcretetype && isstructtype)
+        # NOTE: T isa UnionAll is false for Type{Int64} but true for abstract Type
         return I32
+    elseif isabstracttype(T)
+        # Abstract types (e.g., Compiler.CallInfo, Type (UnionAll)) can hold any concrete subtype
+        # Map to externref like Any
+        # NOTE: Type (without parameter) is UnionAll and isabstracttype, maps here
+        return ExternRef
     elseif isprimitivetype(T)
         # Custom primitive types (e.g., JuliaSyntax.Kind) - map by size
         sz = sizeof(T)
@@ -342,10 +349,6 @@ function julia_to_wasm_type(::Type{T})::WasmValType where T
         else
             error("Primitive type too large for Wasm: $T ($sz bytes)")
         end
-    elseif isabstracttype(T)
-        # Abstract types (e.g., Compiler.CallInfo) can hold any concrete subtype
-        # Map to externref like Any
-        return ExternRef
     else
         error("Unsupported Julia type for Wasm: $T")
     end

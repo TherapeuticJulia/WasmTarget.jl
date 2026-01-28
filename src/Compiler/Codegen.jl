@@ -11,7 +11,7 @@ export compile_function, compile_module, compile_handler, FunctionRegistry
 Maps Julia struct types to their WasmGC representation.
 """
 struct StructInfo
-    julia_type::DataType
+    julia_type::Type  # DataType or UnionAll for parametric types
     wasm_type_idx::UInt32
     field_names::Vector{Symbol}
     field_types::Vector{Type}  # Can include Union types
@@ -33,13 +33,13 @@ end
 Registry for struct and array type mappings within a module.
 """
 mutable struct TypeRegistry
-    structs::Dict{DataType, StructInfo}
+    structs::Dict{Type, StructInfo}  # DataType or UnionAll for parametric types
     arrays::Dict{Type, UInt32}  # Element type -> array type index
     string_array_idx::Union{Nothing, UInt32}  # Index of i8 array type for strings
     unions::Dict{Union, UnionInfo}  # Union type -> tagged union info
 end
 
-TypeRegistry() = TypeRegistry(Dict{DataType, StructInfo}(), Dict{Type, UInt32}(), nothing, Dict{Union, UnionInfo}())
+TypeRegistry() = TypeRegistry(Dict{Type, StructInfo}(), Dict{Type, UInt32}(), nothing, Dict{Union, UnionInfo}())
 
 # ============================================================================
 # Function Registry - for multi-function modules
@@ -1846,6 +1846,10 @@ function _register_struct_type_impl!(mod::WasmModule, registry::TypeRegistry, T:
                     wasm_vt = StructRef  # Forward reference
                 end
             end
+        elseif ft isa UnionAll && isstructtype(ft)
+            # Parametric struct type without concrete parameters (e.g., SyntaxGraph)
+            # Use AnyRef since we can't know the specific type parameter at compile time
+            wasm_vt = AnyRef
         else
             wasm_vt = julia_to_wasm_type(ft)
         end

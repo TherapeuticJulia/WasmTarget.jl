@@ -321,6 +321,10 @@ function julia_to_wasm_type(::Type{T})::WasmValType where T
     elseif isconcretetype(T) && isstructtype(T)
         # User-defined structs map to WasmGC structs
         return StructRef
+    elseif T isa UnionAll && isstructtype(T)
+        # Parametric struct type without concrete parameters (e.g., SyntaxGraph)
+        # Use AnyRef since we can't know the specific type parameter
+        return AnyRef
     elseif T <: Function
         # Abstract Function types (non-closure) map to externref
         return ExternRef

@@ -4702,6 +4702,39 @@ function allocate_ssa_locals!(ctx::CompilationContext)
                     end
                 end
             end
+
+            # Fix PURE-036be: When wasm_type is ExternRef but SSA is used in boolean context,
+            # type the local as I32 instead. This handles dead code after UNREACHABLE where
+            # the polymorphic stack "produces" an i32 for boolean operations.
+            if wasm_type === ExternRef
+                ssa_val = Core.SSAValue(ssa_id)
+                for (j, use_stmt) in enumerate(code)
+                    # Check if used as GotoIfNot condition
+                    if use_stmt isa Core.GotoIfNot && use_stmt.cond === ssa_val
+                        wasm_type = I32
+                        break
+                    end
+                    # Check if used as argument to boolean intrinsics (not_int, eq_int, etc)
+                    if use_stmt isa Expr && use_stmt.head === :call && length(use_stmt.args) >= 2
+                        func = use_stmt.args[1]
+                        if func isa GlobalRef && func.mod in (Core, Base, Core.Intrinsics)
+                            fname = func.name
+                            is_bool_op = fname in (:not_int, :eq_int, :ne_int, :slt_int, :sle_int,
+                                                   :ult_int, :ule_int, :and_int, :or_int, :xor_int)
+                            if is_bool_op
+                                for arg in use_stmt.args[2:end]
+                                    if arg === ssa_val
+                                        wasm_type = I32
+                                        break
+                                    end
+                                end
+                                wasm_type === I32 && break
+                            end
+                        end
+                    end
+                end
+            end
+
             local_idx = ctx.n_params + length(ctx.locals)
             push!(ctx.locals, wasm_type)
             ctx.ssa_locals[ssa_id] = local_idx

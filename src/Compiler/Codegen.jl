@@ -4292,6 +4292,41 @@ function analyze_control_flow!(ctx::CompilationContext)
                 end
             end
 
+            # PURE-036bg: If phi type is a ref type but used in boolean context (i32_eqz,
+            # not_int, eq_int, etc), override to I32. This handles dead code paths where
+            # ref-typed phi values are tested with boolean operations.
+            is_phi_any_ref = phi_wasm_type isa ConcreteRef || phi_wasm_type === StructRef ||
+                             phi_wasm_type === ArrayRef || phi_wasm_type === AnyRef ||
+                             phi_wasm_type === ExternRef
+            if is_phi_any_ref
+                phi_ssa_val = Core.SSAValue(i)
+                for use_stmt in code
+                    # Check if used as GotoIfNot condition
+                    if use_stmt isa Core.GotoIfNot && use_stmt.cond === phi_ssa_val
+                        phi_wasm_type = I32
+                        break
+                    end
+                    # Check if used as argument to boolean intrinsics
+                    if use_stmt isa Expr && use_stmt.head === :call && length(use_stmt.args) >= 2
+                        func = use_stmt.args[1]
+                        if func isa GlobalRef && func.mod in (Core, Base, Core.Intrinsics)
+                            fname = func.name
+                            is_bool_op = fname in (:not_int, :eq_int, :ne_int, :slt_int, :sle_int,
+                                                   :ult_int, :ule_int, :and_int, :or_int, :xor_int)
+                            if is_bool_op
+                                for arg in use_stmt.args[2:end]
+                                    if arg === phi_ssa_val
+                                        phi_wasm_type = I32
+                                        break
+                                    end
+                                end
+                                phi_wasm_type === I32 && break
+                            end
+                        end
+                    end
+                end
+            end
+
             local_idx = ctx.n_params + length(ctx.locals)
             push!(ctx.locals, phi_wasm_type)
             ctx.phi_locals[i] = local_idx
@@ -8233,6 +8268,10 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                                     else
                                         append!(block_bytes, phi_value_bytes)
                                     end
+                                    # DEBUG: track local_set in inline phi handling
+                                    if local_idx == 136 && ctx.func_idx == 45
+                                        println("DEBUG_LOCAL_SET136_INLINE_PHI func=45 local_idx=$local_idx edge_val_type=$edge_val_type phi_local_type=$phi_local_type actual_val_type=$actual_val_type")
+                                    end
                                     push!(block_bytes, Opcode.LOCAL_SET)
                                     append!(block_bytes, encode_leb128_unsigned(local_idx))
                                 end
@@ -8519,6 +8558,10 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                 # The compiled statement may produce a type incompatible with the phi local
                 ssa_julia_type = get(ctx.ssa_types, val.id, Any)
                 ssa_wasm_type = get_concrete_wasm_type(ssa_julia_type, ctx.mod, ctx.type_registry)
+                # DEBUG: Trace SSA-without-local phi compilation for local 136
+                if haskey(ctx.phi_locals, phi_idx) && ctx.phi_locals[phi_idx] == 136 && ctx.func_idx == 45
+                    println("DEBUG_PHI_COMPILE_SSA_NO_LOCAL phi_idx=$phi_idx val=$val ssa_julia_type=$ssa_julia_type ssa_wasm_type=$ssa_wasm_type phi_local_wasm_type=$phi_local_wasm_type compatible=$(phi_local_wasm_type !== nothing ? wasm_types_compatible(phi_local_wasm_type, ssa_wasm_type) : "N/A") stmt=$stmt")
+                end
                 if phi_local_wasm_type !== nothing && !wasm_types_compatible(phi_local_wasm_type, ssa_wasm_type)
                     # Type mismatch: emit type-safe default instead of recomputing
                     append!(result, emit_phi_type_default(phi_local_wasm_type))
@@ -8572,6 +8615,17 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
             end
         else
             # Not an SSA and not nothing - just compile directly
+            # Check type compatibility for non-SSA values (QuoteNode, literals, etc.)
+            if haskey(ctx.phi_locals, phi_idx)
+                phi_local_idx = ctx.phi_locals[phi_idx]
+                phi_local_type = ctx.locals[phi_local_idx - ctx.n_params + 1]
+                edge_val_type = get_phi_edge_wasm_type(val)
+                if edge_val_type !== nothing && !wasm_types_compatible(phi_local_type, edge_val_type)
+                    # Type mismatch: emit type-safe default instead
+                    append!(result, emit_phi_type_default(phi_local_type))
+                    return result
+                end
+            end
             append!(result, compile_value(val, ctx))
         end
         return result
@@ -8620,6 +8674,16 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
             # PURE-036ba: Symbol and String compile to array<i32> (string array type)
             str_type_idx = get_string_array_type!(ctx.mod, ctx.type_registry)
             return ConcreteRef(str_type_idx, false)  # non-nullable since array.new_fixed produces non-nullable ref
+        elseif val isa QuoteNode
+            # PURE-036bg: QuoteNode wraps a value - recursively determine its Wasm type
+            return get_phi_edge_wasm_type(val.value)
+        else
+            # For any other value, try to get its Julia type and convert to Wasm type
+            julia_type = typeof(val)
+            if isstructtype(julia_type)
+                # This will be compiled as struct_new, producing a non-nullable ref
+                return get_concrete_wasm_type(julia_type, ctx.mod, ctx.type_registry)
+            end
         end
         return nothing
     end
@@ -12876,6 +12940,14 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
         end
 
         # If this SSA value needs a local, store it (and remove from stack)
+        # DEBUG: check if local 136 uses are tracked (search ANY function that uses local 136)
+        if haskey(ctx.ssa_locals, idx) && ctx.ssa_locals[idx] == 136
+            println("DEBUG_SSA_LOCAL136 func_idx=$(ctx.func_idx) idx=$idx ssa_type_mismatch=$ssa_type_mismatch stmt=$(typeof(stmt))")
+        end
+        # DEBUG: check phi_locals for local 136
+        if haskey(ctx.phi_locals, idx) && ctx.phi_locals[idx] == 136
+            println("DEBUG_PHI_LOCAL136 func_idx=$(ctx.func_idx) idx=$idx stmt=$(typeof(stmt))")
+        end
         if haskey(ctx.ssa_locals, idx) && !ssa_type_mismatch
             stmt_type = get(ctx.ssa_types, idx, Any)
             is_unreachable_type = stmt_type === Union{}
@@ -12894,6 +12966,10 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
                 # When multiple SSAs share a local but have incompatible types (e.g., in dead code),
                 # DROP the value and emit a type-safe default instead of causing validation error.
                 value_wasm_type = get_concrete_wasm_type(stmt_type, ctx.mod, ctx.type_registry)
+                # DEBUG_LOCAL_SET: Log type mismatch check for local 136 in func 45
+                if local_idx == 136 && ctx.func_idx == 45
+                    println("DEBUG_LOCAL_SET local=136 func=45 stmt_type=$stmt_type local_type=$local_type value_wasm_type=$value_wasm_type compatible=$(wasm_types_compatible(local_type, value_wasm_type))")
+                end
                 if local_type !== nothing && !wasm_types_compatible(local_type, value_wasm_type)
                     # Type mismatch: drop the value and emit type-safe default
                     push!(bytes, Opcode.DROP)

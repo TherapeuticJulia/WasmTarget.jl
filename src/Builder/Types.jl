@@ -342,6 +342,10 @@ function julia_to_wasm_type(::Type{T})::WasmValType where T
         else
             error("Primitive type too large for Wasm: $T ($sz bytes)")
         end
+    elseif isabstracttype(T)
+        # Abstract types (e.g., Compiler.CallInfo) can hold any concrete subtype
+        # Map to externref like Any
+        return ExternRef
     else
         error("Unsupported Julia type for Wasm: $T")
     end

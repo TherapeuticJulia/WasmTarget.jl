@@ -311,12 +311,22 @@ function get_concrete_wasm_type(T::Type, mod::WasmModule, registry::TypeRegistry
     elseif T <: AbstractArray  # Handles Vector, Matrix, and higher-dim arrays
         # Both Vector and Matrix are stored as structs with (ref, size) fields
         # This allows setfield!(v, :size, ...) for push!/resize! operations
-        if T <: AbstractVector
+        if T <: Array
+            # Julia Vector/Array gets (ref, size) layout
             if haskey(registry.structs, T)
                 info = registry.structs[T]
                 return ConcreteRef(info.wasm_type_idx, true)
             else
                 info = register_vector_type!(mod, registry, T)
+                return ConcreteRef(info.wasm_type_idx, true)
+            end
+        elseif T <: AbstractVector && T isa DataType
+            # Other AbstractVector types (SubArray, UnitRange, etc.) - register as regular struct
+            if haskey(registry.structs, T)
+                info = registry.structs[T]
+                return ConcreteRef(info.wasm_type_idx, true)
+            else
+                info = register_struct_type!(mod, registry, T)
                 return ConcreteRef(info.wasm_type_idx, true)
             end
         else
@@ -1025,9 +1035,12 @@ function compile_module(functions::Vector)::WasmModule
                 get_string_array_type!(mod, type_registry)
             elseif is_struct_type(T)
                 register_struct_type!(mod, type_registry, T)
-            elseif T <: AbstractVector
-                # Vector is now a struct with (ref, size) for setfield! support
+            elseif T <: Array
+                # Vector/Array is now a struct with (ref, size) for setfield! support
                 register_vector_type!(mod, type_registry, T)
+            elseif T <: AbstractVector && T isa DataType
+                # Other AbstractVector types (SubArray, UnitRange, etc.) - register as regular struct
+                register_struct_type!(mod, type_registry, T)
             elseif T <: AbstractArray
                 # Multi-dimensional arrays (Matrix, etc.) - register as struct
                 register_matrix_type!(mod, type_registry, T)
@@ -1044,9 +1057,12 @@ function compile_module(functions::Vector)::WasmModule
             get_string_array_type!(mod, type_registry)
         elseif is_struct_type(return_type)
             register_struct_type!(mod, type_registry, return_type)
-        elseif return_type !== Union{} && return_type <: AbstractVector
-            # Vector is now a struct with (ref, size) for setfield! support
+        elseif return_type !== Union{} && return_type <: Array
+            # Vector/Array is now a struct with (ref, size) for setfield! support
             register_vector_type!(mod, type_registry, return_type)
+        elseif return_type !== Union{} && return_type <: AbstractVector && return_type isa DataType
+            # Other AbstractVector types (SubArray, UnitRange, etc.) - register as regular struct
+            register_struct_type!(mod, type_registry, return_type)
         elseif return_type !== Union{} && return_type <: AbstractArray
             # Multi-dimensional arrays (Matrix, etc.) - register as struct
             register_matrix_type!(mod, type_registry, return_type)
@@ -1883,14 +1899,21 @@ function register_tuple_type!(mod::WasmModule, registry::TypeRegistry, T::Type{<
     field_types_vec = DataType[]
 
     for (i, ft) in enumerate(elem_types)
+        # Skip Vararg types (used in variadic tuples like Tuple{Int, Vararg{Any}})
+        # Note: Vararg is NOT a Type, so we check typeof instead of isa
+        if typeof(ft) == Core.TypeofVararg
+            # Vararg can't be represented as a fixed struct field - skip
+            continue
+        end
+
         # Use concrete types for fields that need specific WASM types
         # This ensures consistency between struct field types and local variable types
         wasm_vt = if ft === String
             # String field needs concrete array type
             type_idx = get_string_array_type!(mod, registry)
             ConcreteRef(type_idx, true)
-        elseif ft <: AbstractVector
-            # Vector field needs concrete array type
+        elseif ft isa Type && ft <: Array
+            # Array field needs concrete array type (NOT AbstractVector — UnitRange, SubArray etc are structs)
             elem_type = eltype(ft)
             type_idx = get_array_type!(mod, registry, elem_type)
             ConcreteRef(type_idx, true)
@@ -4141,9 +4164,13 @@ function julia_to_wasm_type_concrete(T, ctx::CompilationContext)::WasmValType
         end
 
         # 1D arrays (Vector) are stored as WasmGC structs (with ref and size fields)
-        if T <: AbstractVector
-            # Register Vector as a struct type
+        if T <: Array
+            # Register Vector/Array as a struct type with (ref, size) layout
             info = register_vector_type!(ctx.mod, ctx.type_registry, T)
+            return ConcreteRef(info.wasm_type_idx, true)
+        elseif T <: AbstractVector && T isa DataType
+            # Other AbstractVector types (SubArray, UnitRange, etc.) - register as regular struct
+            info = register_struct_type!(ctx.mod, ctx.type_registry, T)
             return ConcreteRef(info.wasm_type_idx, true)
         else
             # Matrix and higher-dim arrays: also stored as structs
@@ -5048,7 +5075,7 @@ function analyze_ssa_types!(ctx::CompilationContext)
                 field_ref = stmt.args[3]
                 obj_type = infer_value_type(obj_arg, ctx)
                 # Check the Julia field type directly (no registry lookup needed)
-                if obj_type isa DataType && isstructtype(obj_type) && !isprimitivetype(obj_type)
+                if obj_type isa DataType && isstructtype(obj_type) && !isprimitivetype(obj_type) && isconcretetype(obj_type)
                     field_sym = field_ref isa QuoteNode ? field_ref.value : field_ref
                     julia_field_type = nothing
                     if field_sym isa Symbol && hasfield(obj_type, field_sym)
@@ -6297,9 +6324,9 @@ function wasm_types_compatible(local_type::WasmValType, value_type::WasmValType)
     if local_type isa ConcreteRef && value_type isa ConcreteRef && local_type.type_idx != value_type.type_idx
         return false
     end
-    # Abstract ref (StructRef/ArrayRef) is NOT directly compatible with ConcreteRef
-    # (requires ref.cast to downcast from abstract to concrete)
-    if local_type isa ConcreteRef && (value_type === StructRef || value_type === ArrayRef)
+    # Abstract ref (StructRef/ArrayRef/AnyRef) is NOT directly compatible with ConcreteRef
+    # (requires ref.cast to downcast from abstract/super to concrete)
+    if local_type isa ConcreteRef && (value_type === StructRef || value_type === ArrayRef || value_type === AnyRef)
         return false
     end
     # ExternRef is NOT compatible with ConcreteRef/StructRef/ArrayRef/AnyRef
@@ -9145,11 +9172,44 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                         push!(bytes, Opcode.REF_NULL)
                         push!(bytes, UInt8(ExternRef))
                     else
-                        append!(bytes, compile_value(term.val, ctx))
+                        val_bytes = compile_value(term.val, ctx)
+                        append!(bytes, val_bytes)
                         # If function returns externref but value is concrete ref, convert
+                        # BUT skip if the compiled value is a local.get of an externref local
                         if func_ret_wasm === ExternRef && val_wasm_type !== ExternRef
-                            push!(bytes, Opcode.GC_PREFIX)
-                            push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                            # Check if val_bytes is pure local.get of externref local
+                            is_externref_local = false
+                            if length(val_bytes) >= 2 && val_bytes[1] == 0x20
+                                src_idx = 0; shift = 0; leb_end = 0
+                                for bi in 2:length(val_bytes)
+                                    b = val_bytes[bi]
+                                    src_idx |= (Int(b & 0x7f) << shift)
+                                    shift += 7
+                                    if (b & 0x80) == 0
+                                        leb_end = bi
+                                        break
+                                    end
+                                end
+                                if leb_end == length(val_bytes)  # Pure local.get
+                                    if src_idx < ctx.n_params
+                                        # Param: check arg_types
+                                        if src_idx + 1 <= length(ctx.arg_types)
+                                            src_type = ctx.arg_types[src_idx + 1]
+                                            is_externref_local = src_type === ExternRef
+                                        end
+                                    else
+                                        arr_idx = src_idx - ctx.n_params + 1
+                                        if arr_idx >= 1 && arr_idx <= length(ctx.locals)
+                                            src_type = ctx.locals[arr_idx]
+                                            is_externref_local = src_type === ExternRef
+                                        end
+                                    end
+                                end
+                            end
+                            if !is_externref_local
+                                push!(bytes, Opcode.GC_PREFIX)
+                                push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                            end
                         end
                     end
                     # DEBUG: Before RETURN emission (terminator path line 9035)
@@ -12735,6 +12795,11 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
                                     # in struct registration, but the target local expects a concrete ref type.
                                     # Insert ref.cast null to downcast.
                                     needs_ref_cast_local = local_wasm_type
+                                elseif field_result_type === ExternRef && local_wasm_type isa ConcreteRef
+                                    # struct_get produces externref (Any-typed field) but target local is concrete ref.
+                                    # Need any_convert_extern + ref.cast to downcast.
+                                    needs_any_convert_extern = true
+                                    needs_ref_cast_local = local_wasm_type
                                 end
                             end
                         end
@@ -13398,9 +13463,39 @@ function compile_new(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UInt
                 push!(bytes, UInt8(ExternRef))
             else
                 append!(bytes, val_bytes)
-                # Convert internal ref to externref
-                push!(bytes, Opcode.GC_PREFIX)
-                push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                # Convert internal ref to externref — but skip if already externref
+                # PURE-038c: Check if source is already externref local
+                is_already_externref = false
+                if length(val_bytes) >= 2 && val_bytes[1] == 0x20
+                    src_idx2 = 0; shift2 = 0; leb_end2 = 0
+                    for bi in 2:length(val_bytes)
+                        b = val_bytes[bi]
+                        src_idx2 |= (Int(b & 0x7f) << shift2)
+                        shift2 += 7
+                        if (b & 0x80) == 0
+                            leb_end2 = bi
+                            break
+                        end
+                    end
+                    if leb_end2 == length(val_bytes)
+                        if src_idx2 < ctx.n_params
+                            if src_idx2 + 1 <= length(ctx.arg_types)
+                                src_t = ctx.arg_types[src_idx2 + 1]
+                                is_already_externref = (src_t === ExternRef)
+                            end
+                        else
+                            arr_idx2 = src_idx2 - ctx.n_params + 1
+                            if arr_idx2 >= 1 && arr_idx2 <= length(ctx.locals)
+                                src_t = ctx.locals[arr_idx2]
+                                is_already_externref = (src_t === ExternRef)
+                            end
+                        end
+                    end
+                end
+                if !is_already_externref
+                    push!(bytes, Opcode.GC_PREFIX)
+                    push!(bytes, Opcode.EXTERN_CONVERT_ANY)
+                end
             end
         else
             # Regular field - compile value directly

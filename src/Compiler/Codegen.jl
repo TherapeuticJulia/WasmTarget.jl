@@ -7846,11 +7846,17 @@ function generate_complex_flow(ctx::CompilationContext, blocks::Vector{BasicBloc
     # of explicitly storing to phi locals at each branch.
     has_phi_nodes = any(stmt isa Core.PhiNode for stmt in code)
     if length(conditionals) > 2 || (length(conditionals) >= 2 && has_phi_nodes)
+        # Debug: Show method name when compiling func 17
+        if ctx.func_idx == 17
+            println("DEBUG_FUNC_17_INFO return_type=$(ctx.return_type) code_len=$(length(code)) arg_types=$(ctx.arg_types)")
+        end
+        println("DEBUG_FLOW_PATH func_idx=$(ctx.func_idx) using=stackified conditionals=$(length(conditionals)) has_phi=$has_phi_nodes")
         return generate_stackified_flow(ctx, blocks, code)
     end
 
     # For simpler functions, use nested if-else (which works well for moderate complexity)
     if length(conditionals) >= 1
+        println("DEBUG_FLOW_PATH func_idx=$(ctx.func_idx) using=nested_conditionals conditionals=$(length(conditionals)) has_phi=$has_phi_nodes")
         append!(bytes, generate_nested_conditionals(ctx, blocks, code, conditionals))
     else
         # Fallback: generate blocks sequentially
@@ -8051,17 +8057,22 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
             end
 
             if stmt isa Core.ReturnNode
+                # DEBUG: Trace compile_block_statements ReturnNode handler
+                println("DEBUG_RETURN_BLOCK_STMTS func_idx=$(ctx.func_idx) idx=$i stmt.val=$(isdefined(stmt, :val) ? stmt.val : "undef")")
                 if isdefined(stmt, :val)
                     val_wasm_type = infer_value_wasm_type(stmt.val, ctx)
                     ret_wasm_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
                     func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
+                    println("DEBUG_RETURN_BLOCK_STMTS_CHECK func_idx=$(ctx.func_idx) func_ret_wasm=$func_ret_wasm val_wasm_type=$val_wasm_type")
                     if !return_type_compatible(val_wasm_type, ret_wasm_type)
                         push!(block_bytes, Opcode.UNREACHABLE)
                     else
                         # PURE-036af: Handle numeric-to-externref case
                         is_numeric_val = val_wasm_type === I32 || val_wasm_type === I64 || val_wasm_type === F32 || val_wasm_type === F64
+                        println("DEBUG_RETURN_BLOCK_STMTS_IS_NUMERIC func_idx=$(ctx.func_idx) is_numeric=$is_numeric_val")
                         if func_ret_wasm === ExternRef && is_numeric_val
                             # Can't convert numeric to externref - return ref.null extern instead
+                            println("DEBUG_RETURN_BLOCK_STMTS_CONVERTING func_idx=$(ctx.func_idx)")
                             push!(block_bytes, Opcode.REF_NULL)
                             push!(block_bytes, UInt8(ExternRef))
                         else
@@ -8798,10 +8809,13 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
             end
 
             if stmt isa Core.ReturnNode
+                # DEBUG: Trace inline return path (non-terminator)
+                println("DEBUG_RETURN_INLINE block_idx=$block_idx idx=$i stmt.val=$(isdefined(stmt, :val) ? stmt.val : "undef") func_idx=$(ctx.func_idx)")
                 if isdefined(stmt, :val)
                     val_wasm_type = infer_value_wasm_type(stmt.val, ctx)
                     ret_wasm_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
                     func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
+                    println("DEBUG_RETURN_INLINE_CHECK func_idx=$(ctx.func_idx) func_ret_wasm=$func_ret_wasm val_wasm_type=$val_wasm_type")
                     if !return_type_compatible(val_wasm_type, ret_wasm_type)
                         push!(block_bytes, Opcode.UNREACHABLE)
                     else
@@ -8809,6 +8823,7 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                         is_numeric_val = val_wasm_type === I32 || val_wasm_type === I64 || val_wasm_type === F32 || val_wasm_type === F64
                         if func_ret_wasm === ExternRef && is_numeric_val
                             # Can't convert numeric to externref - return ref.null extern instead
+                            println("DEBUG_RETURN_INLINE_CONVERTING func_idx=$(ctx.func_idx)")
                             push!(block_bytes, Opcode.REF_NULL)
                             push!(block_bytes, UInt8(ExternRef))
                         else
@@ -8819,9 +8834,17 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                                 push!(block_bytes, Opcode.EXTERN_CONVERT_ANY)
                             end
                         end
+                        # DEBUG: Before RETURN emission (inline path line 8833)
+                        if ctx.func_idx == 17
+                            println("DEBUG_RETURN_EMIT_8833 block_idx=$block_idx stmt.val=$(stmt.val)")
+                        end
                         push!(block_bytes, Opcode.RETURN)
                     end
                 else
+                    # DEBUG: Before void RETURN emission (inline path line 8836)
+                    if ctx.func_idx == 17
+                        println("DEBUG_RETURN_EMIT_8836 block_idx=$block_idx")
+                    end
                     push!(block_bytes, Opcode.RETURN)
                 end
 
@@ -8986,6 +9009,8 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
 
         elseif term isa Core.ReturnNode
             if isdefined(term, :val)
+                # DEBUG: Trace return path in generate_stackified_flow
+                println("DEBUG_RETURN_STACKIFIED block_idx=$block_idx term.val=$(term.val) func_idx=$(ctx.func_idx)")
                 # Check if the value's wasm type matches the function's return type
                 val_wasm_type = infer_value_wasm_type(term.val, ctx)
                 ret_wasm_type = julia_to_wasm_type_concrete(ctx.return_type, ctx)
@@ -8997,8 +9022,10 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                 else
                     # PURE-036af: Handle numeric-to-externref case
                     is_numeric_val = val_wasm_type === I32 || val_wasm_type === I64 || val_wasm_type === F32 || val_wasm_type === F64
+                    println("DEBUG_RETURN_CHECK_STACKIFIED func_idx=$(ctx.func_idx) func_ret_wasm=$func_ret_wasm val_wasm_type=$val_wasm_type is_numeric_val=$is_numeric_val")
                     if func_ret_wasm === ExternRef && is_numeric_val
                         # Can't convert numeric to externref - return ref.null extern instead
+                        println("DEBUG_RETURN_CONVERTING_TO_EXTERNREF func_idx=$(ctx.func_idx)")
                         push!(bytes, Opcode.REF_NULL)
                         push!(bytes, UInt8(ExternRef))
                     else
@@ -9009,9 +9036,17 @@ function generate_stackified_flow(ctx::CompilationContext, blocks::Vector{BasicB
                             push!(bytes, Opcode.EXTERN_CONVERT_ANY)
                         end
                     end
+                    # DEBUG: Before RETURN emission (terminator path line 9035)
+                    if ctx.func_idx == 17
+                        println("DEBUG_RETURN_EMIT_9035 block_idx=$block_idx term.val=$(term.val) last5=$(bytes[max(1,end-4):end])")
+                    end
                     push!(bytes, Opcode.RETURN)
                 end
             else
+                # DEBUG: Before void RETURN emission (terminator path line 9038)
+                if ctx.func_idx == 17
+                    println("DEBUG_RETURN_EMIT_9038_VOID block_idx=$block_idx")
+                end
                 push!(bytes, Opcode.RETURN)
             end
 
@@ -12097,15 +12132,19 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
     bytes = UInt8[]
 
     if stmt isa Core.ReturnNode
+        # DEBUG: Trace compile_statement ReturnNode handler
+        println("DEBUG_COMPILE_STATEMENT_RETURN func_idx=$(ctx.func_idx) idx=$idx stmt.val=$(isdefined(stmt, :val) ? stmt.val : "undef")")
         if isdefined(stmt, :val)
             # Check function return type
             func_ret_wasm = get_concrete_wasm_type(ctx.return_type, ctx.mod, ctx.type_registry)
             val_wasm = get_phi_edge_wasm_type(stmt.val, ctx)
             is_numeric_val = val_wasm === I32 || val_wasm === I64 || val_wasm === F32 || val_wasm === F64
+            println("DEBUG_COMPILE_STATEMENT_RETURN_CHECK func_idx=$(ctx.func_idx) func_ret_wasm=$func_ret_wasm val_wasm=$val_wasm is_numeric_val=$is_numeric_val")
 
             if func_ret_wasm === ExternRef && is_numeric_val
                 # PURE-036af: Can't convert numeric to externref - return ref.null extern instead
                 # Don't compile the numeric value at all, just push null
+                println("DEBUG_COMPILE_STATEMENT_RETURN_CONVERTING func_idx=$(ctx.func_idx)")
                 push!(bytes, Opcode.REF_NULL)
                 push!(bytes, UInt8(ExternRef))
             else
@@ -13482,6 +13521,11 @@ function infer_value_wasm_type(val, ctx::CompilationContext)::WasmValType
     if val === nothing
         return I32
     end
+    # PURE-036ay: Handle GlobalRef to nothing (e.g., JuliaSyntax.nothing)
+    # compile_value recursively resolves this to nothing which emits i32_const 0
+    if val isa GlobalRef && val.name === :nothing
+        return I32
+    end
     if val isa Core.SSAValue
         if haskey(ctx.ssa_locals, val.id)
             local_idx = ctx.ssa_locals[val.id]
@@ -13653,6 +13697,16 @@ function compile_value(val, ctx::CompilationContext)::Vector{UInt8}
         end
 
     elseif val isa Bool
+        # DEBUG: trace where Bool false values are compiled - only for func 17
+        if val === false && ctx.func_idx == 17
+            println("DEBUG_COMPILE_BOOL_FALSE_FUNC17")
+            # Print stack trace to find caller
+            for (i, frame) in enumerate(stacktrace())
+                if i <= 15
+                    println("  $i: $(frame.func) at $(frame.file):$(frame.line)")
+                end
+            end
+        end
         push!(bytes, Opcode.I32_CONST)
         push!(bytes, val ? 0x01 : 0x00)
 

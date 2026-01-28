@@ -14946,6 +14946,15 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
                         push!(bytes, Opcode.ARRAY_GET)
                         append!(bytes, encode_leb128_unsigned(array_type_idx))
 
+                        # PURE-036bc: If array element type is ExternRef (e.g., elem_type=Any),
+                        # array_get returns externref. Downstream code may ref_cast to a struct
+                        # type, which requires anyref input. Add any_convert_extern.
+                        wasm_elem_type = get_concrete_wasm_type(elem_type, ctx.mod, ctx.type_registry)
+                        if wasm_elem_type === ExternRef
+                            push!(bytes, Opcode.GC_PREFIX)
+                            push!(bytes, Opcode.ANY_CONVERT_EXTERN)
+                        end
+
                         return bytes
                     end
                     # Non-homogeneous tuple with dynamic index - fall through to error

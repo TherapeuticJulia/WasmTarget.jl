@@ -12659,6 +12659,22 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
                                         resize!(stmt_bytes, si - 1)
                                         needs_type_safe_default = true
                                     end
+                                elseif tlg_idx < ctx.n_params
+                                    # PURE-036bl: Trailing local.get of a PARAM - check param type
+                                    param_julia_type = ctx.arg_types[tlg_idx + 1]  # Julia is 1-indexed
+                                    tlg_type = get_concrete_wasm_type(param_julia_type, ctx.mod, ctx.type_registry)
+                                    if tlg_type !== nothing && !wasm_types_compatible(local_wasm_type, tlg_type)
+                                        if tlg_type === ExternRef && local_wasm_type isa ConcreteRef
+                                            # externref param → concrete ref requires any_convert_extern + ref.cast
+                                            needs_any_convert_extern = true
+                                            needs_ref_cast_local = local_wasm_type
+                                        elseif (tlg_type === StructRef || tlg_type === ArrayRef) && local_wasm_type isa ConcreteRef
+                                            needs_ref_cast_local = local_wasm_type
+                                        else
+                                            resize!(stmt_bytes, si - 1)
+                                            needs_type_safe_default = true
+                                        end
+                                    end
                                 end
                             end
                             break

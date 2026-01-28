@@ -12536,6 +12536,7 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
         # (3) struct_get producing abstract ref (structref/arrayref) where concrete ref expected → ref.cast
         ssa_type_mismatch = false
         needs_ref_cast_local = nothing  # Set to ConcreteRef target type when ref.cast is needed
+        needs_any_convert_extern = false  # PURE-036bj: externref→anyref before ref.cast
         if haskey(ctx.ssa_locals, idx) && length(stmt_bytes) >= 2
             local_idx = ctx.ssa_locals[idx]
             local_array_idx = local_idx - ctx.n_params + 1
@@ -12567,6 +12568,10 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
                             if (src_wasm_type === StructRef || src_wasm_type === ArrayRef) && local_wasm_type isa ConcreteRef
                                 # Abstract ref can be downcast to concrete ref with ref.cast
                                 needs_ref_cast_local = local_wasm_type
+                            elseif src_wasm_type === ExternRef && local_wasm_type isa ConcreteRef
+                                # PURE-036bj: externref local → concrete ref requires any_convert_extern first
+                                needs_any_convert_extern = true
+                                needs_ref_cast_local = local_wasm_type
                             else
                                 needs_type_safe_default = true
                             end
@@ -12578,6 +12583,10 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
                         if src_wasm_type !== nothing && !wasm_types_compatible(local_wasm_type, src_wasm_type)
                             # Check if this is abstract ref → concrete ref (can be cast, not replaced)
                             if (src_wasm_type === StructRef || src_wasm_type === ArrayRef) && local_wasm_type isa ConcreteRef
+                                needs_ref_cast_local = local_wasm_type
+                            elseif src_wasm_type === ExternRef && local_wasm_type isa ConcreteRef
+                                # PURE-036bj: externref param → concrete ref requires any_convert_extern first
+                                needs_any_convert_extern = true
                                 needs_ref_cast_local = local_wasm_type
                             else
                                 needs_type_safe_default = true
@@ -12753,6 +12762,10 @@ function compile_statement(stmt, idx::Int, ctx::CompilationContext)::Vector{UInt
                 if needs_ref_cast_local !== nothing
                     # struct_get produced abstract ref or call returned externref,
                     # need to downcast to concrete type.
+                    # PURE-036bj: if source is externref, first convert to anyref
+                    if needs_any_convert_extern
+                        append!(stmt_bytes, UInt8[Opcode.GC_PREFIX, Opcode.ANY_CONVERT_EXTERN])
+                    end
                     # Append ref.cast null <type_idx> to stmt_bytes
                     append!(stmt_bytes, UInt8[Opcode.GC_PREFIX, Opcode.REF_CAST_NULL])
                     append!(stmt_bytes, encode_leb128_signed(Int64(needs_ref_cast_local.type_idx)))
@@ -16882,6 +16895,13 @@ function compile_call(expr::Expr, idx::Int, ctx::CompilationContext)::Vector{UIn
                             # Abstract ref to concrete ref — insert ref.cast null
                             push!(bytes, Opcode.GC_PREFIX)
                             push!(bytes, Opcode.REF_CAST_NULL)
+                            append!(bytes, encode_leb128_signed(Int64(expected_wasm.type_idx)))
+                        elseif expected_wasm isa ConcreteRef && actual_wasm === ExternRef
+                            # PURE-036bj: externref to concrete ref — convert to anyref first, then cast
+                            push!(bytes, Opcode.GC_PREFIX)
+                            push!(bytes, Opcode.ANY_CONVERT_EXTERN)  # externref → anyref
+                            push!(bytes, Opcode.GC_PREFIX)
+                            push!(bytes, Opcode.REF_CAST_NULL)       # anyref → (ref null X)
                             append!(bytes, encode_leb128_signed(Int64(expected_wasm.type_idx)))
                         elseif expected_wasm === ExternRef && (actual_wasm isa ConcreteRef || actual_wasm === StructRef || actual_wasm === ArrayRef || actual_wasm === AnyRef)
                             # Concrete or abstract ref to externref — insert extern.convert_any
